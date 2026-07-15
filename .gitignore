@@ -1,0 +1,20 @@
+# Secrets — never commit (docs/04 rule 7.1)
+config.toml
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Local database
+*.db
+*.db-wal
+*.db-shm
+
+# Visual QA evidence (referenced from plans, stored locally)
+/qa/
+
+# Editor/OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
