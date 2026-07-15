@@ -9,10 +9,12 @@
   107 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
 - **Next action:** **M1 item 1.2** — allowlist const + test (permitted hosts only, docs/10
   §privacy). Needs no account; 1.3 is the first item that does.
-- **Blockers:** **no git remote** (`git remote -v` empty; the repo 404s) → CI has never run and
-  the badge can't be green. This is M0's one unmet acceptance line; no code fixes it, the owner
-  must push ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). **M1 item 1.3 needs the OpenSky account**
-  (#2) — 1.2 and the fallback adapters (1.5–1.6) proceed without it.
+- **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
+  `look-above` and then push, in that order** — the existing repo has an underscore; the
+  hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
+  push is the owner's ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). Until then CI has never run —
+  M0's one unmet line. **M1 item 1.3 needs the OpenSky account** (#2); 1.2 and the fallback
+  adapters (1.5–1.6) proceed without it.
 - **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step"), and
   M1 now runs ahead of it — a failure there will surface mid-M1.
 - **No live API call has been made yet.** Every ingest test is a local mock; the first request
@@ -42,6 +44,18 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-15** — Repo identity settled. The owner supplied
+  `git@github.com:arcTanMyAngle/look_above.git` — an **underscore**, where every doc says
+  hyphen. Probed both: `look_above` exists (HTTP 200), `look-above` 404s. That gap is the
+  User-Agent we send every aviation source (docs/09), so the URL a source operator would
+  follow to identify us points at nothing. Owner chose to **rename the repo to `look-above`**
+  over editing the identity in five files — the hyphen already matches the crate names, so a
+  rename fixes it with zero code change. `origin` set to the hyphenated URL; **the rename must
+  land before the first push**. The push is the owner's: no SSH key exists here
+  (`Permission denied (publickey)`), and generating one was declined. Also flagged: the repo
+  is **public** while inception recorded "private by default" — nothing sensitive is exposed,
+  but the record and reality disagree (NEXT_ACTIONS #1).
 
 - **2026-07-15** — **M1 opened at the owner's direction** with the M0 gate still at 6/7 (the
   badge line needs a push that hasn't happened; nothing about the blocker changed). Then M1

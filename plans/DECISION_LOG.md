@@ -354,6 +354,32 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `cargo test --workspace` all green locally — 87 tests (51 core, 31 app, 5 render), unchanged
   by this item, which adds no Rust code.
 
+## 2026-07-15 — Repo identity: `look-above`, not `look_above` (owner call)
+
+- **The remote the owner supplied was `git@github.com:arcTanMyAngle/look_above.git` — an
+  underscore, where every doc says hyphen.** Probed both spellings unauthenticated:
+  `look_above` → HTTP 200 (exists), `look-above` → HTTP 404. So the repo that exists is *not*
+  the one the code points at. This is not cosmetic — docs/09 makes
+  `github.com/arcTanMyAngle/look-above` our identity in the User-Agent sent to every
+  aviation source, i.e. the URL a source operator follows to find out who is polling them,
+  and it currently 404s. The README CI badge has the same defect and would never render.
+- **Decision (owner): rename the GitHub repo to `look-above`.** The alternative — keep the
+  underscore and edit the identity in five places (USER_AGENT + its test, README badge,
+  docs/09, the authorized-sources skill, this log) — was rejected: the hyphen already matches
+  the crate names and the binary (`cargo run -p look-above`), so one rename fixes everything
+  and changes no code. GitHub redirects the old URL, so nothing that already refers to
+  `look_above` breaks. **The rename must land before the first push** — the remote is set to
+  the hyphenated URL and will fail against the current name (NEXT_ACTIONS #1).
+- **`origin` is now set** to `git@github.com:arcTanMyAngle/look-above.git`. The push itself is
+  the owner's (their call): **this machine has no SSH key** — `~/.ssh` holds only
+  `known_hosts`, and `git@github.com` returns `Permission denied (publickey)`. No key was
+  generated; that was offered and declined in favour of the owner pushing from their own
+  terminal.
+- **The repo is public; inception recorded "private by default until owner says otherwise".**
+  An unauthenticated `HEAD` returns 200. Flagged rather than acted on — it is the owner's
+  call, and nothing sensitive is exposed (`config.toml` is gitignored, untracked, and absent
+  from a fresh clone; verified at the 0.8 gate). Noting it so the record and reality agree.
+
 ## 2026-07-15 — M1 opened with the M0 gate at 6/7 (owner call)
 
 - **M0 closes with the badge line outstanding.** The owner directed "continue to M1" while the
