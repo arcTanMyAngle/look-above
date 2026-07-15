@@ -5,18 +5,21 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 in progress — `core` done; the app opens a window and clears it (87 tests green).
-- **Active milestone:** M0, items 0.1–0.6 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** M0 item 0.7 (CI: GitHub Actions — fmt --check, clippy -D warnings,
-  test --workspace on windows-latest + ubuntu-latest).
-- **Acceptance §M0:** config (3 lines) and window met, verified live. Left: clean-clone build,
-  CI badge, `cargo tree` direction — then the 0.8 gate.
-- **Blockers:** none for M0. Before M1 item 1.3 the owner must create a free OpenSky account +
-  API client ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1); config fields exist and are empty until
-  then — absence is a supported state, not an error.
+- **Phase:** M0 all implementation items done (0.1–0.7); only the 0.8 gate is left. 87 tests green.
+- **Active milestone:** M0. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
+- **Next action:** M0 item 0.8 — run acceptance §M0, record evidence here, stop for human review.
+- **Acceptance §M0:** config (3 lines), window, and ADRs met and verified. The gate still has to
+  check clean-clone `cargo build`, `cargo tree` direction, and the badge (blocked, below).
+- **Blockers:** **the repo has no git remote**, so CI has never run and the README badge 404s —
+  acceptance §M0's "badge green" cannot pass until the owner pushes to
+  `github.com/arcTanMyAngle/look-above` ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). The gate can run
+  around it; it cannot close on it. Separately, M1 item 1.3 needs the owner's OpenSky account
+  (#2) — config fields exist and are empty until then; absence is a supported state, not an error.
 - **Decisions pending:** none — ADRs 001–005 accepted (docs/02).
-- **Watch at 0.7:** CI runs on ubuntu-latest with no GPU. Nothing in the suite opens a window
-  today, so this should be fine; if a headless runner ever trips on wgpu, that is the cause.
+- **Watch at 0.8:** CI is unproven — the workflow is verified only as far as offline allows
+  (YAML parses, its three commands are green on Windows, the toolchain step resolves). The
+  Linux job has never executed; if it fails, DECISION_LOG's "no apt step" paragraph is the
+  first suspect.
 
 ## Gate record
 
@@ -28,6 +31,23 @@
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ## Session log (newest first)
+
+- **2026-07-15** — M0 item 0.7: CI. `.github/workflows/ci.yml` — one job per OS
+  (windows-latest + ubuntu-latest, `fail-fast: false`), each running fmt → clippy → test, plus
+  the README badge. The item's real decision was that CI must run *exactly* what CLAUDE.md
+  tells a human to run: the two had drifted (0.6 verified with `--all-targets`, the doc didn't
+  say so), and CI stricter than the documented check means green locally, red in CI, for
+  someone who followed the docs — so `--all-targets` went into both, verified green first.
+  Toolchain comes from `rust-toolchain.toml` via a bare `rustup toolchain install` rather than
+  a setup action, so the pinned version lives in exactly one place (confirmed against local
+  rustup 1.29.0). No apt step on Linux: winit defaults to `wayland-dlopen`, x11/xkbcommon load
+  via `dlopen`, and x11-dl's build.rs treats a missing pkg-config entry as `None` — read, not
+  assumed — so nothing links a system windowing lib at build time. That also settles the
+  "watch at 0.7" note: no test opens a window or requests an adapter, so the GPU-less runner is
+  a non-issue. `Swatinem/rust-cache@v2` is the one third-party action (bare `actions/cache` on
+  `target/` is the problem it exists to solve); pinned by tag, not SHA — noted in DECISION_LOG
+  as a choice. No Rust code changed; 87 tests, fmt/clippy/test green. **The workflow has never
+  executed** — there is no remote (see Blockers). Next: 0.8, the gate.
 
 - **2026-07-15** — M0 item 0.6: the window. `render::Renderer` (instance/surface/device +
   background clear) and `app::window` (winit `ApplicationHandler`) and `app::frame_stats`.

@@ -33,7 +33,8 @@ global/regional view modes, free authorized data sources only.
   block the render loop on I/O.
 - Errors: `thiserror` in libraries, `anyhow` only in the `app` binary. No `unwrap()` outside tests.
 - Logging: `tracing`. Serialization: `serde`. DB: `rusqlite` (bundled feature).
-- Before claiming done: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`.
+- Before claiming done: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
+  CI runs exactly these three, on Windows and Linux ([.github/workflows/ci.yml](.github/workflows/ci.yml)) — if they pass here they pass there.
 
 ## Agents & skills
 

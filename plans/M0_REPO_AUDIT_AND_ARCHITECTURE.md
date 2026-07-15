@@ -65,8 +65,16 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       setup. 87 tests. Exercised against the real window: opened, resized ×4, minimized
       (0×0) and restored, closed with exit 0; a screen capture reads `#0A0E14`.
       Rationale in DECISION_LOG.)*
-- [ ] 0.7 CI: GitHub Actions — fmt --check, clippy -D warnings, test --workspace on
+- [x] 0.7 CI: GitHub Actions — fmt --check, clippy -D warnings, test --workspace on
       windows-latest + ubuntu-latest.
+      *(2026-07-15: done — `.github/workflows/ci.yml`, one matrix job per OS running the
+      three commands CLAUDE.md requires, plus the README badge. `--all-targets` added to the
+      clippy line in CLAUDE.md so the documented local check and CI are the same command.
+      No apt step on Linux: nothing links a system windowing lib at build time and no test
+      touches a GPU. **The badge cannot go green until the owner pushes to
+      `github.com/arcTanMyAngle/look-above` — no git remote exists yet** (NEXT_ACTIONS #1);
+      that is the one acceptance §M0 line 0.8 cannot check locally. Rationale in
+      DECISION_LOG.)*
 - [ ] 0.8 Gate: run acceptance §M0, record results in CURRENT_STATUS, human review.
 
 ## Notes

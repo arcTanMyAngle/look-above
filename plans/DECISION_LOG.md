@@ -309,3 +309,47 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   M2's (docs/10). Frame pacing is uncapped (~1700–2300 fps on a 1280×800 clear), which is
   expected under `ControlFlow::Poll` with no vsync-bound content yet; the 60 fps budget is
   an M2 measurement against real traffic, not this.
+
+## 2026-07-15 — M0 item 0.7: CI (GitHub Actions)
+
+- **One matrix job, not a fmt/clippy/test fan-out.** `.github/workflows/ci.yml` runs the three
+  commands in sequence on `windows-latest` and `ubuntu-latest` (`fail-fast: false` — Windows is
+  the primary target and a Linux failure must not mask a Windows one). Splitting them into
+  parallel jobs would triple the compile cost for a workspace this size to save a minute of
+  wall clock; revisit if CI ever gets slow enough to notice.
+- **CI runs exactly what CLAUDE.md tells a human to run.** The two had drifted: CLAUDE.md said
+  `cargo clippy --workspace -- -D warnings`, but item 0.6 actually verified with
+  `--all-targets` (which lints test code too). Rather than let CI be stricter than the
+  documented check — the failure mode being green locally, red in CI, for someone who followed
+  the docs — `--all-targets` went into CLAUDE.md and the workflow together. Verified green
+  before the doc changed.
+- **Toolchain comes from `rust-toolchain.toml`, not a setup action.** The step is a bare
+  `rustup toolchain install`, which since rustup 1.28 reads the file with no arguments and
+  installs the pinned channel plus its `components` (rustfmt, clippy). A `dtolnay/rust-toolchain`
+  step would name a version in a second place and let CI silently test a toolchain the repo
+  isn't pinned to. Confirmed against local rustup 1.29.0: no-arg install resolves 1.96.0 and
+  says it is "overridden by rust-toolchain.toml".
+- **No apt step on Linux, deliberately.** Every winit/wgpu tutorial's CI installs
+  `libx11-dev`/`libwayland-dev`, and it is dead weight here: winit's default features include
+  `wayland-dlopen`, `xkbcommon-dl` and `x11-dl` load through `dlopen`, and x11-dl's build script
+  treats a missing pkg-config entry as `None` rather than failing (read the build.rs, didn't
+  assume). Nothing links a system windowing library at build time. The runtime question is moot
+  because no test opens a window or requests an adapter — `Renderer::new` is the only GPU entry
+  point and nothing calls it under `cargo test` (this is the "watch at 0.7" CURRENT_STATUS
+  flagged; it resolves to a non-issue). If a Linux job ever fails on a missing `.so`, this is
+  the paragraph that was wrong.
+- **`Swatinem/rust-cache@v2` is the only third-party action.** Without it each job rebuilds
+  wgpu + winit + bundled SQLite from scratch (minutes, every push, twice). `actions/cache` alone
+  is not a substitute — caching `target/` naively grows unbounded and restores stale artifacts,
+  which is the problem that action exists to solve. Pinned to the major tag, not a SHA; that is
+  a looser posture than this repo takes with cargo deps, and if it starts to matter the fix is a
+  SHA pin, recorded here so the inconsistency is a choice and not an oversight.
+- **Badge added to README pointing at `arcTanMyAngle/look-above`.** Not a guess: docs/09 and the
+  authorized-sources skill already fix that URL as the project's identity in the outgoing
+  User-Agent. **It will 404 until the owner creates the remote and pushes — there is no git
+  remote today** (NEXT_ACTIONS #1). Acceptance §M0's "CI runs on push; badge green" is therefore
+  the one M0 line the 0.8 gate cannot check locally; the workflow is verified as far as it can
+  be offline (YAML parses, the three commands are green on Windows, the toolchain step resolves).
+- **Verification:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` all green locally — 87 tests (51 core, 31 app, 5 render), unchanged
+  by this item, which adds no Rust code.

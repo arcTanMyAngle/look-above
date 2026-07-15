@@ -1,5 +1,7 @@
 # Look Above
 
+[![CI](https://github.com/arcTanMyAngle/look-above/actions/workflows/ci.yml/badge.svg)](https://github.com/arcTanMyAngle/look-above/actions/workflows/ci.yml)
+
 A flight tracker that runs on your own machine. Rust, native window, no browser.
 It asks public servers what is currently in the sky and draws it.
 

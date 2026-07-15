@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Windows is the primary target; a Linux failure should not hide a Windows one.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # No apt step: winit/wgpu reach X11, Wayland and Vulkan through dlopen, and x11-dl's
+      # build script treats a missing pkg-config entry as "probe later". Nothing here links
+      # a system windowing library at build time, and no test opens a window or a GPU
+      # adapter, so the runner needs no display stack. If that changes, this is the step
+      # that has to come back.
+      - name: Install pinned toolchain
+        # Reads rust-toolchain.toml: channel + rustfmt/clippy.
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The three commands CLAUDE.md requires before "done", in that order.
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
