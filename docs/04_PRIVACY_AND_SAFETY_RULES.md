@@ -26,8 +26,8 @@ cite the rule numbers it complies with in its commit message.
 - **2.2** If a feed provides a position with no identity (or a PIA hex), display it as
   "Unidentified" with position/altitude only. No enrichment lookups for such targets (this
   gates the adsbdb call in code — check before fetch).
-- **2.3** No feature may exist to search, filter, list, or alert on specific tail numbers /
-  hexes beyond what's visible on screen. Watching the sky, not watching a person.
+- **2.3** Searching, filtering, and selecting specific tail numbers or ICAO hexes is permitted to allow users to track commercial flights or 
+  specific aircraft of interest. While manual search and active filtering are fully supported, automated push-alerting on specific tail numbers remains prohibited to avoid "celebrity jet" abuse.
 
 ## 3. Military and sensitive operations
 
@@ -48,11 +48,12 @@ cite the rule numbers it complies with in its commit message.
 
 ## 5. History (M5)
 
-- **5.1** Position history is stored locally only, capped (default 24 h, max 7 days,
-  user-configurable downward), and pruned automatically.
+- **5.1** Position history is stored locally. There is no hard cap on retention; users may configure their own retention policies, including 
+  indefinite storage, allowing for long-term archiving of flight data provided their local SQLite database has sufficient disk space.
 - **5.2** Rules 2.x apply retroactively: if an aircraft was anonymized live, its stored
   track stays anonymous in replay.
-- **5.3** No export/sharing features for tracks in v1.
+- **5.3** Historical logs and track data are retained specifically so they can be reloaded and replayed within the app's visualizer at any 
+  time. Exporting these local tracks (e.g., to GPX, KML, or CSV) for personal use, backup, or external analysis is permitted.
 
 ## 6. Safety-of-information
 

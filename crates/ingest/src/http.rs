@@ -202,21 +202,34 @@ fn transport_error(error: reqwest::Error) -> SourceError {
     }
 }
 
-/// Reads `Retry-After` as delta-seconds.
+/// Headers that can carry a retry hint, in the order we trust them.
 ///
-/// RFC 9110 also permits an HTTP-date, which we deliberately do not parse: it would cost
-/// a date-parsing dependency to serve a form no aviation source here sends, and an
-/// unreadable header is not a failure — the caller falls back to the exponential
-/// schedule, which is what [`backoff::retry_delay`] does with `None`.
+/// The standard one first. The second is `OpenSky`'s own spelling, and it is the *only* hint
+/// their 429 carries — item 1.3 found that reading just `Retry-After` silently discards the
+/// one number the source went to the trouble of telling us, leaving the backoff floor to
+/// guess (`DECISION_LOG` 2026-07-15). Naming a vendor header in the shared client is a small
+/// leak of one source into a place that serves all of them; the alternative is threading a
+/// per-adapter header list through [`send_json`], which is a lot of machinery for a header no
+/// other authorized source sends and none of them can be harmed by us looking for.
+const RETRY_AFTER_HEADERS: [&str; 2] = ["retry-after", "x-rate-limit-retry-after-seconds"];
+
+/// Reads a retry hint as delta-seconds, taking the first header that carries a usable one.
+///
+/// RFC 9110 also permits `Retry-After` to be an HTTP-date, which we deliberately do not
+/// parse: it would cost a date-parsing dependency to serve a form no aviation source here
+/// sends, and an unreadable header is not a failure — the caller falls back to the
+/// exponential schedule, which is what [`backoff::retry_delay`] does with `None`.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    RETRY_AFTER_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+    })
 }
 
 /// Renders a `reqwest::Error` for a message field, with the URL stripped.

@@ -136,9 +136,14 @@ impl OpenSkyAuth {
         }
     }
 
-    /// The one real constructor. Private so that the endpoint and clock overrides the tests
-    /// need cannot become public API — the seam exists for testing, not for callers.
-    fn build(
+    /// The one real constructor.
+    ///
+    /// `pub(crate)` for the same reason [`HttpClient::build`](crate::http::HttpClient::build)
+    /// is: sibling modules' tests need the endpoint and clock overrides to reach a mock, and
+    /// keeping it off the public API is what says those overrides never ship. Outside this
+    /// crate the only ways in are [`new`](Self::new) and [`disabled`](Self::disabled), neither
+    /// of which can be talked out of the real endpoint.
+    pub(crate) fn build(
         client: HttpClient,
         credentials: Credentials,
         token_endpoint: String,
