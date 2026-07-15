@@ -30,6 +30,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 rayon = "1.12.0"
 thiserror = "2.0.18"
+# Proc-macro only (syn/quote/proc-macro2) — pulls no runtime, so core stays I/O-free.
+# Needed because `LiveSource` must be dyn-compatible for the poller's failover list;
+# native async-fn-in-trait is not. See docs/09 and DECISION_LOG 2026-07-15.
+async-trait = "0.1.89"
 
 # ingest: tokio owns all network I/O; results cross to the sync pipeline via crossbeam (ADR-005).
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync"] }

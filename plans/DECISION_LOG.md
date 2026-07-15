@@ -92,3 +92,47 @@ Versions pinned in root `[workspace.dependencies]`, inherited by crates via `dep
 - **Verification:** `cargo build --workspace`, `cargo fmt --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green
   on Windows / rustc 1.96.0.
+
+## 2026-07-15 — M0 item 0.3 (core types + contracts)
+
+Shapes taken verbatim from docs/09 where specified; the decisions below are the gaps docs/09
+left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies),
+`core::contracts` (traits), all re-exported at the crate root.
+
+- **`async-trait` 0.1.89 added to `[workspace.dependencies]` and to `core`** — beyond the 0.2
+  table, because docs/09 specifies `#[async_trait]` on `LiveSource` and 0.2 didn't pin it.
+  Native async-fn-in-trait (stable since 1.75) was rejected: it is not dyn-compatible, and the
+  poller needs `dyn LiveSource` to hold a failover list of sources. The crate is proc-macro
+  only (`proc-macro2`/`quote`/`syn`) — verified via `cargo tree` that it pulls no runtime, so
+  `core` keeps its "no I/O deps" rule and ADR-005 (no async outside `ingest`) still holds:
+  `core` declares the async seam, `ingest` alone runs it.
+- **Error taxonomies are backend-agnostic** — `SourceError`/`StoreError` carry `String`
+  messages, not `reqwest::Error`/`rusqlite::Error` sources, since `core` cannot depend on
+  either. Implementing crates map their library errors in. `SourceError::is_transient()`
+  encodes the docs/09 branch rule (retry `RateLimited`/`Network`/`Server`; never `Auth`, whose
+  retry only burns budget, or `Parse`, whose bytes won't change).
+- **`StoreError` variants invented** (docs/09 named the type but not its shape):
+  `Backend`/`Migration{version}`/`Corrupt`. Minimal set the docs/08 startup path needs.
+- **`Icao24` stores `[u8; 3]`, not text** — feeds disagree on hex casing for the same aircraft,
+  so bytes make `Eq`/`Hash` case-safe for free; `Display` emits the canonical lower-case hex of
+  the `aircraft.icao24` key (docs/08).
+- **`Icao24::from_hex` rejects readsb's `~`-prefixed addresses** (TIS-B/ADS-R synthetic
+  targets) by being strict about 6 hex digits. Forces each M1 adapter to handle them
+  deliberately rather than silently minting an aircraft identity for a non-aircraft.
+- **`BBox` is validated + private-field** (`new` checks ±90/±180, ordering, and NaN) and
+  **does not model antimeridian wrap** — `lon_min <= lon_max` always holds; a ±180°-spanning
+  box must be split by the caller. Global is `RegionQuery { bbox: None }`, never a whole-world
+  box, because sources bill global and regional queries differently (docs/09).
+- **`SourceId` is a closed enum with `as_str`/`FromStr`** round-tripping the docs/08 spellings
+  (`opensky`/`airplaneslive`/`adsblol`) — a new source must add a variant, which forces the
+  allowlist test (docs/10) and budget logic to be updated rather than a string slipping through.
+- **`AirportSize` ordered `Heliport < Small < Medium < Large`** so `airports_in_bbox`'s
+  `min_size` filters as `size >= min_size` (L1 = large+medium, docs/08). Mapping the remaining
+  OurAirports types (`seaplane_base`, `balloonport`, `closed`) is deferred to the M3 importer.
+- **No serde derives yet** — deferred until a consumer needs them. M1 adapters deserialize
+  their own source-shaped DTOs and convert into `StateVector`; `StateVector` itself is never
+  parsed from a feed, so a derive now would be a guess at a wire format we don't have.
+- **`RenderFeed` (docs/09) deliberately not defined** — item 0.3 doesn't list it, and its
+  fields (projected positions, LOD tier, label rects) depend on M2 render decisions.
+- **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green on Windows / rustc
+  1.96.0; 23 new unit tests in `core`.

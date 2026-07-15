@@ -35,9 +35,12 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       *(2026-07-15: done — versions + rationale in DECISION_LOG; `toml` added for 0.5 config.
       Verified: workspace builds, no OpenSSL/native-tls (rustls only), SQLite bundled,
       single raw-window-handle 0.6.2 shared by wgpu 30 + winit 0.30.)*
-- [ ] 0.3 `core`: define `StateVector`, `Icao24`, `CallSign`, `BBox`, `SourceId`, error types,
+- [x] 0.3 `core`: define `StateVector`, `Icao24`, `CallSign`, `BBox`, `SourceId`, error types,
       and the `LiveSource`/`Store` traits from docs/09 (compile-only stubs, unit-testable
       newtype parsing: `Icao24::from_hex`).
+      *(2026-07-15: done — `core::types` / `core::error` / `core::contracts`, 23 unit tests.
+      `async-trait` added for dyn-compatible `LiveSource`; `RenderFeed` and serde derives
+      deferred (not in scope / no consumer yet). Rationale in DECISION_LOG.)*
 - [ ] 0.4 `core::geo`: haversine, bearing, destination-point, Web Mercator fwd/inv — with the
       golden-value unit tests from docs/10 §1 (this is real M0 code, it unblocks everything).
 - [ ] 0.5 `app`: config loading (`config.toml` → struct via serde, env var overrides
