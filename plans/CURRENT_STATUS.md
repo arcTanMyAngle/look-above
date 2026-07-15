@@ -37,8 +37,12 @@
   logs only `configured|absent`. Env injected via an `EnvSource` trait because `set_var` is
   `unsafe` in edition 2024. No new deps (`toml` was pinned in 0.2 for exactly this; a small
   `TempDir` avoids `tempfile`). `.gitignore` already covered all four paths — verified, not
-  recreated. 24 app tests, 75 workspace; fmt/clippy/test green. Binary exercised beyond the
-  tests: no file → defaults, env beats file, broken file → exit 1 with line/column. Next: 0.6.
+  recreated. 26 app tests, 77 workspace; fmt/clippy/test green. Binary exercised beyond the
+  tests: no file → defaults, env beats file, broken file → exit 1 with line/column.
+  Self-audit caught the environment path violating the very rule the file path enforced:
+  `std::env::var(..).ok()` flattens "unset" and "set to non-Unicode" into one `None`, so a
+  corrupt secret read as absent. `EnvSource::var` now returns `Result<Option<String>>`;
+  verified by spawning the binary with an unpaired surrogate. Next: 0.6.
 
 - **2026-07-15** — M0 item 0.4: `core::geo` — haversine, initial bearing, destination-point
   (the dead-reckoning step), Web Mercator fwd/inv in `EPSG:3857` metres, `LatLon`/`MercatorXy`

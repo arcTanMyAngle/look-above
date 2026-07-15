@@ -11,11 +11,12 @@
 //! Credential values never appear in `Debug` output (privacy rule 7.1) — see
 //! [`SecretString`].
 
+use std::env::VarError;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// Where [`Config::load_default`] looks, relative to the working directory.
@@ -44,8 +45,11 @@ pub const RETENTION_HOURS_MAX: u32 = 24 * 7;
 /// `std::env::set_var` is `unsafe` in edition 2024, and the environment is process-global
 /// state that parallel tests would race on.
 pub trait EnvSource {
-    /// The value of `key`, or `None` when it is unset.
-    fn var(&self, key: &str) -> Option<String>;
+    /// The value of `key`.
+    ///
+    /// `Ok(None)` means the variable is unset. An `Err` means it is *present but unusable* —
+    /// a different case, which must not quietly read as absent.
+    fn var(&self, key: &str) -> Result<Option<String>>;
 }
 
 /// The real process environment.
@@ -53,8 +57,20 @@ pub trait EnvSource {
 pub struct SystemEnv;
 
 impl EnvSource for SystemEnv {
-    fn var(&self, key: &str) -> Option<String> {
-        std::env::var(key).ok()
+    fn var(&self, key: &str) -> Result<Option<String>> {
+        match std::env::var(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(VarError::NotPresent) => Ok(None),
+            // `std::env::var` reports "unset" and "set to something that is not valid
+            // Unicode" as the same `Err` type, and `.ok()` would flatten both to `None` —
+            // turning a broken credential into an absent one. On Windows the environment is
+            // UTF-16, so this is reachable, not theoretical. The message never echoes the
+            // value: it may be the secret itself (privacy rule 7.1).
+            Err(VarError::NotUnicode(_)) => Err(anyhow!(
+                "{key} is set but is not valid Unicode, so it cannot be read as a \
+                 configuration value; unset it or set it to a valid value"
+            )),
+        }
     }
 }
 
@@ -199,19 +215,19 @@ impl Config {
     /// Overlay `LOOK_ABOVE_*` variables. Present-but-unparseable values are errors, for the
     /// same reason a broken file is.
     fn apply_env(&mut self, env: &impl EnvSource) -> Result<()> {
-        if let Some(value) = env.var(ENV_LOG_FILTER) {
+        if let Some(value) = env.var(ENV_LOG_FILTER)? {
             self.log.filter = value;
         }
-        if let Some(value) = env.var(ENV_OPENSKY_CLIENT_ID) {
+        if let Some(value) = env.var(ENV_OPENSKY_CLIENT_ID)? {
             self.sources.opensky.client_id = Some(SecretString::from(value));
         }
-        if let Some(value) = env.var(ENV_OPENSKY_CLIENT_SECRET) {
+        if let Some(value) = env.var(ENV_OPENSKY_CLIENT_SECRET)? {
             self.sources.opensky.client_secret = Some(SecretString::from(value));
         }
-        if let Some(value) = env.var(ENV_DB_PATH) {
+        if let Some(value) = env.var(ENV_DB_PATH)? {
             self.storage.db_path = PathBuf::from(value);
         }
-        if let Some(value) = env.var(ENV_RETENTION_HOURS) {
+        if let Some(value) = env.var(ENV_RETENTION_HOURS)? {
             self.storage.retention_hours = value.trim().parse().with_context(|| {
                 format!("{ENV_RETENTION_HOURS} must be a whole number of hours, got {value:?}")
             })?;
@@ -270,8 +286,21 @@ mod tests {
     use super::*;
 
     impl EnvSource for BTreeMap<String, String> {
-        fn var(&self, key: &str) -> Option<String> {
-            self.get(key).cloned()
+        fn var(&self, key: &str) -> Result<Option<String>> {
+            Ok(self.get(key).cloned())
+        }
+    }
+
+    /// An environment where one variable is present but unreadable — what [`SystemEnv`]
+    /// reports for a value that is not valid Unicode.
+    struct UnreadableEnv(&'static str);
+
+    impl EnvSource for UnreadableEnv {
+        fn var(&self, key: &str) -> Result<Option<String>> {
+            if key == self.0 {
+                bail!("{key} is set but is not valid Unicode")
+            }
+            Ok(None)
         }
     }
 
@@ -474,12 +503,30 @@ mod tests {
 
     // --- Acceptance §M0: "repo contains config.example.toml" -----------------------------
 
+    /// Embedded at compile time, so a build failure here means the example file went
+    /// missing — acceptance §M0 requires it to exist.
+    const EXAMPLE: &str = include_str!("../../../config.example.toml");
+
+    #[test]
+    fn every_env_override_is_documented_in_the_example_file() {
+        // config.example.toml is the only place these names are published, so a const
+        // renamed without touching the file leaves the documentation silently wrong.
+        for key in [
+            ENV_LOG_FILTER,
+            ENV_OPENSKY_CLIENT_ID,
+            ENV_OPENSKY_CLIENT_SECRET,
+            ENV_DB_PATH,
+            ENV_RETENTION_HOURS,
+        ] {
+            assert!(
+                EXAMPLE.contains(key),
+                "config.example.toml never mentions {key}"
+            );
+        }
+    }
+
     #[test]
     fn example_file_is_equivalent_to_no_file() {
-        // include_str! is compile-time: this test failing to build means the example file
-        // went missing.
-        const EXAMPLE: &str = include_str!("../../../config.example.toml");
-
         let dir = TempDir::new("example");
         let path = dir.write_config(EXAMPLE);
         let config = Config::load(&path, &empty_env()).expect("config.example.toml parses");
@@ -541,6 +588,26 @@ mod tests {
         std::fs::create_dir_all(&path).expect("create dir in test");
 
         Config::load(&path, &empty_env()).expect_err("an unreadable config.toml is not defaults");
+    }
+
+    #[test]
+    fn an_unreadable_env_var_is_an_error_not_an_absent_one() {
+        // The environment's own version of the broken-file case, and the reason `SystemEnv`
+        // cannot use `std::env::var(..).ok()`: that flattens NotPresent and NotUnicode into
+        // the same `None`. A client secret that is present but unreadable would then read as
+        // "no credentials", and the app would quietly run on the fallback sources instead of
+        // saying what is wrong.
+        let dir = TempDir::new("unreadable-env");
+        let err = Config::load(
+            &dir.config_path(),
+            &UnreadableEnv(ENV_OPENSKY_CLIENT_SECRET),
+        )
+        .expect_err("a present-but-unreadable variable is not an unset one");
+
+        assert!(
+            err.to_string().contains(ENV_OPENSKY_CLIENT_SECRET),
+            "the message must name the variable at fault: {err}"
+        );
     }
 
     #[test]

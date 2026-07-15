@@ -229,3 +229,27 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   run; file → values read; env on top → env wins; broken file → exit 1 with line/column;
   over-cap → refused by name; typo'd key → refused. `git check-ignore` confirms `config.toml`
   is ignored (`.gitignore:2`) and `git status` never saw the real one used during testing.
+
+## 2026-07-15 — M0 item 0.5 follow-up (self-audit correction)
+
+- **`EnvSource::var` returns `Result<Option<String>>`, not `Option<String>`.** The first cut
+  of this item read the environment with `std::env::var(key).ok()`, which flattens
+  `VarError::NotPresent` and `VarError::NotUnicode` into the same `None`. A client secret that
+  was *set but not valid Unicode* therefore read as "no credentials", and the app ran on the
+  no-key fallbacks without saying why — exactly the present-but-broken-reads-as-absent failure
+  the entry above calls unacceptable. The file path honored that principle and the environment
+  path silently did not; the inconsistency was in the code while the rationale was in this log
+  claiming otherwise. Reachable, not theoretical: the Windows environment is UTF-16 and can
+  hold unpaired surrogates. `Ok(None)` now means unset and an `Err` means present-but-unusable.
+  Verified by spawning the binary with `OsString::from_wide(&[0xD800])` as the secret: it exits
+  1 naming the variable, where before it logged `opensky_credentials=absent` and exited 0. The
+  message never echoes the value (rule 7.1) — an error that printed a bad secret to the
+  terminal would be its own leak.
+- **Env var names are asserted to appear in `config.example.toml`.** That file is the only
+  place the `LOOK_ABOVE_*` names are published, so renaming a const without touching it would
+  leave the documentation silently wrong — the same class of quiet drift.
+- **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green; 26 app tests, 77
+  workspace-wide. The `SystemEnv` `NotUnicode` branch itself is covered by the manual spawn
+  above rather than a unit test: forcing it in-process needs a non-Unicode variable, and
+  `set_var` is `unsafe` in edition 2024. A `#[cfg(windows)]` spawn test could pin it if this
+  path ever grows; noted rather than built, since CI (item 0.7) runs Linux too.
