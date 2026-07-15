@@ -5,32 +5,56 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 all implementation items done (0.1–0.7); only the 0.8 gate is left. 87 tests green.
-- **Active milestone:** M0. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** M0 item 0.8 — run acceptance §M0, record evidence here, stop for human review.
-- **Acceptance §M0:** config (3 lines), window, and ADRs met and verified. The gate still has to
-  check clean-clone `cargo build`, `cargo tree` direction, and the badge (blocked, below).
-- **Blockers:** **the repo has no git remote**, so CI has never run and the README badge 404s —
-  acceptance §M0's "badge green" cannot pass until the owner pushes to
-  `github.com/arcTanMyAngle/look-above` ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). The gate can run
-  around it; it cannot close on it. Separately, M1 item 1.3 needs the owner's OpenSky account
-  (#2) — config fields exist and are empty until then; absence is a supported state, not an error.
-- **Decisions pending:** none — ADRs 001–005 accepted (docs/02).
-- **Watch at 0.8:** CI is unproven — the workflow is verified only as far as offline allows
-  (YAML parses, its three commands are green on Windows, the toolchain step resolves). The
-  Linux job has never executed; if it fails, DECISION_LOG's "no apt step" paragraph is the
-  first suspect.
+- **Phase:** M0 items 0.1–0.7 done; gate 0.8 **run — 6 of 7 acceptance lines met** (evidence
+  below). 87 tests green. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
+- **Next action:** **human review of the M0 gate.** M1 does not start until it closes.
+- **Blockers:** **no git remote** (`git remote -v` empty; the repo 404s) → CI has never run and
+  the badge can't be green. That is the unmet line; no code fixes it, the owner must push
+  ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). M1 item 1.3 separately needs the OpenSky account (#2).
+- **Decisions pending:** does M0 close with the badge outstanding? Recommend no — nothing else
+  is left, and the first push settles it.
+- **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step").
 
 ## Gate record
 
 | Milestone | Status | Evidence |
 |---|---|---|
-| M0 | not started | — |
+| M0 | **gate run 2026-07-15 — 6/7, awaiting human review + the badge** | per-line below |
 | M1 | not started | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
+### M0 acceptance §M0 — evidence (run 2026-07-15, Windows 11, rustc 1.96.0, Intel Arc / Vulkan)
+
+| # | Line | Result | Evidence |
+|---|---|---|---|
+| 1 | `cargo build --workspace` on a clean clone | **pass** | fresh `git clone` to a scratch dir, cold build: **exit 0 in 66.2 s**. Not the warm tree — a clone is the only thing that can catch a needed-but-uncommitted file. |
+| 2 | CI fmt + clippy + tests on push; badge green | **BLOCKED** | no git remote (`git remote -v` empty); `github.com/arcTanMyAngle/look-above` → **HTTP 404** (fetched). Workflow has never executed. Its three commands are green locally on Windows; the Linux job is unproven. |
+| 3 | Five crates, direction core ← {ingest, store, render} ← app, no reverse deps | **pass** | full intra-workspace edge list from `cargo metadata`: `ingest`/`store`/`render` → `core`; `app` → all four; **nothing else**. Nothing depends on `app`; the three middle crates don't depend on each other. `core` externals: async-trait, rayon, serde, thiserror (no tokio/reqwest/rusqlite). `render`: no winit, no network, no DB. |
+| 4 | `cargo run -p look-above` opens a window, resizes without panic, closes cleanly | **pass** | driven over Win32: window titled "Look Above" (hwnd confirmed), resized 800×600 / 1280×720 / 640×480 / 1024×768, minimized to 0×0 and restored, all alive; `WM_CLOSE` → "close requested" → "window closed"; **exit code 0**; zero panics on stdout/stderr. |
+| 5 | Config from `config.toml` + env override; missing file → defaults, not error | **pass** | against the **binary**, not the tests. No file → "no configuration file; using defaults", `look_above.db`, 24 h, credentials "absent". With a file → `from_file.db`, 6 h. With `LOOK_ABOVE_*` → `from_env.db`, 3 h. Env > file > default, observed each time. |
+| 6 | `config.toml` gitignored; repo contains `config.example.toml` | **pass** | `git check-ignore -v` hits for `config.toml`, `target/`, `qa/`, `*.db`; `config.toml` untracked and **absent from the clone**; `config.example.toml` tracked and present. |
+| 7 | ADRs 001–005 accepted; DECISION_LOG updated | **pass** | docs/02: all five marked `Status: accepted`. DECISION_LOG has a dated entry per item 0.1–0.8. |
+
+Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
+
 ## Session log (newest first)
+
+- **2026-07-15** — M0 item 0.8: the gate. Ran acceptance §M0 — **6 of 7 lines met**, per-line
+  evidence in the table above; no code changed. The gate is recorded as *run*, not passed: the
+  badge line needs a remote that doesn't exist (the repo 404s, verified rather than assumed),
+  and a gate that certifies its own unverifiable line is worth nothing. Everything else was
+  checked against the real artifact rather than a proxy — a fresh clone for the cold build
+  (the warm tree cannot prove that line), the running binary for config precedence (the 31 app
+  tests already assert the rules; the question was whether the shipped binary obeys them), and
+  the live window over Win32 for resize/close (exit 0). Dependency direction came from
+  `cargo metadata` edges instead of eyeballing `cargo tree`, which is precisely where a reverse
+  edge would hide: the whole graph is seven lines and has none. Two scripting breadcrumbs for
+  M2's visual QA, logged in DECISION_LOG: `FindWindow` returns 0 against this app from a
+  non-interactive host though the window is real and correctly titled (use `Get-Process` →
+  `MainWindowHandle`; this produced one false "no window" scare), and `cargo run` makes the app
+  a child, so exit codes must come from a foreground `$LASTEXITCODE`. Next: **human review**;
+  M1 does not start until the gate closes.
 
 - **2026-07-15** — M0 item 0.7: CI. `.github/workflows/ci.yml` — one job per OS
   (windows-latest + ubuntu-latest, `fail-fast: false`), each running fmt → clippy → test, plus

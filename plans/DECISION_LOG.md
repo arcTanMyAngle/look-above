@@ -353,3 +353,47 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
 - **Verification:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` all green locally — 87 tests (51 core, 31 app, 5 render), unchanged
   by this item, which adds no Rust code.
+
+## 2026-07-15 — M0 item 0.8: the gate
+
+- **M0 does not close: six of seven acceptance lines are met, the seventh cannot be checked.**
+  "CI runs fmt + clippy + tests on push; badge green" needs a remote, and `git remote -v` is
+  still empty — `github.com/arcTanMyAngle/look-above` returns HTTP 404 (fetched, not assumed).
+  The workflow has therefore never executed. The decision here is to record the gate as **run
+  with one line blocked** rather than pass it: a gate that certifies its own unverifiable line
+  is worth nothing, and "the YAML looks right" is not the claim acceptance §M0 asks for. M0
+  closes when the owner pushes and the badge goes green (NEXT_ACTIONS #1) — nothing else is
+  outstanding.
+- **The clean-clone line was checked in an actual fresh clone.** `git clone` to a scratch dir,
+  then `cargo build --workspace` from cold: exit 0 in 66.2s. The warm working tree could not
+  have proven this line no matter how green it looked — it cannot catch an uncommitted file the
+  build needs, and that is the entire failure mode the line exists to catch. It also
+  incidentally confirmed the two config-adjacent lines from the outside: the clone contains
+  `config.example.toml` and no `config.toml`, and the binary built there ran on defaults.
+- **Dependency direction verified from `cargo metadata` edges, not by reading `cargo tree`.**
+  Acceptance says "no reverse deps in `cargo tree`"; the intent is the property, and scanning a
+  deep tree by eye is exactly where a reverse edge would survive. Enumerating intra-workspace
+  edges yields the whole graph in seven lines: `ingest`/`store`/`render` → `core`, `app` → all
+  four, nothing else — no crate depends on `app`, and the three middle crates do not depend on
+  each other. `core`'s only externals are async-trait, rayon, serde, thiserror (no tokio,
+  reqwest or rusqlite), and `render` pulls no winit, no network, no DB, which is the 0.6 crate
+  seam holding.
+- **Config and the window were checked against the running binary, not the unit tests.** The
+  31 app tests already assert the precedence rules, so re-reading them would prove nothing new;
+  the gate's question is whether the shipped binary behaves that way. Missing file → defaults
+  (`look_above.db`, 24h, credentials "absent"); a `config.toml` → `from_file.db`/6h; with
+  `LOOK_ABOVE_*` set → `from_env.db`/3h. Env beats file beats default, observed in the startup
+  log each time. The window was driven over Win32: opened titled "Look Above", four resizes,
+  minimize (0×0) and restore, `WM_CLOSE` → "close requested" → "window closed", `cargo run -p
+  look-above` exit code 0, no panic on stdout or stderr.
+- **Note for future window-driving sessions (M2 visual QA):** `FindWindow(NULL, "Look Above")`
+  returns 0 against this app from a non-interactive PowerShell host even though the window
+  exists and is correctly titled — `EnumWindows` and `Process.MainWindowHandle` both find it
+  (hwnd confirmed, title exact). Discover the handle via `Get-Process -Name look-above` and
+  `MainWindowHandle`. This is a quirk of the scripting host, not a defect in the app; it cost a
+  wrong "no window appeared" result once already. Also: `cargo run` makes the app a *child*
+  process, so an exit code must come from `$LASTEXITCODE` on a foreground `cargo run` —
+  `Start-Process -PassThru` reports `ExitCode` empty here.
+- **Verification:** all three commands green on Windows; 87 tests (51 core, 31 app, 5 render).
+  No code changed at this item. Working tree clean afterwards — the runs left no `config.toml`
+  or `*.db` behind in the repo.

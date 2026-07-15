@@ -75,7 +75,16 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       `github.com/arcTanMyAngle/look-above` — no git remote exists yet** (NEXT_ACTIONS #1);
       that is the one acceptance §M0 line 0.8 cannot check locally. Rationale in
       DECISION_LOG.)*
-- [ ] 0.8 Gate: run acceptance §M0, record results in CURRENT_STATUS, human review.
+- [~] 0.8 Gate: run acceptance §M0, record results in CURRENT_STATUS, human review.
+      *(2026-07-15: gate **run**, not passed — 6 of 7 acceptance lines met, evidence in
+      CURRENT_STATUS. Verified: clean-clone `cargo build --workspace` (fresh clone, exit 0,
+      66.2s); dependency direction from `cargo metadata` edges (no reverse deps); the live
+      window (4 resizes, minimize/restore, `WM_CLOSE` → exit 0); config precedence against the
+      binary (env > file > default, missing file → defaults); `config.toml` gitignored and
+      absent from the clone with `config.example.toml` present; ADRs 001–005 accepted and
+      DECISION_LOG current. **Blocked:** "CI runs on push; badge green" — no git remote exists
+      and the repo 404s, so the workflow has never run. Awaiting owner push (NEXT_ACTIONS #1)
+      + human review; do not start M1 until then.)*
 
 ## Notes
 
