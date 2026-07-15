@@ -42,3 +42,53 @@ Format: `date — decision — rationale — (ADR-ref if any)`.
   `crates/<short-name>/` directories; the binary package is `look-above` (crates/app).
 - **Workspace resolver 3**, shared `version`/`edition`/`rust-version`/`license` via
   `[workspace.package]`. Dependency pins deferred to item 0.2 as planned.
+
+## 2026-07-15 — M0 item 0.2 (dependency pins)
+
+Versions pinned in root `[workspace.dependencies]`, inherited by crates via `dep.workspace = true`:
+
+| Crate | Version | Features | Used by |
+|---|---|---|---|
+| serde | 1.0.228 | derive | core, ingest, app |
+| serde_json | 1.0.150 | — | ingest |
+| rayon | 1.12.0 | — | core |
+| thiserror | 2.0.18 | — | core, ingest, store, render |
+| tokio | 1.52.3 | rt-multi-thread, macros, time, sync | ingest, app |
+| reqwest | 0.13.4 | json | ingest |
+| crossbeam-channel | 0.5.16 | — | ingest, app |
+| rusqlite | 0.40.1 | bundled | store |
+| wgpu | `=30.0.0` | default | render, app |
+| winit | `=0.30.13` | default | app |
+| anyhow | 1.0.103 | — | app |
+| toml | 1.1.3 | — | app |
+| tracing | 0.1.44 | — | ingest, store, render, app |
+| tracing-subscriber | 0.3.23 | env-filter | app |
+
+- **"Exact versions" read as: full `major.minor.patch` + committed `Cargo.lock`, not `=` on
+  every dep** — the lockfile is what actually makes builds reproducible. Blanket `=` pins are
+  actively harmful: any transitive crate needing a semver-compatible patch bump (e.g. serde
+  1.0.229) would fail to resolve or duplicate the crate in the tree. `=` is therefore reserved
+  for `wgpu`/`winit`, the one pair ADR-003 flags for churn and restricts to milestone-boundary
+  upgrades. (ADR-003)
+- **winit pinned to 0.30.13 (latest stable), not 0.31.0-beta.2** — 0.31 is the max published
+  version but is a prerelease; a foundational dep does not ride a beta. Revisit at a milestone
+  boundary once 0.31 is stable.
+- **wgpu 30.0.0 + winit 0.30.13 verified compatible**: both resolve to a single
+  `raw-window-handle` 0.6.2, which is the interface surface creation goes through — this is the
+  classic version-mismatch failure, so it was checked now rather than discovered at item 0.6.
+- **reqwest: default features + `json` (no `rustls-tls` flag needed)** — reqwest 0.13 changed
+  `default-tls` to mean rustls, so the default is already the rustls stack. Verified no
+  `openssl-sys`/`native-tls` anywhere in the tree, so Windows builds need no system OpenSSL.
+- **rusqlite `bundled`** — verified `libsqlite3-sys` builds with feature `bundled`, so SQLite is
+  compiled in with no system dependency. (ADR-004)
+- **`toml` 1.1.3 added beyond the 0.2 checklist** — item 0.5 needs `config.toml` parsing and
+  a config format dep belongs with the other pins rather than appearing ad hoc later.
+- **tokio features `time` + `sync` added** beyond the checklist's (rt-multi-thread, macros) —
+  pollers need interval timers and the token-refresh cache needs a shared lock. (ADR-005)
+- **Deps wired into crates now, ahead of their code** (unused until 0.3–0.6) — pinning is only
+  meaningful if the graph is proven to resolve and build; a version table nobody compiled is a
+  guess. Dependency direction from the plan is respected: `core` takes only serde/rayon/thiserror,
+  `render` takes no network/DB deps, winit lives in `app` (item 0.6 owns the window).
+- **Verification:** `cargo build --workspace`, `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green
+  on Windows / rustc 1.96.0.

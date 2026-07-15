@@ -28,10 +28,13 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
 - [x] 0.1 `cargo new` workspace + five crates; workspace-level `[lints]` (clippy pedantic
       subset agreed in ADR); `rust-toolchain.toml` pinning stable; edition 2024.
       *(2026-07-15: done — stable 1.96.0 pinned; lint subset in root Cargo.toml, see DECISION_LOG.)*
-- [ ] 0.2 Pin dependencies (exact versions, workspace `[workspace.dependencies]`):
+- [x] 0.2 Pin dependencies (exact versions, workspace `[workspace.dependencies]`):
       tokio (rt-multi-thread, macros), reqwest (json, rustls), serde/serde_json, rayon,
       crossbeam-channel, rusqlite (bundled), wgpu, winit, thiserror, anyhow (app only),
       tracing + tracing-subscriber. Record versions in DECISION_LOG.
+      *(2026-07-15: done — versions + rationale in DECISION_LOG; `toml` added for 0.5 config.
+      Verified: workspace builds, no OpenSSL/native-tls (rustls only), SQLite bundled,
+      single raw-window-handle 0.6.2 shared by wgpu 30 + winit 0.30.)*
 - [ ] 0.3 `core`: define `StateVector`, `Icao24`, `CallSign`, `BBox`, `SourceId`, error types,
       and the `LiveSource`/`Store` traits from docs/09 (compile-only stubs, unit-testable
       newtype parsing: `Icao24::from_hex`).

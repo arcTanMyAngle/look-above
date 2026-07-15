@@ -14,8 +14,41 @@ edition = "2024"
 rust-version = "1.96"
 license = "MIT"
 
-# Shared dependency versions are pinned here in M0 item 0.2.
+# Versions pinned in M0 item 0.2 (see plans/DECISION_LOG.md 2026-07-15).
+# Reproducibility comes from the committed Cargo.lock; `=` pins are reserved for the
+# graphics pair, which ADR-003 says may only move at a milestone boundary.
 [workspace.dependencies]
+
+# Internal crates. Dependency direction: core <- ingest, store, render <- app.
+look-above-core = { path = "crates/core" }
+look-above-ingest = { path = "crates/ingest" }
+look-above-store = { path = "crates/store" }
+look-above-render = { path = "crates/render" }
+
+# core (no I/O): std + serde + rayon + thiserror only.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+rayon = "1.12.0"
+thiserror = "2.0.18"
+
+# ingest: tokio owns all network I/O; results cross to the sync pipeline via crossbeam (ADR-005).
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# reqwest 0.13 defaults to rustls (default-tls = [rustls]); no native-tls/OpenSSL in the tree.
+reqwest = { version = "0.13.4", features = ["json"] }
+crossbeam-channel = "0.5.16"
+
+# store: bundled SQLite, no system dependency (ADR-004).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# render/app: exact pins — wgpu/winit churn is the known risk in ADR-003.
+wgpu = "=30.0.0"
+winit = "=0.30.13"
+
+# app only.
+anyhow = "1.0.103"
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -7,10 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-look-above-core = { path = "../core" }
-look-above-ingest = { path = "../ingest" }
-look-above-store = { path = "../store" }
-look-above-render = { path = "../render" }
+look-above-core.workspace = true
+look-above-ingest.workspace = true
+look-above-store.workspace = true
+look-above-render.workspace = true
+
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wgpu.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true
