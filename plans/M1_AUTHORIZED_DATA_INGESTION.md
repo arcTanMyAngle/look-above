@@ -7,10 +7,10 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
 
 ## Prerequisite (user action)
 
-> **OpenSky account needed before item 1.3:** create a free account at
-> https://opensky-network.org, then in your account settings create an **API client** to get
-> a client id + secret. Put them in `config.toml` (`[opensky] client_id/client_secret`).
-> Items 1.1–1.2 and the fallback path (1.5+) proceed without it.
+> **Done 2026-07-15.** The owner created the API client and supplied its `credentials.json`.
+> Item 1.3 reads that file as-issued (gitignored); no transcription into `config.toml` is
+> needed. Precedence: `LOOK_ABOVE_OPENSKY_*` > `config.toml` > `credentials.json`. Verified
+> live against the token endpoint — accepted, TTL 1798 s.
 
 ## Checklist
 
@@ -33,11 +33,24 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       to `core` — the taxonomy had no home for "we declined to send this". Static-download
       hosts deliberately excluded (import tooling, not this crate). Rationale in
       DECISION_LOG.)*
-- [ ] 1.3 OpenSky auth: OAuth2 client-credentials token fetch + cache + refresh at 80% TTL;
+- [x] 1.3 OpenSky auth: OAuth2 client-credentials token fetch + cache + refresh at 80% TTL;
       credentials from config; graceful "no credentials" state (source disabled, not error).
+      *(2026-07-15: done — `ingest::opensky::auth`: `OpenSkyAuth` (token cache, 80% refresh,
+      `Ok(None)` when disabled), `Credentials`, injected `Clock`. 35 new tests, 161 total.
+      **First live API call in the project**: an `#[ignore]`d test hit the real token endpoint
+      with the owner's credentials — accepted, TTL 1798 s, refresh at 79.98%, confirming the
+      documented ~30 min on real data rather than on a mock. `credentials.json` is read
+      as-issued (owner call) and gitignored; it is all-or-nothing so a pair is never assembled
+      from two sources. `SecretString` moved to `core::secret` so `ingest` can hold credentials
+      without a second copy of privacy rule 7.1. `HttpClient::post_form` added — the allowlist
+      choke point covered GET only, and the grant is a POST carrying the secret. Rationale in
+      DECISION_LOG.)*
 - [ ] 1.4 OpenSky adapter: `/states/all` bbox query → `Vec<StateVector>`; positional-array
       parsing tolerant of nulls per field; credit cost function (bbox area → 1–4);
       fixture set per docs/10 §2.
+      **Two things 1.3 found:** OpenSky's 429 carries `X-Rate-Limit-Retry-After-Seconds`, not
+      the standard `Retry-After` that `http::retry_after` reads — the backoff floor misses it
+      today. And `reqwest`'s `query` feature is off; the bbox params need it enabled.
 - [ ] 1.5 airplanes.live adapter: `/v2/point` query, readsb-JSON parsing (shared module),
       `"ground"` altitude handling, ≥ 2 s request spacing; fixtures.
 - [ ] 1.6 adsb.lol adapter reusing the readsb parsing module; fixtures.

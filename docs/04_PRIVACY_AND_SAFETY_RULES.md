@@ -64,8 +64,16 @@ cite the rule numbers it complies with in its commit message.
 
 ## 7. Secrets & local data
 
-- **7.1** Credentials (OpenSky client id/secret) live in gitignored `config.toml` or
-  environment variables. Never in code, logs, commits, or fixtures.
+- **7.1** Credentials (OpenSky client id/secret) live in exactly three places, in precedence
+  order: the `LOOK_ABOVE_OPENSKY_*` environment variables, gitignored `config.toml`, or the
+  gitignored `credentials.json` that OpenSky's account page issues — read as-downloaded, and
+  all-or-nothing, so a pair is never assembled from two sources (M1 item 1.3; DECISION_LOG
+  2026-07-15). Never in code, logs, commits, or fixtures.
+- **7.1a** Credential material is carried as `core::secret::SecretString`, whose `Debug` is
+  redacted and which deliberately has no `Display`. `SecretString::expose` is the single
+  audited route to a value: call it where the credential is *used*, never where one is
+  logged, formatted, or put in an error message. Errors quoting a URL strip it first
+  (`reqwest::Error::without_url`), since a token can ride in a query string.
 - **7.2** Recorded test fixtures are scrubbed: real hexes/callsigns may remain (they're
   public data from authorized feeds) but any credential material or account metadata is removed.
 

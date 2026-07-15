@@ -11,12 +11,14 @@
 pub mod contracts;
 pub mod error;
 pub mod geo;
+pub mod secret;
 pub mod types;
 
 pub use contracts::{
     AircraftCategory, AircraftMeta, Airport, AirportSize, LiveSource, RegionQuery, Store,
 };
 pub use error::{SourceError, StoreError};
+pub use secret::SecretString;
 pub use types::{
     BBox, BBoxError, CallSign, Icao24, Icao24ParseError, SourceId, StateVector, UnixSeconds,
     UnknownSourceId,

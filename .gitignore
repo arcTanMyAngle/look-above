@@ -1,5 +1,6 @@
 # Secrets — never commit (docs/04 rule 7.1)
 config.toml
+credentials.json
 
 # Rust build artifacts
 /target/

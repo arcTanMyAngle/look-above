@@ -23,7 +23,10 @@ fn main() -> Result<()> {
 
 /// Record what was loaded.
 ///
-/// Credential *values* are never logged (privacy rule 7.1) — only whether they are present.
+/// Credential *values* are never logged (privacy rule 7.1) — only whether they are present,
+/// and which file they came from. That last part earns its line: with three possible
+/// sources for one credential, "absent" is a question ("but I put the file *there*") unless
+/// the log says where we looked.
 fn log_startup(config: &Config) {
     if let Some(path) = &config.source_path {
         tracing::info!(path = %path.display(), "loaded configuration");
@@ -39,6 +42,12 @@ fn log_startup(config: &Config) {
             "configured"
         } else {
             "absent"
+        },
+        opensky_credentials_from = match &config.credentials_path {
+            Some(path) => path.display().to_string(),
+            None if config.sources.opensky.is_configured() =>
+                "config.toml or environment".to_owned(),
+            None => format!("nothing (looked for {})", config::DEFAULT_CREDENTIALS_PATH),
         },
         db_path = %config.storage.db_path.display(),
         retention_hours = config.storage.retention_hours,

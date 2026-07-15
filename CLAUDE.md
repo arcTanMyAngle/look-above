@@ -21,8 +21,15 @@ global/regional view modes, free authorized data sources only.
   Never scrape FlightRadar24, FlightAware, or ADS-B Exchange web UIs. Never exceed documented rate limits.
 - **Privacy:** follow [docs/04_PRIVACY_AND_SAFETY_RULES.md](docs/04_PRIVACY_AND_SAFETY_RULES.md).
   Blocked/anonymized aircraft (LADD, PIA) are never tracked, correlated, or displayed with identity.
-- **Secrets:** API credentials live in `config.toml` / env vars only. `config.toml` is gitignored. Never commit credentials.
+- **Secrets:** API credentials live in exactly three places, in precedence order: `LOOK_ABOVE_*` env vars, gitignored `config.toml`, or the gitignored `credentials.json` OpenSky issues (read as-downloaded). Nowhere else — never in code, logs, fixtures, or commits. Credential-bearing types are `core::secret::SecretString` ([docs/04](docs/04_PRIVACY_AND_SAFETY_RULES.md) rule 7.1).
 - **Never paste raw API responses into context.** Record trimmed fixtures to `tests/fixtures/` and reference them ([docs/06_TOOL_USAGE_RULES.md](docs/06_TOOL_USAGE_RULES.md)).
+
+## Token Management & Workflow Efficiency
+
+- **Batch File Edits:** Never issue multiple consecutive edit commands for the same file. Plan all necessary changes for a single file and apply them in one comprehensive edit block.
+- **No "Compile-and-Fix" Loops:** Before running `cargo check`, `cargo clippy`, or `cargo test`, you must silently review your drafted code for ownership/borrowing errors (e.g., moving out of shared references) and common Clippy lints (e.g., suboptimal duration units). Write the code correctly the first time to avoid burning tokens on repetitive terminal feedback loops.
+- **Dependency Discovery:** Do not use `cargo tree` to explore dependencies; it is too verbose and fails on un-targeted workspaces. To check existing dependencies, read the `Cargo.toml` files directly. To investigate a new crate, use `cargo add --dry-run <crate>` and read the output.
+- **Strict Context Adherence:** Do not guess or hunt for missing milestones (e.g., blindly grepping the repo for a step number that isn't in the plan). If a requested task, milestone, or document is missing or ambiguous, stop immediately and ask for clarification.
 
 ## Rust conventions
 

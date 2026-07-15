@@ -11,6 +11,7 @@
 # exactly like having no config.toml at all. Delete any line to take its default.
 #
 # Precedence: LOOK_ABOVE_* environment variables > config.toml > these defaults.
+# The OpenSky credential has one extra rung below config.toml — see [sources.opensky].
 #
 # A missing config.toml is fine — the app runs on defaults. A config.toml that exists but
 # does not parse is a hard error rather than a silent fall back to defaults, so that a typo
@@ -27,11 +28,28 @@ filter = "look_above=info,warn"
 #   https://opensky-network.org -> account settings -> create an API client
 # Env overrides: LOOK_ABOVE_OPENSKY_CLIENT_ID / LOOK_ABOVE_OPENSKY_CLIENT_SECRET
 #
-# Leave both blank to run on the no-key community fallbacks (airplanes.live, adsb.lol).
-# Set both or neither — half a pair cannot authenticate and is rejected.
+# You probably do not need to fill these in. Creating an API client downloads a
+# credentials.json:
 #
-# On a shared machine, prefer leaving client_secret blank here and exporting
-# LOOK_ABOVE_OPENSKY_CLIENT_SECRET instead, so the secret never lands on disk.
+#     {"clientId": "...", "clientSecret": "..."}
+#
+# Drop that file in the working directory and it is picked up as-is — it is gitignored
+# alongside config.toml. Precedence for this one credential is:
+#
+#     LOOK_ABOVE_OPENSKY_* > config.toml > credentials.json > (source disabled)
+#
+# The keys below are for naming the credential explicitly — pointing at a second account,
+# or keeping the secret out of a file (see below). If either key below is set, or either
+# environment variable is, credentials.json is ignored *entirely* rather than filling in the
+# gap: the two halves are issued as a pair, and an id from one client with a secret from
+# another authenticates as nobody.
+#
+# Leave everything blank and provide no credentials.json to run on the no-key community
+# fallbacks (airplanes.live, adsb.lol). OpenSky is then a disabled source, not an error.
+# Set both keys or neither — half a pair cannot authenticate and is rejected.
+#
+# On a shared machine, prefer exporting LOOK_ABOVE_OPENSKY_CLIENT_ID and
+# LOOK_ABOVE_OPENSKY_CLIENT_SECRET and keeping no credential on disk at all.
 client_id = ""
 client_secret = ""
 

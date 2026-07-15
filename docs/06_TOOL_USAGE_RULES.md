@@ -49,6 +49,6 @@ cargo bench -p core                          # only when a perf item asks for it
 
 - Commit per completed checklist item; message format:
   `M<milestone>: <what> (<rule/doc refs if privacy-relevant>)`.
-- Never commit: `config.toml`, credentials, `target/`, untrimmed fixtures, screenshots.
-  (`.gitignore` enforces; don't fight it.)
+- Never commit: `config.toml`, `credentials.json`, credentials in any other form, `target/`,
+  untrimmed fixtures, screenshots. (`.gitignore` enforces; don't fight it.)
 - Don't push, tag, or touch remotes unless the session was asked to.

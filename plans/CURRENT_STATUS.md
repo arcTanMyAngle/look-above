@@ -5,28 +5,33 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.2
-  done; 126 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.3** — OpenSky OAuth2 token fetch + cache + refresh at 80% TTL.
-  **This is the first item that needs the account** ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2);
-  without it, 1.5–1.6 (the no-key fallback adapters) are the way forward instead.
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.3
+  done; 161 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.4** — OpenSky `/states/all` bbox adapter. Auth is live, so
+  nothing blocks it. Two findings from 1.3 land in its lap: OpenSky's 429 uses
+  **`X-Rate-Limit-Retry-After-Seconds`**, not the standard `Retry-After` that 1.1 parses, so
+  the backoff floor misses their hint today; and `reqwest`'s **`query` feature is off** and the
+  bbox params need it.
+- **The OpenSky account is no longer a blocker** — the owner supplied `credentials.json`; it is
+  gitignored and read as-issued. **Live-verified**: the token endpoint accepted it (TTL 1798 s).
+  [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 is closed.
 - **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
   `look-above` and then push, in that order** — the existing repo has an underscore; the
   hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
   push is the owner's ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). Until then CI has never run —
-  M0's one unmet line. **M1 item 1.3 needs the OpenSky account** (#2); 1.2 and the fallback
-  adapters (1.5–1.6) proceed without it.
+  M0's one unmet line.
 - **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step"), and
   M1 now runs ahead of it — a failure there will surface mid-M1.
-- **No live API call has been made yet.** Every ingest test is a local mock; the first request
-  to an allowlisted host is item 1.4.
+- **The first live API call has now been made** (1.3, token endpoint — no credits, they meter
+  `/states/*`). It is an `#[ignore]`d test, so CI never repeats it. Every *automatic* ingest
+  test is still a local mock; the first live **data** request is item 1.4.
 
 ## Gate record
 
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1, 1.2 done | — |
+| M1 | in progress — 1.1, 1.2, 1.3 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -45,6 +50,34 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-15** — M1 item 1.3: OpenSky OAuth2. `ingest::opensky::auth` — `OpenSkyAuth`
+  (token fetch, cache, refresh at 80% TTL, `Ok(None)` when disabled), `Credentials`, an
+  injected `Clock`. 35 new tests, 161 total; fmt/clippy/test green. **The project made its
+  first live API call**, and it is the headline: every other test here is a mock, which proves
+  only that we parse what we *believe* OpenSky sends. An `#[ignore]`d live test proves the
+  belief — the real endpoint **accepted the owner's credentials, TTL 1798 s, refresh scheduled
+  at 1438 s = 79.98%**, confirming the documented ~30 min and validating the whole schedule
+  against reality rather than against my own fixture. It costs no credits (the ledger meters
+  `/states/*`, not the token endpoint) and stays `#[ignore]`d so CI never runs it. **The owner
+  supplied `credentials.json`** rather than transcribing into `config.toml`; it is gitignored
+  (checked untracked and absent from history *before* anything else — nothing leaked) and read
+  as-issued, at a new precedence rung below `config.toml`. That file is **all-or-nothing**: if
+  either half is configured elsewhere it is ignored entirely, because the two values are issued
+  as a pair and mixing halves builds a credential that authenticates as nobody — a 401 that
+  neither file explains. **`SecretString` moved to `core::secret`**: `ingest` must hold
+  credentials and cannot depend on `app`, and the alternative was privacy rule 7.1 implemented
+  twice. **`HttpClient::post_form` is new** — 1.1/1.2 gated `get` only, and the grant is a POST
+  carrying the secret, so a bare client for it would have routed the credential straight around
+  the allowlist. The 80% refresh is a **retry window, not just a deadline**: a failed refresh
+  reuses the still-valid token with a warning, since refreshing early and then hard-failing buys
+  nothing over refreshing at 100%. 1.2's tripwire **armed exactly as predicted** and was
+  exercised, not assumed: a `flightradar24.com` host planted in `TOKEN_ENDPOINT` failed the scan
+  with file, host and remedy named, then reverted. Two things handed to 1.4, both in
+  DECISION_LOG: OpenSky's 429 carries **`X-Rate-Limit-Retry-After-Seconds`**, not the standard
+  header 1.1 reads, so the backoff floor misses their hint; and reqwest 0.13 keeps **`query`
+  behind a feature** (as it did `form`, added here) that the bbox params will need.
+  Next: **1.4**, the `/states/all` adapter.
 
 - **2026-07-15** — M1 item 1.2: the host allowlist. `ingest::allowlist` — `AUTHORIZED_HOSTS`
   (the skill's six runtime hosts), `is_authorized_host`, and `HostPolicy`. 19 new tests, 126

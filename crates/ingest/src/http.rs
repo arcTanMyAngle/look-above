@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use look_above_core::error::SourceError;
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url, header::HeaderMap, redirect};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::allowlist::HostPolicy;
@@ -56,7 +57,10 @@ impl HttpClient {
         Self::build(REQUEST_TIMEOUT, HostPolicy::Authorized)
     }
 
-    fn build(timeout: Duration, hosts: HostPolicy) -> Result<Self, SourceError> {
+    /// `pub(crate)` so sibling modules' tests can widen the policy to reach a loopback mock
+    /// and still exercise the shipping client. Not public: outside this crate the only way
+    /// to a client is [`new`](Self::new), which cannot be talked out of the allowlist.
+    pub(crate) fn build(timeout: Duration, hosts: HostPolicy) -> Result<Self, SourceError> {
         let inner = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(timeout)
@@ -75,13 +79,34 @@ impl HttpClient {
     /// but not a different host. Checking the parsed URL — not the string — is what makes
     /// the difference between a rule and a spelling of a rule.
     pub fn get(&self, url: &str) -> Result<RequestBuilder, SourceError> {
+        Ok(self.inner.get(self.checked_url(url)?))
+    }
+
+    /// Starts a POST with a form-encoded body — the shape `OAuth2` token endpoints take.
+    ///
+    /// The only method here that sends a body, and the reason it exists is
+    /// [`opensky::auth`](crate::opensky::auth): the client-credentials grant is a POST, and
+    /// routing it through this type rather than a bare [`reqwest::Client`] is what keeps the
+    /// allowlist a choke point instead of a suggestion. The credential goes in the *body*,
+    /// never the query string — a URL reaches proxy logs and `reqwest`'s error `Display`;
+    /// a body reaches neither (privacy rule 7.1).
+    pub fn post_form<T: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        form: &T,
+    ) -> Result<RequestBuilder, SourceError> {
+        Ok(self.inner.post(self.checked_url(url)?).form(form))
+    }
+
+    /// Parses `url` and puts it through the allowlist, or refuses it.
+    fn checked_url(&self, url: &str) -> Result<Url, SourceError> {
         let url = Url::parse(url).map_err(|error| SourceError::Refused {
             // `url::ParseError` describes the fault ("invalid IPv6 address") without
             // echoing the input, so this cannot leak a token from a query string.
             reason: format!("could not parse the URL: {error}"),
         })?;
         self.hosts.check(&url)?;
-        Ok(self.inner.get(url))
+        Ok(url)
     }
 }
 
@@ -207,7 +232,7 @@ fn describe(error: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -433,6 +458,66 @@ mod tests {
         assert!(client.get("http://127.0.0.1:8080/states").is_err());
         // An authorized host still builds.
         assert!(client.get("https://api.adsb.lol/v2/point/50/8/25").is_ok());
+    }
+
+    /// The gate must cover every method that can leave the process, not just `get`.
+    ///
+    /// `post_form` is the one that carries the `OAuth2` client secret, so a gap here would
+    /// mail the credential to whatever host a bug named.
+    #[test]
+    fn post_form_is_gated_by_the_same_allowlist() {
+        let client = HttpClient::new().expect("client builds");
+        let form = [("client_secret", "super-secret")];
+
+        let error = client
+            .post_form("https://evil.example/token", &form)
+            .expect_err("prohibited host is refused");
+        let SourceError::Refused { reason } = &error else {
+            panic!("expected Refused, got {error:?}");
+        };
+        assert!(!error.is_transient());
+        assert!(!reason.contains("super-secret"), "leaked: {reason}");
+
+        // Cleartext to an otherwise-authorized host would put the secret on the wire.
+        assert!(
+            client
+                .post_form("http://auth.opensky-network.org/token", &form)
+                .is_err(),
+            "the OAuth2 grant must never go out over http"
+        );
+
+        // The real token endpoint still builds.
+        assert!(
+            client
+                .post_form(
+                    "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
+                    &form,
+                )
+                .is_ok()
+        );
+    }
+
+    /// The body actually arrives form-encoded — the shape an `OAuth2` endpoint requires.
+    #[tokio::test]
+    async fn post_form_sends_a_url_encoded_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let form = [("grant_type", "client_credentials")];
+        let request = client()
+            .post_form(&format!("{}/token", server.uri()), &form)
+            .expect("URL is allowed");
+        assert_eq!(
+            send_json::<Body>(request).await.expect("request succeeds"),
+            Body { ok: true }
+        );
     }
 
     #[test]
