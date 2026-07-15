@@ -7,20 +7,23 @@ parking lot — not into milestones.
 
 1. **[OWNER] Create the GitHub remote and push** — the repo has no remote. Docs already fix
    the identity as `github.com/arcTanMyAngle/look-above` (it's in the User-Agent, docs/09),
-   and README's CI badge points at that repo's `ci.yml`. **This is now the only thing standing
-   between M0 and a closed gate:** the 0.8 gate ran on 2026-07-15 and met 6 of 7 acceptance
-   lines; "CI runs on push; badge green" is the seventh and cannot be met without a remote
-   (the URL currently 404s). When the first push lands, watch the **Linux** job — it has never
-   executed (DECISION_LOG 0.7, "no apt step", is the first suspect if it fails).
+   and README's CI badge points at that repo's `ci.yml`. **This is the last unmet M0
+   acceptance line:** the 0.8 gate ran on 2026-07-15 and met 6 of 7; "CI runs on push; badge
+   green" is the seventh and cannot be met without a remote (the URL currently 404s). M1 was
+   opened anyway on 2026-07-15 at the owner's direction, so this is now overdue rather than
+   merely pending — every M1 commit lands unverified by CI. When the first push does land,
+   watch the **Linux** job: it has never executed (DECISION_LOG 0.7, "no apt step", is the
+   first suspect if it fails).
 2. **[OWNER] Create OpenSky account + API client** — free, at https://opensky-network.org
    (register → account settings → create API client → note client id/secret; they'll go into
-   the gitignored `config.toml` created in M0 item 0.5). Needed before M1 item 1.3; everything
-   else proceeds without it. *This is the only signup the whole project requires.*
-3. **[OWNER] Review the M0 gate** — evidence table in
-   [CURRENT_STATUS.md](CURRENT_STATUS.md). 6/7 met and the seventh is #1 above; M0 closes when
-   you accept the record and the badge goes green. *(Item 0.8 itself ran 2026-07-15 — done.)*
-4. **Open M1** after the gate closes — [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md).
-   Needs #2 by item 1.3.
+   the gitignored `config.toml` created in M0 item 0.5). **Needed before M1 item 1.3, which
+   is two items away** — 1.2 does not need it. *This is the only signup the whole project
+   requires.*
+3. **Continue M1** — [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md),
+   item 1.2 (host allowlist). 1.1 done 2026-07-15.
+4. **[OWNER] Review the M0 gate record** — evidence table in
+   [CURRENT_STATUS.md](CURRENT_STATUS.md). 6/7 met, the seventh is #1 above. M1 proceeding
+   does not retire this; it just means the review is happening late.
 
 ## Parking lot (post-v1 candidates — do not schedule)
 

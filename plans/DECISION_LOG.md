@@ -354,6 +354,65 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `cargo test --workspace` all green locally — 87 tests (51 core, 31 app, 5 render), unchanged
   by this item, which adds no Rust code.
 
+## 2026-07-15 — M1 opened with the M0 gate at 6/7 (owner call)
+
+- **M0 closes with the badge line outstanding.** The owner directed "continue to M1" while the
+  0.8 gate stands at six of seven acceptance lines, the seventh being "CI runs on push; badge
+  green" — still unmeetable, still for the same reason (no git remote; NEXT_ACTIONS #1). This
+  is recorded as a decision rather than a silent transition because CLAUDE.md says not to start
+  a milestone at an open gate unprompted, and this was prompted. Nothing about the blocker
+  changed; the risk carried forward is that the Linux CI job has never executed, so the first
+  push may surface a failure attributable to M0 work while M1 is already underway.
+
+## 2026-07-15 — M1 item 1.1: the shared HTTP client
+
+- **`SourceError::Request { status }` added — docs/09's taxonomy was incomplete.** The listed
+  variants are `{Auth, RateLimited, Network, Parse, Server}`, and a plain 400/404/410 fits none
+  of them: `Auth` is a lie, `Server` means 5xx *and* is transient, and `Parse` is documented as
+  non-fatal "log and skip". Every option therefore either retries a permanent failure forever
+  or swallows it silently — a 404 from a moved endpoint would be invisible. The new variant is
+  non-transient, so the poller fails over instead of burning budget on our own bug. This
+  extends a doc rather than following it, which is why it is here.
+- **`Retry-After` is a floor, not an appointment: `max(header, jittered_backoff)`.** The header
+  means "not before", so waiting longer always honors it and waiting less never does. Honoring
+  it *exactly* would pin us to the server's suggestion and drop the escalation on repeated
+  429s — a source answering `Retry-After: 1` would have us back once a second indefinitely.
+  A `Retry-After` beyond the 5-min cap is honored **in full**: the cap governs our own
+  guesswork, not an explicit instruction from the source (CLAUDE.md: never exceed documented
+  rate limits).
+- **Equal jitter (`[d/2, d]`), not the more usual full jitter (`[0, d]`).** Full jitter can
+  schedule a retry milliseconds after a 429 — the one response that means *stop asking*. Half
+  the delay stays fixed, which puts a floor under every retry and still spreads them out.
+- **`Retry-After` is parsed as delta-seconds only.** RFC 9110 also permits an HTTP-date; that
+  would cost a date-parsing dependency to serve a form none of the allowlisted sources send.
+  An unparseable header is not an error — it degrades to `None`, i.e. the exponential
+  schedule, so the failure mode is "we wait longer", never "we wait less".
+- **`fastrand` 2.4.1 for jitter, not `rand`.** `rand` is the ecosystem default, but its default
+  features pull in chacha20 — a CSPRNG, to smear a retry by a few seconds. `fastrand` is one
+  crate with no dependencies. The randomness here is not security-relevant; if anything in this
+  project ever needs a CSPRNG, that is the moment to add `rand`, not now.
+- **Error messages strip the URL (`reqwest::Error::without_url`).** `reqwest`'s `Display`
+  includes the failing URL, and privacy rule 7.1 bars credentials from logs — a source taking a
+  token as a query parameter would put one in every error string. The poller already knows the
+  `SourceId` it called, so the URL adds nothing. Asserted by a test that requests
+  `?access_token=super-secret` and greps the message.
+- **`wiremock` 0.6.5 as a dev-dependency.** Not a new choice — docs/10 §2 already mandates it
+  for adapter tests. Pulled in at 1.1 rather than 1.4 so the User-Agent and the timeout are
+  verified *on the wire* at the moment they are introduced; a constant asserted against itself
+  proves nothing about what reqwest actually sends.
+- **The 10 s timeout is asserted two ways** — as a constant, and by a mock that hangs for 30 s
+  against a 200 ms client (mechanism: `Client::timeout` is wired and maps to `Network`).
+  Asserting the mechanism *at* 10 s would mean a ten-second test. Every other mock test uses
+  the real 10 s client: a tight deadline against loopback buys nothing but CI flakes.
+- **A test caught its own flake before CI could.** The privacy test originally dropped a
+  `MockServer` to get a connection failure; with tests running in parallel another server bound
+  the freed port and answered 404. It now targets `127.0.0.1:1` — refused instantly, no DNS,
+  and nothing a sibling test can bind underneath it.
+- **Verification:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
+  `cargo test --workspace` all green — **107 tests** (51 core, 31 app, 20 ingest, 5 render),
+  ingest suite 0.22 s. No network was contacted: every test is a local mock, and no
+  allowlisted host has been called yet (that starts at 1.4).
+
 ## 2026-07-15 — M0 item 0.8: the gate
 
 - **M0 does not close: six of seven acceptance lines are met, the seventh cannot be checked.**

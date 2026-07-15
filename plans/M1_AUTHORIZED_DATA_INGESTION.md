@@ -14,8 +14,16 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
 
 ## Checklist
 
-- [ ] 1.1 `ingest::http`: shared reqwest client — 10 s timeouts, User-Agent per docs/09,
+- [x] 1.1 `ingest::http`: shared reqwest client — 10 s timeouts, User-Agent per docs/09,
       backoff helper (exponential + jitter, honors Retry-After), `SourceError` mapping.
+      *(2026-07-15: done — `ingest::http` (client, `send_json`, status/transport mapping) +
+      `ingest::http::backoff` (pure `retry_delay`). 20 tests, wiremock-backed per docs/10 §2:
+      the User-Agent and the timeout are asserted on the wire, not just as constants.
+      `SourceError::Request { status }` added to `core` for non-auth, non-429 4xx — docs/09's
+      taxonomy had no non-retryable home for a 400/404. `Retry-After` is a floor
+      (`max(header, backoff)`), honored past the 5-min cap; parsed as delta-seconds only.
+      Equal jitter, not full jitter — a 429 must never be retried milliseconds later. New
+      deps: `fastrand` (jitter), `wiremock` (dev). Rationale in DECISION_LOG.)*
 - [ ] 1.2 Allowlist const + test (docs/10 §privacy): permitted hosts only.
 - [ ] 1.3 OpenSky auth: OAuth2 client-credentials token fetch + cache + refresh at 80% TTL;
       credentials from config; graceful "no credentials" state (source disabled, not error).

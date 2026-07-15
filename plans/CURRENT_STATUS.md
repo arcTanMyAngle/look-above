@@ -5,22 +5,25 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 items 0.1–0.7 done; gate 0.8 **run — 6 of 7 acceptance lines met** (evidence
-  below). 87 tests green. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** **human review of the M0 gate.** M1 does not start until it closes.
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Item 1.1 done;
+  107 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.2** — allowlist const + test (permitted hosts only, docs/10
+  §privacy). Needs no account; 1.3 is the first item that does.
 - **Blockers:** **no git remote** (`git remote -v` empty; the repo 404s) → CI has never run and
-  the badge can't be green. That is the unmet line; no code fixes it, the owner must push
-  ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). M1 item 1.3 separately needs the OpenSky account (#2).
-- **Decisions pending:** does M0 close with the badge outstanding? Recommend no — nothing else
-  is left, and the first push settles it.
-- **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step").
+  the badge can't be green. This is M0's one unmet acceptance line; no code fixes it, the owner
+  must push ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). **M1 item 1.3 needs the OpenSky account**
+  (#2) — 1.2 and the fallback adapters (1.5–1.6) proceed without it.
+- **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step"), and
+  M1 now runs ahead of it — a failure there will surface mid-M1.
+- **No live API call has been made yet.** Every ingest test is a local mock; the first request
+  to an allowlisted host is item 1.4.
 
 ## Gate record
 
 | Milestone | Status | Evidence |
 |---|---|---|
-| M0 | **gate run 2026-07-15 — 6/7, awaiting human review + the badge** | per-line below |
-| M1 | not started | — |
+| M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
+| M1 | in progress — 1.1 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -39,6 +42,25 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-15** — **M1 opened at the owner's direction** with the M0 gate still at 6/7 (the
+  badge line needs a push that hasn't happened; nothing about the blocker changed). Then M1
+  item 1.1: `ingest::http` — the shared reqwest client (User-Agent + 10 s timeout per docs/09),
+  `send_json`, the `SourceError` mapping, and `ingest::http::backoff` (pure `retry_delay`,
+  base 5 s → cap 5 min). 20 new tests, 107 total; fmt/clippy/test green. Three calls worth
+  knowing about, all in DECISION_LOG. **`SourceError::Request { status }` is new in `core`** —
+  docs/09's taxonomy had no non-retryable home for a 400/404, so every existing variant either
+  retried a permanent failure forever or swallowed it silently; this extends a doc rather than
+  following one. **`Retry-After` is treated as a floor**, `max(header, backoff)`, and honored
+  in full even past the 5-min cap — the header means "not before", so waiting longer honors it
+  while honoring it *exactly* would drop escalation on repeated 429s. **Equal jitter, not full
+  jitter**, because full jitter can retry milliseconds after a 429. Testing followed 0.8's
+  habit of checking the artifact, not a proxy: wiremock (docs/10 §2 already required it, pulled
+  in early) proves the User-Agent and the timeout on the wire rather than asserting constants
+  against themselves. The privacy test caught its own flake before CI could — dropping a
+  `MockServer` for a connection failure let a parallel test bind the freed port and answer 404;
+  it targets `127.0.0.1:1` now. New deps: `fastrand` (jitter; `rand`'s defaults drag in a
+  CSPRNG to smear a retry), `wiremock` (dev). Next: **1.2**, the host allowlist.
 
 - **2026-07-15** — M0 item 0.8: the gate. Ran acceptance §M0 — **6 of 7 lines met**, per-line
   evidence in the table above; no code changed. The gate is recorded as *run*, not passed: the

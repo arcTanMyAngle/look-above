@@ -36,13 +36,21 @@ pub enum SourceError {
     /// HTTP 5xx — upstream is unhealthy; back off and consider failing over.
     #[error("upstream server error: HTTP {status}")]
     Server { status: u16 },
+
+    /// A 4xx that is none of the above (400, 404, 410 …) — *our* request was wrong, or
+    /// the endpoint moved. Permanent by nature: the same request will fail the same way,
+    /// so the poller fails over rather than retrying. Extends docs/09's list, which had
+    /// no home for a non-auth, non-429 client error (`DECISION_LOG` 2026-07-15, item 1.1).
+    #[error("source rejected the request: HTTP {status}")]
+    Request { status: u16 },
 }
 
 impl SourceError {
     /// Whether retrying the same request later could plausibly succeed.
     ///
     /// `Auth` is excluded: retrying with the same rejected credentials only burns
-    /// budget. `Parse` is excluded: the bytes will not change on a re-fetch.
+    /// budget. `Parse` is excluded: the bytes will not change on a re-fetch. `Request`
+    /// is excluded: the source understood us and said no.
     pub const fn is_transient(&self) -> bool {
         matches!(
             self,
@@ -96,5 +104,6 @@ mod tests {
             }
             .is_transient()
         );
+        assert!(!SourceError::Request { status: 404 }.is_transient());
     }
 }
