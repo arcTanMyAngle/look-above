@@ -5,11 +5,12 @@
 //! ([`LiveSource`], [`Store`]) that `ingest`, `store`, and `render` implement
 //! against — see `docs/09_API_CONTRACTS.md`.
 //!
-//! M0 item 0.3 defines those shapes; `core::geo` lands in 0.4 and the
-//! interpolation pipeline (`core::sim`, `core::merge`) in M2.
+//! M0 items 0.3–0.4 define those shapes and the geo math; the interpolation
+//! pipeline (`core::sim`, `core::merge`) lands in M2.
 
 pub mod contracts;
 pub mod error;
+pub mod geo;
 pub mod types;
 
 pub use contracts::{

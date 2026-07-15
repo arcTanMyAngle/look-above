@@ -41,8 +41,11 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       *(2026-07-15: done — `core::types` / `core::error` / `core::contracts`, 23 unit tests.
       `async-trait` added for dyn-compatible `LiveSource`; `RenderFeed` and serde derives
       deferred (not in scope / no consumer yet). Rationale in DECISION_LOG.)*
-- [ ] 0.4 `core::geo`: haversine, bearing, destination-point, Web Mercator fwd/inv — with the
+- [x] 0.4 `core::geo`: haversine, bearing, destination-point, Web Mercator fwd/inv — with the
       golden-value unit tests from docs/10 §1 (this is real M0 code, it unblocks everything).
+      *(2026-07-15: done — 28 geo tests. Goldens are analytic arcs + the published `EPSG:3857`
+      constants. Orthographic globe (docs/10 §1) deferred to M2 with the L0 camera; proptest
+      deferred in favour of a deterministic sweep. Rationale in DECISION_LOG.)*
 - [ ] 0.5 `app`: config loading (`config.toml` → struct via serde, env var overrides
       `LOOK_ABOVE_*`, defaults when absent); tracing init; `config.example.toml`; `.gitignore`
       (config.toml, target/, qa/, *.db).

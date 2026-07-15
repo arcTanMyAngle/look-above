@@ -136,3 +136,48 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   fields (projected positions, LOD tier, label rects) depend on M2 render decisions.
 - **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green on Windows / rustc
   1.96.0; 23 new unit tests in `core`.
+
+## 2026-07-15 — M0 item 0.4 (`core::geo`)
+
+- **Two Earth radii, deliberately not unified** — great-circle math uses the IUGG mean radius
+  `6_371_008.8` m; Web Mercator uses the WGS84 semi-major axis `6_378_137.0` m because
+  `EPSG:3857` is *defined* on it. Collapsing them to one constant would silently shift every
+  projected position by ~0.1%. Both are named consts with the reason on them.
+- **Spherical, not ellipsoidal** (no `geographiclib`/Vincenty) — ~0.5% worst-case error against
+  WGS84, far below the feeds' own position error, and cheap enough to dead-reckon every
+  tracked aircraft per frame. Revisit only if a measurement feature (not a display feature)
+  ever needs it.
+- **Projection output is `EPSG:3857` metres**, not normalized [0,1] tile space — it is the
+  standard definition, so it can be checked against published constants
+  (`20037508.342789244`), and the camera can scale metres to clip space in M2 without `core`
+  needing to know about viewports.
+- **`LatLon` / `MercatorXy` structs rather than `(f64, f64)` tuples** — lat/lon transposition
+  is the classic silent bug in geo code: it yields a plausible position elsewhere on Earth
+  rather than an error. `LatLon` is unvalidated (feeds are its source; validation belongs at
+  the M1 parse boundary, not the hot path), unlike `BBox`, which is camera/config input and
+  validates in `new`.
+- **Mercator forward implemented as `R·artanh(sin φ)`, not `R·ln(tan(π/4 + φ/2))`** — the two
+  are the same function (inverse Gudermannian), but the tan form blows up approaching the
+  latitude limit. A test pins the equivalence so an edit to either form must keep them agreeing.
+- **Forward projection clamps latitude to ±85.051128779806590° instead of erroring** — the
+  projection is undefined only at the poles, and a camera panned to the top of the map should
+  show the map's edge, not fail.
+- **Golden values are analytic arcs, not recalled table values** — quarter-equator, pole-to-pole,
+  antipodal, one meridian degree, plus the published `EPSG:3857` constants. Rationale: a
+  "golden" number recalled from memory is not golden. This was not theoretical — the first
+  draft asserted LAX→JFK ≈ 3,983 km from memory and failed against the implementation's
+  3,974.2 km. The implementation was right (every analytic test passed); the remembered figure
+  was the *flight* distance, not the great circle. The test now asserts 2,145 nm, the unit the
+  Great Circle Mapper publishes, and is documented as a cross-check rather than the proof.
+- **No `proptest` dep; deterministic sweep instead** — docs/10 §1 asks for
+  `inverse(forward(p)) ≈ p` within 1e-9°, which a fixed lat/lon grid (>1,000 points, corners
+  and limits included) covers reproducibly without a new dev-dependency or a random seed in CI.
+  Revisit when `core::sim` lands in M2, where randomized properties earn their keep.
+- **Orthographic globe projection deferred to M2** — docs/10 §1 lists it under geo math, but
+  plan item 0.4 does not, and it is the L0 camera's projection (docs/01). It lands with the
+  camera that needs it.
+- **No rayon batch/projection helpers yet** — docs/10 §5 budgets a 10k-point projection batch
+  at < 0.5 ms, but a parallel batch API with no caller is a guess at the call shape. Add it in
+  M2 alongside the pipeline stage, with the criterion bench.
+- **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green on Windows / rustc
+  1.96.0; 28 new geo tests (51 in `core` total).

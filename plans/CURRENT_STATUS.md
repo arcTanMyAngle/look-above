@@ -5,10 +5,11 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 in progress — `core` vocabulary + crate seams defined (fmt/clippy/test green).
-- **Active milestone:** M0, items 0.1–0.3 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** M0 checklist item 0.4 (`core::geo`: haversine, bearing, destination-point,
-  Web Mercator fwd/inv, with the golden-value unit tests from docs/10 §1).
+- **Phase:** M0 in progress — `core` vocabulary, seams, and geo math done (51 tests green).
+- **Active milestone:** M0, items 0.1–0.4 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
+- **Next action:** M0 checklist item 0.5 (`app`: config loading `config.toml` → serde struct,
+  `LOOK_ABOVE_*` env overrides, defaults when absent; tracing init; `config.example.toml`;
+  `.gitignore` for config.toml/target/qa/*.db).
 - **Blockers:** none for M0. Before M1 item 1.3, the owner must create a free OpenSky
   account + API client (see [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1).
 - **Decisions pending:** none — ADRs 001–005 accepted (docs/02).
@@ -23,6 +24,17 @@
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ## Session log (newest first)
+
+- **2026-07-15** — M0 item 0.4: `core::geo` — haversine, initial bearing, destination-point
+  (the dead-reckoning step), Web Mercator fwd/inv in `EPSG:3857` metres, `LatLon`/`MercatorXy`
+  types, lon/bearing normalization. Two radii kept distinct (mean 6371008.8 for great-circle,
+  WGS84 6378137.0 for Mercator per its definition). Goldens are analytic arcs + published
+  `EPSG:3857` constants, not recalled figures — a remembered LAX→JFK value was wrong and the
+  code was right; test now pins the published 2,145 nm. Deferred: orthographic globe (M2, L0
+  camera), proptest (deterministic sweep covers docs/10's 1e-9° round-trip), rayon batch
+  helpers (M2, with the bench). 28 geo tests, 51 in `core`; fmt/clippy/test green.
+  Also rewrote README for a human reader: explains ICAO24/ADS-B/TIS-B/ADS-R/dead reckoning,
+  and states plainly that the project needs no receiver hardware. Next: 0.5.
 
 - **2026-07-15** — M0 item 0.3: `core` types + contracts — `core::types` (StateVector, Icao24,
   CallSign, BBox, SourceId, UnixSeconds), `core::error` (SourceError/StoreError, backend-agnostic),
