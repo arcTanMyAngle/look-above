@@ -1,0 +1,48 @@
+# Look Above — example configuration.
+#
+# Copy this file to config.toml and edit it:
+#
+#     cp config.example.toml config.toml
+#
+# config.toml is gitignored and must stay that way: credentials never belong in the
+# repository (privacy rule 7.1, docs/04).
+#
+# Every value below is the built-in default, so a verbatim copy of this file behaves
+# exactly like having no config.toml at all. Delete any line to take its default.
+#
+# Precedence: LOOK_ABOVE_* environment variables > config.toml > these defaults.
+#
+# A missing config.toml is fine — the app runs on defaults. A config.toml that exists but
+# does not parse is a hard error rather than a silent fall back to defaults, so that a typo
+# in this file cannot quietly cost you your credentials or your retention setting. Unknown
+# keys are rejected for the same reason.
+
+[log]
+# tracing-subscriber EnvFilter directives: our crates at info, everything else at warn.
+# Env override: LOOK_ABOVE_LOG_FILTER   (RUST_LOG is not consulted)
+filter = "look_above=info,warn"
+
+[sources.opensky]
+# OpenSky Network OAuth2 client credentials. A free account gets 4,000 credits/day:
+#   https://opensky-network.org -> account settings -> create an API client
+# Env overrides: LOOK_ABOVE_OPENSKY_CLIENT_ID / LOOK_ABOVE_OPENSKY_CLIENT_SECRET
+#
+# Leave both blank to run on the no-key community fallbacks (airplanes.live, adsb.lol).
+# Set both or neither — half a pair cannot authenticate and is rejected.
+#
+# On a shared machine, prefer leaving client_secret blank here and exporting
+# LOOK_ABOVE_OPENSKY_CLIENT_SECRET instead, so the secret never lands on disk.
+client_id = ""
+client_secret = ""
+
+[storage]
+# SQLite database file, relative to the working directory unless absolute.
+# Env override: LOOK_ABOVE_DB_PATH
+db_path = "look_above.db"
+
+# How long position history is kept, in hours.
+# Env override: LOOK_ABOVE_RETENTION_HOURS
+#
+# Default 24, hard maximum 168 (7 days). Privacy rule 5.1 allows configuring this downward
+# only; a larger value is rejected rather than clamped. 0 keeps no history at all.
+retention_hours = 24

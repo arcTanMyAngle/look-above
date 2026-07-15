@@ -5,13 +5,15 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 in progress — `core` vocabulary, seams, and geo math done (51 tests green).
-- **Active milestone:** M0, items 0.1–0.4 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** M0 checklist item 0.5 (`app`: config loading `config.toml` → serde struct,
-  `LOOK_ABOVE_*` env overrides, defaults when absent; tracing init; `config.example.toml`;
-  `.gitignore` for config.toml/target/qa/*.db).
-- **Blockers:** none for M0. Before M1 item 1.3, the owner must create a free OpenSky
-  account + API client (see [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1).
+- **Phase:** M0 in progress — `core` done; `app` loads config + inits tracing (75 tests green).
+- **Active milestone:** M0, items 0.1–0.5 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
+- **Next action:** M0 item 0.6 (`app`: winit window "Look Above", dark clear via wgpu surface,
+  resize + close handling, frame-stats stub in the log).
+- **Acceptance §M0:** all 3 config lines met, verified live. Left: clean-clone build, CI badge,
+  `cargo tree` direction, window.
+- **Blockers:** none for M0. Before M1 item 1.3 the owner must create a free OpenSky account +
+  API client ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1); config fields exist and are empty until
+  then — absence is a supported state, not an error.
 - **Decisions pending:** none — ADRs 001–005 accepted (docs/02).
 
 ## Gate record
@@ -24,6 +26,19 @@
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ## Session log (newest first)
+
+- **2026-07-15** — M0 item 0.5: `app::config` + `app::logging` — `config.toml` → serde struct,
+  `LOOK_ABOVE_*` overrides, tracing init, `config.example.toml`. Precedence env > file >
+  default. The item's real decision was the one the plan didn't answer: acceptance §M0 excuses
+  a *missing* file, not a broken one, so absence → defaults but a present-but-unparseable file
+  (or an unknown key, or retention past the 7-day cap) is a hard error — silent defaults hide
+  a typo, and the app then looks fine while running unauthenticated or keeping the wrong
+  history. Credentials are a redacted-`Debug` `SecretString` (rule 7.1) and the startup line
+  logs only `configured|absent`. Env injected via an `EnvSource` trait because `set_var` is
+  `unsafe` in edition 2024. No new deps (`toml` was pinned in 0.2 for exactly this; a small
+  `TempDir` avoids `tempfile`). `.gitignore` already covered all four paths — verified, not
+  recreated. 24 app tests, 75 workspace; fmt/clippy/test green. Binary exercised beyond the
+  tests: no file → defaults, env beats file, broken file → exit 1 with line/column. Next: 0.6.
 
 - **2026-07-15** — M0 item 0.4: `core::geo` — haversine, initial bearing, destination-point
   (the dead-reckoning step), Web Mercator fwd/inv in `EPSG:3857` metres, `LatLon`/`MercatorXy`

@@ -181,3 +181,51 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   M2 alongside the pipeline stage, with the criterion bench.
 - **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green on Windows / rustc
   1.96.0; 28 new geo tests (51 in `core` total).
+
+## 2026-07-15 — M0 item 0.5 (config + tracing)
+
+- **Precedence: environment > file > default.** `LOOK_ABOVE_*` beats `config.toml` beats the
+  built-in default. Rationale: the environment is the more specific, more immediate context
+  (a shell, a CI job, a secrets injector) while the file is the machine's persistent choice;
+  the narrower scope should win. Privacy rule 7.1 also names environment variables as a home
+  for credentials, which *requires* env to work with no file present and to beat a stale file.
+- **A missing `config.toml` yields defaults; a present-but-broken one is a hard error.**
+  Acceptance §M0 excuses *absence* only, and the two cases carry different information.
+  Absence is unambiguous ("I have no config, use defaults"). A parse failure is evidence of
+  intent — the operator meant to configure something and mistyped it. Silently defaulting
+  there hides the typo and the app then *looks* fine while running unauthenticated on a
+  fallback source, or keeping the wrong amount of history. Only `ErrorKind::NotFound` takes
+  the defaults path; every other read failure (permissions, a directory in the way) errors.
+  Verified live: a broken file exits 1 with the toml line/column.
+- **Unknown keys are rejected** (`deny_unknown_fields`). The same argument one step down: a
+  typo'd *key* (`clientid`) is indistinguishable from an absent one, which is exactly how a
+  credential goes silently missing. Costs forward-compatibility (an old binary rejects a
+  newer file) — acceptable pre-v1, revisit if config ever ships ahead of binaries.
+- **Retention above the 7-day cap is rejected, not clamped.** Privacy rule 5.1 says history is
+  configurable downward only. Clamping would silently give someone 168 h when they asked for
+  720; a warning at load time is also unreliable, since config is read *before* the subscriber
+  exists and the warning would be dropped. Erroring needs no logger and cannot be missed.
+  `retention_hours = 0` is legal — keeping nothing is the private extreme, not a mistake.
+- **Half an `OpenSky` credential is an error**, blank is not. Blank/whitespace credentials
+  normalize to `None` ("run on the no-key fallbacks"), so `config.example.toml` copied
+  verbatim behaves exactly like having no file — a property the test suite asserts. But
+  id-without-secret cannot authenticate and reads as a typo, so it fails loudly. The split
+  "id in the file, secret in the environment" is supported and tested.
+- **Credentials are `SecretString` with a redacted `Debug`** — privacy rule 7.1 says never in
+  logs, and `#[derive(Debug)]` on a config struct is precisely how a secret reaches one. The
+  startup line logs `opensky_credentials = configured|absent`, never a value. Regression-tested.
+- **No config crate (`figment`/`config`/`clap`).** `toml` was pinned in item 0.2 for this; the
+  whole loader is ~5 env keys over a serde struct. No new dependency was added, including for
+  tests: a 20-line self-cleaning `TempDir` avoids `tempfile`.
+- **Environment is injected via an `EnvSource` trait, not read globally.** `std::env::set_var`
+  is `unsafe` in edition 2024 (and the workspace warns on `unsafe_code`), and the environment
+  is process-global state that parallel tests race on. Tests pass a `BTreeMap`; `main` passes
+  `SystemEnv`. This is why "env override wins" is testable at all.
+- **`RUST_LOG` is deliberately not consulted** — `LOOK_ABOVE_LOG_FILTER` is the one variable,
+  keeping a single precedence chain. Two variables with their own ordering is a second thing
+  to reason about when the logs come out empty.
+- **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green; 24 new tests in `app`
+  (75 workspace-wide). Beyond the tests, the binary was exercised: no file → defaults + clean
+  run; file → values read; env on top → env wins; broken file → exit 1 with line/column;
+  over-cap → refused by name; typo'd key → refused. `git check-ignore` confirms `config.toml`
+  is ignored (`.gitignore:2`) and `git status` never saw the real one used during testing.

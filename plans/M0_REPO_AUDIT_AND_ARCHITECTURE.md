@@ -46,9 +46,16 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       *(2026-07-15: done — 28 geo tests. Goldens are analytic arcs + the published `EPSG:3857`
       constants. Orthographic globe (docs/10 §1) deferred to M2 with the L0 camera; proptest
       deferred in favour of a deterministic sweep. Rationale in DECISION_LOG.)*
-- [ ] 0.5 `app`: config loading (`config.toml` → struct via serde, env var overrides
+- [x] 0.5 `app`: config loading (`config.toml` → struct via serde, env var overrides
       `LOOK_ABOVE_*`, defaults when absent); tracing init; `config.example.toml`; `.gitignore`
       (config.toml, target/, qa/, *.db).
+      *(2026-07-15: done — `app::config` + `app::logging`, 24 tests. Precedence env > file >
+      default. A missing file defaults; a present-but-broken one is a hard error (so does an
+      unknown key, and retention over the 7-day cap) — acceptance §M0 excuses absence only,
+      and silent defaults hide a typo. Credentials are a redacted-`Debug` `SecretString`
+      (rule 7.1); `OpenSky` fields defined but empty, pending the account (M1 1.3).
+      `.gitignore` already covered all four paths — verified, not recreated. No new deps.
+      Rationale in DECISION_LOG.)*
 - [ ] 0.6 `app`: winit window (title "Look Above", dark clear color via wgpu surface),
       resize + close handling, frame-stats stub in log.
 - [ ] 0.7 CI: GitHub Actions — fmt --check, clippy -D warnings, test --workspace on
