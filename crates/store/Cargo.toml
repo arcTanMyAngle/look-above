@@ -1,0 +1,13 @@
+[package]
+name = "look-above-store"
+description = "SQLite persistence: schema, migrations, single-writer thread."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+look-above-core = { path = "../core" }
+
+[lints]
+workspace = true

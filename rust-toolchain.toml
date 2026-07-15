@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned stable per ADR-001. Bump deliberately (record in plans/DECISION_LOG.md).
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

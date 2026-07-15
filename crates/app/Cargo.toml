@@ -1,0 +1,16 @@
+[package]
+name = "look-above"
+description = "Look Above: native flight tracker binary — wiring, config, event loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+look-above-core = { path = "../core" }
+look-above-ingest = { path = "../ingest" }
+look-above-store = { path = "../store" }
+look-above-render = { path = "../render" }
+
+[lints]
+workspace = true

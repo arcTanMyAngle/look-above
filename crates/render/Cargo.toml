@@ -1,0 +1,13 @@
+[package]
+name = "look-above-render"
+description = "wgpu pipelines, WGSL shaders, camera. No network, no DB."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+look-above-core = { path = "../core" }
+
+[lints]
+workspace = true

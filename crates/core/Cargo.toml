@@ -1,0 +1,12 @@
+[package]
+name = "look-above-core"
+description = "Types, geo math, and simulation contracts. No I/O dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

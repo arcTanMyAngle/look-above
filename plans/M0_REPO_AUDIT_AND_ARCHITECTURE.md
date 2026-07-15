@@ -25,8 +25,9 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
 
 ## Checklist
 
-- [ ] 0.1 `cargo new` workspace + five crates; workspace-level `[lints]` (clippy pedantic
+- [x] 0.1 `cargo new` workspace + five crates; workspace-level `[lints]` (clippy pedantic
       subset agreed in ADR); `rust-toolchain.toml` pinning stable; edition 2024.
+      *(2026-07-15: done — stable 1.96.0 pinned; lint subset in root Cargo.toml, see DECISION_LOG.)*
 - [ ] 0.2 Pin dependencies (exact versions, workspace `[workspace.dependencies]`):
       tokio (rt-multi-thread, macros), reqwest (json, rustls), serde/serde_json, rayon,
       crossbeam-channel, rusqlite (bundled), wgpu, winit, thiserror, anyhow (app only),

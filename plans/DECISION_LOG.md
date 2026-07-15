@@ -25,3 +25,20 @@ Format: `date — decision — rationale — (ADR-ref if any)`.
 - **Docs-first workflow with milestone gates** — one checklist item per AI session, handoff
   via plans/CURRENT_STATUS.md; model-to-task mapping in docs/12.
 - **GitHub: push to `arcTanMyAngle/look-above`** — private by default until owner says otherwise.
+
+## 2026-07-15 — M0 item 0.1 (workspace skeleton)
+
+- **Toolchain pinned to 1.96.0** in `rust-toolchain.toml` (exact stable version, not the
+  `stable` channel) — reproducible builds across machines/CI; bumps are deliberate and logged.
+  (ADR-001)
+- **Clippy lint set** (root `Cargo.toml` `[workspace.lints]`, inherited by all crates via
+  `[lints] workspace = true`): `clippy::all` + `clippy::pedantic` at warn (CI runs
+  `-D warnings`, so effectively deny); `clippy::unwrap_used = warn` to enforce the
+  "no unwrap outside tests" rule. Allowed pedantic exceptions: `module_name_repetitions`,
+  `must_use_candidate`, `missing_errors_doc`, `missing_panics_doc`, `float_cmp` — noise
+  outweighs value for this codebase. Also `unsafe_code = warn` and
+  `missing_debug_implementations = warn` at the rustc level.
+- **Crate/package naming:** packages `look-above-core/-ingest/-store/-render` in
+  `crates/<short-name>/` directories; the binary package is `look-above` (crates/app).
+- **Workspace resolver 3**, shared `version`/`edition`/`rust-version`/`license` via
+  `[workspace.package]`. Dependency pins deferred to item 0.2 as planned.

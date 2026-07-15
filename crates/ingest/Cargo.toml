@@ -1,0 +1,13 @@
+[package]
+name = "look-above-ingest"
+description = "LiveSource adapters, pollers, and rate/credit budgeting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+look-above-core = { path = "../core" }
+
+[lints]
+workspace = true
