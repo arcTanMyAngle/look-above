@@ -482,3 +482,56 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
 - **Verification:** all three commands green on Windows; 87 tests (51 core, 31 app, 5 render).
   No code changed at this item. Working tree clean afterwards — the runs left no `config.toml`
   or `*.db` behind in the repo.
+
+## 2026-07-15 — M1 item 1.2 (host allowlist)
+
+- **The allowlist is an enforced gate, not a checked const** — docs/10 §privacy specifies
+  "a single const list of permitted hosts; test walks all adapter base URLs and asserts
+  membership". Implemented as written it would assert over an *empty set* today (no adapters
+  until 1.3) and, once they exist, would only ever see the base URLs an adapter remembered to
+  declare — not a URL built at the call site. So `ingest::allowlist::HostPolicy` is checked in
+  `HttpClient::get`, the choke point item 1.1 already established every adapter must pass
+  through, against the parsed `Url` that would go on the wire. This extends a doc rather than
+  following it; the const list and the membership test it asks for both exist.
+- **Redirects are gated too.** `reqwest` follows up to 10 by default, so a gate that only
+  checks the outbound URL is one `Location` header away from meaningless — an authorized host
+  could hand us anywhere. A custom `redirect::Policy` applies the same check per hop. Because
+  installing a custom policy *replaces* reqwest's default limit rather than adding to it,
+  `MAX_REDIRECTS = 10` is restated explicitly, matching `Policy::limited`'s own `>` comparison
+  (`previous()` counts the original request; `>=` silently costs a hop — caught by a test that
+  asserts the request count on the mock, not by reading the docs).
+- **`SourceError::Refused { reason }` added to `core`** — the second extension of docs/09's
+  taxonomy after 1.1's `Request`. Every other variant reports what a source *did*; this one
+  reports that we declined to ask. It needed to exist: `Network` is transient, so a refusal
+  mapped there would retry an unauthorized host forever, and `Request` claims an HTTP exchange
+  that never happened. Not transient, and not a reason to fail over — the next source would be
+  asked the same wrong question. One variant covers both an unparseable URL and a rejected
+  origin, since the caller's only branch is "permanent".
+- **Exact host matching, never suffix.** `ends_with("opensky-network.org")` also welcomes
+  `evil-opensky-network.org`. `auth.opensky-network.org` is listed in full instead. The test
+  pins eight lookalikes that a `contains`/`ends_with`/`starts_with` allowlist would admit.
+- **HTTPS is part of the gate**, not a property of the URL string: an `http://` typo on the
+  token endpoint would put the OAuth2 client secret on the wire in cleartext.
+- **Refusals log scheme + host only** — never path or query (privacy 7.1), same reasoning as
+  1.1's `without_url()`: a source taking a token as a query param would otherwise leak it into
+  every refusal.
+- **Scope: runtime hosts only.** The skill also authorizes bulk static downloads (OurAirports,
+  FAA registry, openflights, Natural Earth). They are deliberately *not* on the list: they are
+  fetched by import tooling at setup time, not by `ingest`, and `raw.githubusercontent.com`
+  serves anyone's repository — widening the live-polling gate to cover a build step it never
+  uses weakens it for nothing. That tooling extends the list on purpose when it lands.
+- **`#[cfg(test)]` escape hatch, not a cargo feature.** Tests point the *real* client at a
+  loopback mock, so `HostPolicy` has an `AuthorizedOrLoopback` variant gated on `cfg(test)`.
+  A `testing` feature was rejected: cargo feature unification could switch a privacy gate off
+  in a shipped binary via an unrelated crate's dependency. `cfg(test)` cannot escape this
+  crate's own test build. One test builds via `HttpClient::new` to prove loopback is refused
+  in production.
+- **The membership test scans source, not a registry.** It walks `src/**/*.rs`, skips comment
+  lines (so citing a spec URL in a doc comment is not a failure — a rule that punishes
+  documentation gets deleted), truncates at `#[cfg(test)]\nmod tests`, and asserts every URL
+  literal's host is on the list. Today the crate has no request URL, so the walk is a tripwire
+  that arms itself at 1.3; the extractor therefore has its own unit test, and the walk asserts
+  it visited ≥ 1 file — a scan that silently found nothing would pass forever.
+- **Verification:** the tripwire was exercised rather than assumed — a `flightradar24.com`
+  const planted in `http.rs` failed the test with the file, host, and remedy named, then
+  reverted. 126 tests (51 core, 39 ingest, 31 app, 5 render); fmt/clippy/test green.

@@ -5,14 +5,20 @@
 //! them right and one place to audit. Adapters shape the request ([`HttpClient::get`] →
 //! query params, auth) and hand it back to [`send_json`], which turns every failure into
 //! the [`SourceError`] taxonomy the poller branches on.
+//!
+//! Being the one place every adapter passes through also makes this the place the host
+//! allowlist is enforced ([`crate::allowlist`], privacy rule 1.1) — on the way out in
+//! [`HttpClient::get`], and on every redirect hop.
 
 pub mod backoff;
 
 use std::time::Duration;
 
 use look_above_core::error::SourceError;
-use reqwest::{Client, RequestBuilder, Response, StatusCode, header::HeaderMap};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url, header::HeaderMap, redirect};
 use serde::de::DeserializeOwned;
+
+use crate::allowlist::HostPolicy;
 
 /// Identifies this project to every source we contact (docs/09).
 ///
@@ -27,6 +33,13 @@ pub const USER_AGENT: &str = concat!(
 /// Per-request ceiling, applied to the whole request→body round trip (docs/09).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Redirect hops we will follow, matching `reqwest`'s own default.
+///
+/// Restated because installing a custom redirect policy replaces the default limit rather
+/// than adding to it — without this, a redirect loop between two authorized hosts would
+/// spin until the 10 s timeout instead of stopping.
+const MAX_REDIRECTS: usize = 10;
+
 /// A configured [`reqwest::Client`], cloneable and shared across adapters.
 ///
 /// Cloning is cheap and shares the connection pool — build one per process, not per
@@ -34,29 +47,62 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     inner: Client,
+    hosts: HostPolicy,
 }
 
 impl HttpClient {
-    /// Builds the client with the mandated User-Agent and timeout.
+    /// Builds the client with the mandated User-Agent, timeout, and host allowlist.
     pub fn new() -> Result<Self, SourceError> {
-        Self::build(REQUEST_TIMEOUT)
+        Self::build(REQUEST_TIMEOUT, HostPolicy::Authorized)
     }
 
-    fn build(timeout: Duration) -> Result<Self, SourceError> {
+    fn build(timeout: Duration, hosts: HostPolicy) -> Result<Self, SourceError> {
         let inner = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(timeout)
+            .redirect(redirect_policy(hosts))
             .build()
             .map_err(|error| SourceError::Network {
                 message: format!("could not build HTTP client: {}", describe(error)),
             })?;
-        Ok(Self { inner })
+        Ok(Self { inner, hosts })
     }
 
     /// Starts a GET the caller finishes (query params, auth) and passes to [`send_json`].
-    pub fn get(&self, url: &str) -> RequestBuilder {
-        self.inner.get(url)
+    ///
+    /// The allowlist check happens here rather than in [`send_json`] because this is where
+    /// a host enters: a [`RequestBuilder`] can gain query params and headers afterwards,
+    /// but not a different host. Checking the parsed URL — not the string — is what makes
+    /// the difference between a rule and a spelling of a rule.
+    pub fn get(&self, url: &str) -> Result<RequestBuilder, SourceError> {
+        let url = Url::parse(url).map_err(|error| SourceError::Refused {
+            // `url::ParseError` describes the fault ("invalid IPv6 address") without
+            // echoing the input, so this cannot leak a token from a query string.
+            reason: format!("could not parse the URL: {error}"),
+        })?;
+        self.hosts.check(&url)?;
+        Ok(self.inner.get(url))
     }
+}
+
+/// Applies the allowlist to every redirect hop.
+///
+/// A 302 from an authorized host is still a URL we did not choose. `reqwest` follows
+/// redirects by default, so without this the gate on the way out would be one `Location`
+/// header away from irrelevant — an authorized-but-compromised source, or a captive
+/// portal, could hand us anywhere. Refused hops [`stop`](redirect::Attempt::stop), which
+/// surfaces the 3xx itself and lands in [`status_error`] as a `Refused`.
+fn redirect_policy(hosts: HostPolicy) -> redirect::Policy {
+    redirect::Policy::custom(move |attempt| {
+        // `>` not `>=`: `previous()` counts the original request too, so `> MAX_REDIRECTS`
+        // is what allows exactly that many hops — the same comparison `reqwest`'s own
+        // `Policy::limited` makes.
+        if attempt.previous().len() > MAX_REDIRECTS || !hosts.permits(attempt.url()) {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// Sends `request` and decodes a successful JSON body.
@@ -96,6 +142,23 @@ fn status_error(response: &Response) -> Option<SourceError> {
         },
         _ if status.is_server_error() => SourceError::Server {
             status: status.as_u16(),
+        },
+        // A redirect reaching the caller means [`redirect_policy`] declined to follow it:
+        // the client follows the ones it is allowed to, so an unfollowed hop is our
+        // refusal, not the source rejecting us. Named explicitly because falling into the
+        // `Request` arm below would report "source rejected the request: HTTP 302", which
+        // is precisely backwards. 304 is deliberately not here — it is a 3xx that means
+        // "unchanged", and conditional requests are the import tooling's business.
+        StatusCode::MOVED_PERMANENTLY
+        | StatusCode::FOUND
+        | StatusCode::SEE_OTHER
+        | StatusCode::TEMPORARY_REDIRECT
+        | StatusCode::PERMANENT_REDIRECT => SourceError::Refused {
+            reason: format!(
+                "HTTP {} to a host we may not follow, or past {MAX_REDIRECTS} hops \
+                 (privacy rule 1.1)",
+                status.as_u16()
+            ),
         },
         _ => SourceError::Request {
             status: status.as_u16(),
@@ -154,16 +217,27 @@ mod tests {
         ok: bool,
     }
 
-    /// The real thing — the client adapters will actually get.
+    /// The real client, with loopback added to the allowlist so it can reach a mock.
+    ///
+    /// That one widening is the whole difference from `HttpClient::new`, and it is what
+    /// lets every test below exercise the shipping timeout, User-Agent, and redirect
+    /// policy rather than a rehearsal of them. `refuses_an_unauthorized_host` uses the
+    /// real constructor to prove the widening is test-only.
     fn client() -> HttpClient {
-        HttpClient::new().expect("client builds")
+        HttpClient::build(REQUEST_TIMEOUT, HostPolicy::AuthorizedOrLoopback).expect("client builds")
     }
 
     /// Impatient client, for the two tests that want a failure rather than a reply.
     /// Everything else uses the real 10 s timeout: a mock on loopback answers in
     /// microseconds, and a tight deadline would only buy flakes on a loaded CI runner.
     fn impatient_client() -> HttpClient {
-        HttpClient::build(Duration::from_millis(200)).expect("client builds")
+        HttpClient::build(Duration::from_millis(200), HostPolicy::AuthorizedOrLoopback)
+            .expect("client builds")
+    }
+
+    /// Builds a GET the allowlist is expected to permit.
+    fn get(client: &HttpClient, url: &str) -> RequestBuilder {
+        client.get(url).expect("URL is allowed")
     }
 
     /// Mounts a single GET /states responder and returns the server.
@@ -178,7 +252,7 @@ mod tests {
     }
 
     async fn get_body(server: &MockServer) -> Result<Body, SourceError> {
-        send_json(client().get(&format!("{}/states", server.uri()))).await
+        send_json(get(&client(), &format!("{}/states", server.uri()))).await
     }
 
     #[test]
@@ -209,7 +283,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let body: Body = send_json(client().get(&format!("{}/states", server.uri())))
+        let body: Body = send_json(get(&client(), &format!("{}/states", server.uri())))
             .await
             .expect("request succeeds");
         assert_eq!(body, Body { ok: true });
@@ -316,9 +390,12 @@ mod tests {
                 .set_delay(Duration::from_secs(30)),
         )
         .await;
-        let error = send_json::<Body>(impatient_client().get(&format!("{}/states", server.uri())))
-            .await
-            .expect_err("is an error");
+        let error = send_json::<Body>(get(
+            &impatient_client(),
+            &format!("{}/states", server.uri()),
+        ))
+        .await
+        .expect_err("is an error");
         assert!(matches!(error, SourceError::Network { .. }), "{error:?}");
         assert!(error.is_transient(), "a timeout is worth retrying");
     }
@@ -330,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn error_messages_do_not_echo_the_url() {
         let url = "http://127.0.0.1:1/states?access_token=super-secret";
-        let error = send_json::<Body>(impatient_client().get(url))
+        let error = send_json::<Body>(get(&impatient_client(), url))
             .await
             .expect_err("is an error");
         let SourceError::Network { message } = &error else {
@@ -338,5 +415,92 @@ mod tests {
         };
         assert!(!message.contains("super-secret"), "leaked: {message}");
         assert!(!message.contains("/states"), "leaked: {message}");
+    }
+
+    /// Privacy rule 1.1, on the client adapters are actually handed.
+    ///
+    /// The only test here that builds via `HttpClient::new`: everything else widens the
+    /// policy to reach a mock, and this is what says that widening never ships.
+    #[test]
+    fn the_real_client_refuses_an_unauthorized_host() {
+        let client = HttpClient::new().expect("client builds");
+        let error = client
+            .get("https://www.flightradar24.com/api/feed")
+            .expect_err("prohibited host is refused");
+        assert!(matches!(error, SourceError::Refused { .. }), "{error:?}");
+        assert!(!error.is_transient());
+        // And loopback — the escape hatch the tests use — is closed here too.
+        assert!(client.get("http://127.0.0.1:8080/states").is_err());
+        // An authorized host still builds.
+        assert!(client.get("https://api.adsb.lol/v2/point/50/8/25").is_ok());
+    }
+
+    #[test]
+    fn an_unparseable_url_is_refused_rather_than_sent() {
+        let error = client()
+            .get("https://[not-an-address]/states?access_token=super-secret")
+            .expect_err("is an error");
+        let SourceError::Refused { reason } = &error else {
+            panic!("expected Refused, got {error:?}");
+        };
+        assert!(!error.is_transient(), "a malformed URL never becomes valid");
+        assert!(!reason.contains("super-secret"), "leaked: {reason}");
+    }
+
+    /// The gate on the way out is worth little if a `Location` header can walk around it.
+    #[tokio::test]
+    async fn a_redirect_off_the_allowlist_is_not_followed() {
+        let server = server_returning(
+            ResponseTemplate::new(302).insert_header("location", "https://www.flightradar24.com/"),
+        )
+        .await;
+        let error = get_body(&server).await.expect_err("is an error");
+        let SourceError::Refused { reason } = &error else {
+            panic!("expected Refused, got {error:?}");
+        };
+        assert!(reason.contains("302"), "{reason}");
+        assert!(!error.is_transient());
+    }
+
+    /// A redirect within the allowlist is ordinary and must still work.
+    #[tokio::test]
+    async fn a_redirect_to_a_permitted_host_is_followed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/states"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/states/v2", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/states/v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        assert_eq!(get_body(&server).await.expect("follows"), Body { ok: true });
+    }
+
+    /// Loops between permitted hosts stop at the hop limit instead of running to the timeout.
+    #[tokio::test]
+    async fn a_redirect_loop_stops_at_the_hop_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/states"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/states", server.uri())),
+            )
+            // The original request plus MAX_REDIRECTS hops, then we stop. Asserted on the
+            // server, so a policy that quietly followed forever fails here rather than
+            // hiding behind the 10 s timeout.
+            .expect(u64::try_from(MAX_REDIRECTS).expect("fits") + 1)
+            .mount(&server)
+            .await;
+
+        let error = get_body(&server).await.expect_err("is an error");
+        assert!(matches!(error, SourceError::Refused { .. }), "{error:?}");
     }
 }

@@ -5,10 +5,11 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Item 1.1 done;
-  107 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.2** — allowlist const + test (permitted hosts only, docs/10
-  §privacy). Needs no account; 1.3 is the first item that does.
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.2
+  done; 126 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.3** — OpenSky OAuth2 token fetch + cache + refresh at 80% TTL.
+  **This is the first item that needs the account** ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2);
+  without it, 1.5–1.6 (the no-key fallback adapters) are the way forward instead.
 - **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
   `look-above` and then push, in that order** — the existing repo has an underscore; the
   hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
@@ -25,7 +26,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1 done | — |
+| M1 | in progress — 1.1, 1.2 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -44,6 +45,32 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-15** — M1 item 1.2: the host allowlist. `ingest::allowlist` — `AUTHORIZED_HOSTS`
+  (the skill's six runtime hosts), `is_authorized_host`, and `HostPolicy`. 19 new tests, 126
+  total; fmt/clippy/test green. The item's real decision was that docs/10's spec for it —
+  "a const list; test walks all adapter base URLs and asserts membership" — is weaker than it
+  reads: there are no adapters until 1.3, so it would **pass over an empty set today**, and it
+  could only ever see base URLs an adapter *declared*, not a URL built at a call site. So the
+  list is enforced, not merely checked: `HttpClient::get` (1.1's choke point, which every
+  adapter must pass through) checks the parsed `Url`, and **so does every redirect hop** —
+  reqwest follows 10 by default, so a gate on the outbound URL alone is one `Location` header
+  away from irrelevant. Matching is exact, never suffix (`ends_with("opensky-network.org")`
+  welcomes `evil-opensky-network.org`; eight such lookalikes are pinned), and **https is part
+  of the gate** — an `http://` typo on the token endpoint would send the OAuth2 secret in
+  cleartext. **`SourceError::Refused` is new in `core`**, the second extension of docs/09's
+  taxonomy after 1.1: `Network` is transient, so a refusal mapped there would retry an
+  unauthorized host forever. Static-download hosts (OurAirports, FAA, Natural Earth) are
+  deliberately *off* the list — import tooling, not this crate, and `raw.githubusercontent.com`
+  serves anyone's repo. The test escape hatch is `#[cfg(test)]`, **not** a cargo feature, since
+  feature unification could switch a privacy gate off in a shipped binary. Verified the way 0.8
+  did: a `flightradar24.com` const planted in `http.rs` **failed** the scan test with file, host
+  and remedy named, then reverted — a tripwire nobody has seen trip is a decoration. It is a
+  tripwire, though: the crate has no request URL yet, so it arms itself at 1.3 (hence the
+  extractor's own unit test and an assert that the walk visited ≥ 1 file). Two calls to revisit
+  if they chafe: a blocked redirect surfaces as the 3xx status mapped to `Refused` (reqwest's
+  policy API offers only follow/stop), and `Retry-After`-style HTTP-date parsing stays out.
+  Next: **1.3**, which needs the OpenSky account — or 1.5–1.6 without it.
 
 - **2026-07-15** — Repo identity settled. The owner supplied
   `git@github.com:arcTanMyAngle/look_above.git` — an **underscore**, where every doc says

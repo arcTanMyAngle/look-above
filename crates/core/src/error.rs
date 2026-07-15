@@ -43,6 +43,15 @@ pub enum SourceError {
     /// no home for a non-auth, non-429 client error (`DECISION_LOG` 2026-07-15, item 1.1).
     #[error("source rejected the request: HTTP {status}")]
     Request { status: u16 },
+
+    /// *We* declined to send the request — it never reached the network. Raised by
+    /// `ingest`'s host allowlist when a URL is not on it (privacy rule 1.1), and by any
+    /// other pre-flight rule that must fail closed. The odd one out in this enum: every
+    /// other variant reports what a source did, this one reports a bug or a bad config on
+    /// our side. Permanent, and not a reason to fail over — the next source would be asked
+    /// the same wrong question (`DECISION_LOG` 2026-07-15, item 1.2).
+    #[error("refused to send the request: {reason}")]
+    Refused { reason: String },
 }
 
 impl SourceError {
@@ -50,7 +59,8 @@ impl SourceError {
     ///
     /// `Auth` is excluded: retrying with the same rejected credentials only burns
     /// budget. `Parse` is excluded: the bytes will not change on a re-fetch. `Request`
-    /// is excluded: the source understood us and said no.
+    /// is excluded: the source understood us and said no. `Refused` is excluded: nothing
+    /// about waiting makes an unauthorized host authorized.
     pub const fn is_transient(&self) -> bool {
         matches!(
             self,
@@ -105,5 +115,11 @@ mod tests {
             .is_transient()
         );
         assert!(!SourceError::Request { status: 404 }.is_transient());
+        assert!(
+            !SourceError::Refused {
+                reason: "https://example.com is not an authorized origin".to_owned()
+            }
+            .is_transient()
+        );
     }
 }

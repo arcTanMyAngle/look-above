@@ -24,7 +24,15 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       (`max(header, backoff)`), honored past the 5-min cap; parsed as delta-seconds only.
       Equal jitter, not full jitter — a 429 must never be retried milliseconds later. New
       deps: `fastrand` (jitter), `wiremock` (dev). Rationale in DECISION_LOG.)*
-- [ ] 1.2 Allowlist const + test (docs/10 §privacy): permitted hosts only.
+- [x] 1.2 Allowlist const + test (docs/10 §privacy): permitted hosts only.
+      *(2026-07-15: done — `ingest::allowlist`: `AUTHORIZED_HOSTS` (the skill's six runtime
+      hosts), `is_authorized_host` (exact + case-insensitive, never a suffix match), and
+      `HostPolicy`, enforced in `HttpClient::get` and on **every redirect hop** — docs/10
+      asked only for a test over declared base URLs, which would pass vacuously today and
+      never see a dynamically built URL. 19 tests, 126 total. `SourceError::Refused` added
+      to `core` — the taxonomy had no home for "we declined to send this". Static-download
+      hosts deliberately excluded (import tooling, not this crate). Rationale in
+      DECISION_LOG.)*
 - [ ] 1.3 OpenSky auth: OAuth2 client-credentials token fetch + cache + refresh at 80% TTL;
       credentials from config; graceful "no credentials" state (source disabled, not error).
 - [ ] 1.4 OpenSky adapter: `/states/all` bbox query → `Vec<StateVector>`; positional-array
