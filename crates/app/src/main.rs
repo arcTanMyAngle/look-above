@@ -1,9 +1,11 @@
 //! `look-above` — a native flight tracker.
 //!
-//! M0 item 0.5 wires configuration and logging; the window follows in 0.6.
+//! M0 item 0.5 wires configuration and logging; 0.6 opens the window.
 
 mod config;
+mod frame_stats;
 mod logging;
+mod window;
 
 use anyhow::Result;
 
@@ -16,7 +18,7 @@ fn main() -> Result<()> {
     logging::init(&config.log.filter)?;
     log_startup(&config);
 
-    Ok(())
+    window::run()
 }
 
 /// Record what was loaded.

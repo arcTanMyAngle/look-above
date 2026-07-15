@@ -253,3 +253,59 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   above rather than a unit test: forcing it in-process needs a non-Unicode variable, and
   `set_var` is `unsafe` in edition 2024. A `#[cfg(windows)]` spawn test could pin it if this
   path ever grows; noted rather than built, since CI (item 0.7) runs Linux too.
+
+## 2026-07-15 — M0 item 0.6 (window + wgpu surface)
+
+- **`render` owns the GPU, `app` owns the window; the seam is a wgpu trait, not winit.**
+  `Renderer::new` takes `Arc<W> where W: wgpu::DisplayAndWindowHandle`, so `render` has no
+  windowing dependency and the plan's crate description ("wgpu pipelines … no network, no DB")
+  stays literally true. The `Arc` is what makes the surface `'static`: it borrows the window
+  for as long as it draws to it. `app` keeps the event loop, per ADR-005.
+- **`render` stays sync; `pollster` 1.0.1 added to make that possible.** wgpu's
+  `request_adapter`/`request_device` are `async`, and ADR-005 says "no async in core/render
+  crates at all". The alternatives were to make `Renderer::new` async (violates the ADR and
+  drags a runtime into a crate that needs none) or to hand the futures to `app`'s tokio
+  runtime (leaks GPU setup into the async half of the app for no gain). On native these two
+  futures resolve without ever yielding, so blocking on them costs nothing. `pollster` is a
+  ~100-line executor with no dependencies. New dep — recorded here per the 0.2 pin policy.
+- **Background is `#0A0E14`, authored in sRGB and linearized before use.** docs/01 fixes the
+  intent ("dark, desaturated, aircraft are the brightest things on screen") but not a shade,
+  so the value is ours. The non-obvious part is the conversion: `wgpu::Color` is *linear*, the
+  surface here is `Bgra8UnormSrgb`, and handing encoded values straight over gets them
+  brightened a second time by the hardware — `#0A0E14` would land near `#3A4351`, a washed-out
+  grey that would have read as "some dark colour, near enough" and quietly broken the
+  contrast the altitude ramp is designed against. `color::clear_color` linearizes only when
+  `format.is_srgb()`, so a non-sRGB surface still gets what was authored. Verified by
+  capturing the live window with `PrintWindow`: pixels read exactly `#0A0E14`.
+- **`PowerPreference::HighPerformance`.** Picks the discrete GPU where there is one and falls
+  back to integrated where there is not, so it costs nothing on the integrated-only machines
+  docs/01's frame budget assumes. Revisit at M2 if it turns out to matter for battery.
+- **Transient surface states are not errors.** `Timeout`/`Occluded` (and `Outdated`, after a
+  reconfigure) return `FrameOutcome::Skipped`; only `Lost`/`Validation` are `RenderError`.
+  A minimized window on Windows reports a 0×0 size, which is invalid to configure, so
+  `resize` ignores zero and `render` skips the frames until it comes back — otherwise
+  minimizing the window would kill the app. `Suboptimal` draws the frame and reconfigures
+  *after* presenting, because `Surface::configure` panics while a surface texture is alive.
+- **Frame stats log at `debug`, not `info`.** A line every second at the default filter
+  (`look_above=info,warn`) would bury the startup lines it sits next to. Seen with
+  `LOOK_ABOVE_LOG_FILTER=look_above=debug`. `FrameStats::record` takes `Instant` as an
+  argument rather than reading the clock, so the reporting logic is unit-tested without
+  sleeping. It reports mean *and* worst: the mean alone hides exactly the stutter M2's
+  p95 budget (docs/11 §M2) cares about. This is the stub the item asks for — M2 replaces it
+  with the on-screen overlay.
+- **wgpu 30 API notes (for the next person who reads a tutorial written against 0.19):**
+  `get_current_texture` returns a `CurrentSurfaceTexture` enum, not `Result<_, SurfaceError>`;
+  presenting is `Queue::present(frame)`; `InstanceDescriptor` has no `Default` and needs
+  `new_without_display_handle_from_env()` (the `_from_env` form keeps `WGPU_BACKEND` working
+  for bisecting a backend bug); `RenderPassDescriptor` gained `multiview_mask`. All four were
+  found by reading the vendored source, not by recall — ADR-003 predicted this churn.
+- **Verification:** fmt/clippy(`-D warnings`, all-targets)/test green; 87 tests (5 new in
+  `render`, 5 in `app::frame_stats`). The window itself has no unit test — it needs a real
+  GPU and a real event loop — so acceptance §M0's window line was exercised by driving the
+  live window over Win32 from PowerShell: opened titled "Look Above" on Intel Arc / Vulkan
+  (`Bgra8UnormSrgb`), survived four resizes and a minimize (0×0) / restore, and exited 0 on
+  `WM_CLOSE` with an empty stderr. Scripts are in the session scratchpad, not committed:
+  they are throwaway harnesses, and the headless smoke test that belongs in the repo is
+  M2's (docs/10). Frame pacing is uncapped (~1700–2300 fps on a 1280×800 clear), which is
+  expected under `ControlFlow::Poll` with no vsync-bound content yet; the 60 fps budget is
+  an M2 measurement against real traffic, not this.

@@ -57,8 +57,14 @@ Dependency direction (enforced by review + `cargo tree` check in CI later):
       (rule 7.1); `OpenSky` fields defined but empty, pending the account (M1 1.3).
       `.gitignore` already covered all four paths — verified, not recreated. No new deps.
       Rationale in DECISION_LOG.)*
-- [ ] 0.6 `app`: winit window (title "Look Above", dark clear color via wgpu surface),
+- [x] 0.6 `app`: winit window (title "Look Above", dark clear color via wgpu surface),
       resize + close handling, frame-stats stub in log.
+      *(2026-07-15: done — `render::Renderer` (surface/device/clear, sync API per ADR-005)
+      + `app::window` (winit `ApplicationHandler`) + `app::frame_stats`. Background is
+      `#0A0E14`, linearized for the sRGB surface. `pollster` added to block on wgpu's async
+      setup. 87 tests. Exercised against the real window: opened, resized ×4, minimized
+      (0×0) and restored, closed with exit 0; a screen capture reads `#0A0E14`.
+      Rationale in DECISION_LOG.)*
 - [ ] 0.7 CI: GitHub Actions — fmt --check, clippy -D warnings, test --workspace on
       windows-latest + ubuntu-latest.
 - [ ] 0.8 Gate: run acceptance §M0, record results in CURRENT_STATUS, human review.

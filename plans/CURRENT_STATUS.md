@@ -5,16 +5,18 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** M0 in progress — `core` done; `app` loads config + inits tracing (75 tests green).
-- **Active milestone:** M0, items 0.1–0.5 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
-- **Next action:** M0 item 0.6 (`app`: winit window "Look Above", dark clear via wgpu surface,
-  resize + close handling, frame-stats stub in the log).
-- **Acceptance §M0:** all 3 config lines met, verified live. Left: clean-clone build, CI badge,
-  `cargo tree` direction, window.
+- **Phase:** M0 in progress — `core` done; the app opens a window and clears it (87 tests green).
+- **Active milestone:** M0, items 0.1–0.6 done. Plan: [M0_REPO_AUDIT_AND_ARCHITECTURE.md](M0_REPO_AUDIT_AND_ARCHITECTURE.md)
+- **Next action:** M0 item 0.7 (CI: GitHub Actions — fmt --check, clippy -D warnings,
+  test --workspace on windows-latest + ubuntu-latest).
+- **Acceptance §M0:** config (3 lines) and window met, verified live. Left: clean-clone build,
+  CI badge, `cargo tree` direction — then the 0.8 gate.
 - **Blockers:** none for M0. Before M1 item 1.3 the owner must create a free OpenSky account +
   API client ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1); config fields exist and are empty until
   then — absence is a supported state, not an error.
 - **Decisions pending:** none — ADRs 001–005 accepted (docs/02).
+- **Watch at 0.7:** CI runs on ubuntu-latest with no GPU. Nothing in the suite opens a window
+  today, so this should be fine; if a headless runner ever trips on wgpu, that is the cause.
 
 ## Gate record
 
@@ -26,6 +28,26 @@
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ## Session log (newest first)
+
+- **2026-07-15** — M0 item 0.6: the window. `render::Renderer` (instance/surface/device +
+  background clear) and `app::window` (winit `ApplicationHandler`) and `app::frame_stats`.
+  The crate seam is a wgpu trait, not a winit type: `Renderer::new` takes
+  `Arc<W: DisplayAndWindowHandle>`, so `render` never depends on winit and the surface can be
+  `'static`. `render` stays sync per ADR-005, which is what `pollster` (new dep) buys — wgpu's
+  setup calls are async but resolve without yielding on native. Background `#0A0E14` is
+  linearized before use: `wgpu::Color` is linear and the surface is `Bgra8UnormSrgb`, so
+  passing encoded values through would land near `#3A4351` — a washed-out grey that still
+  looks "dark" in a screenshot and quietly breaks the contrast the altitude ramp assumes.
+  Transient surface states (`Timeout`/`Occluded`/`Outdated`) are `Skipped`, not errors, and a
+  0×0 (minimized) window is never configured — otherwise minimizing kills the app. Four wgpu
+  30 API changes vs. every tutorial online (`CurrentSurfaceTexture` enum, `Queue::present`,
+  no `InstanceDescriptor::default`, `multiview_mask`) were found by reading the vendored
+  source; ADR-003 predicted exactly this churn. 87 tests; fmt/clippy/test green. The window
+  has no unit test (needs a real GPU + event loop), so it was exercised by driving the live
+  window over Win32: opened titled "Look Above" on Intel Arc/Vulkan, four resizes, minimize
+  (0×0) + restore, `WM_CLOSE` → exit 0, stderr empty; a `PrintWindow` capture reads exactly
+  `#0A0E14`, confirming the linearization rather than assuming it. Frame stats log at `debug`
+  (a line/second would bury the startup lines at the default filter). Next: 0.7.
 
 - **2026-07-15** — M0 item 0.5: `app::config` + `app::logging` — `config.toml` → serde struct,
   `LOOK_ABOVE_*` overrides, tracing init, `config.example.toml`. Precedence env > file >

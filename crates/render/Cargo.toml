@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 look-above-core.workspace = true
 
+pollster.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

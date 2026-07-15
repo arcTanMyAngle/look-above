@@ -47,6 +47,9 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # render/app: exact pins — wgpu/winit churn is the known risk in ADR-003.
 wgpu = "=30.0.0"
 winit = "=0.30.13"
+# wgpu's setup calls are async; ADR-005 bars async from `render`. This drives those two
+# futures to completion on the calling thread and pulls in nothing else. See DECISION_LOG.
+pollster = "1.0.1"
 
 # app only.
 anyhow = "1.0.103"
