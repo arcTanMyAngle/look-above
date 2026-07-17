@@ -835,3 +835,59 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   is a parameter). 267 tests (56 core, 163 ingest, 43 app, 5 render), 4 live tests ignored;
   fmt/clippy/test green. Next: **1.8**, the poller that drives this cadence and the failover
   chain.
+
+## 2026-07-17 — M1 item 1.8 (`ingest::poller`: the poll loop + failover chain)
+
+- **The three-way failover branch on `is_transient`.** A fetch error means one of three things
+  to the active source, and `error_response` (a pure, unit-tested function) encodes exactly
+  which: **transient** (`RateLimited`/`Network`/`Server`) → retry the *same* source with
+  `http::backoff`, failing over only after `TRANSIENT_FAILOVER_THRESHOLD` = 3 consecutive
+  failures (one timeout is not a dead source); **permanent-but-a-real-answer**
+  (`Auth`/`Parse`/`Request`) → fail over on the *first*, because the identical request cannot
+  succeed on a re-fetch; **our own refusal** (`Refused`) → **hold and idle**, never fail over.
+  That last one is the subtle call, and it follows `error.rs`'s own note: a `Refused` is an
+  unauthorized host or a global query to a point source — the *next* source would be asked the
+  same wrong question, so failing over would just launder a bug into a silent degradation. The
+  disabled-OpenSky case falls straight out of the permanent branch: `fetch` returns `Auth`
+  without a network call, so a missing credential drops us to the keyless fallbacks on cycle one.
+- **Budget veto is a *skip*, not a failover.** When `can_afford` refuses a cycle (the metered
+  primary would cross the 3,200/day cap), the poller does not fetch and idles at the ceiling
+  until the UTC-day reset — it does **not** fail over to a free fallback. A primary that is
+  rationing its budget is not a *failed* source, and the fallbacks exist for failures; dropping
+  to them on budget would poll a redundant source while the allowance simply rests. This is the
+  spec-faithful reading of item 1.8 ("skips … any cycle `can_afford` refuses") and 1.7's "an
+  exhausted budget idles at the ceiling until the midnight reset". *Noted as a candidate M4+
+  improvement*: once global/multi-region polling lands, serving from the free fallbacks while
+  the primary is budget-capped may be worth the extra source — deferred, not forgotten.
+- **Recovery is a separate, faster path than the failover rotation.** Failover advances through
+  the chain *wrapping* (`(active+1) % len`) so every source stays in rotation when things are
+  bad; but a *working* fallback never errs, so nothing in the error path would ever pull us back
+  to the primary. `PRIMARY_PROBE_INTERVAL` = 5 min is the fix: while failed over, the loop
+  re-probes index 0 and switches back the instant it answers. The probe goes through the same
+  budgeted `run_cycle`, so it respects the ledger and costs nothing when the primary is disabled
+  (no network on `Auth`).
+- **Two clocks, for the two reasons `budget` already separated them.** The ledger reads an
+  injected wall-clock `WallClock` (`UnixSeconds`) because the day boundary is a *calendar* fact;
+  the cadence sleeps and the 5-min probe timer use tokio's *monotonic* clock (`tokio::time`)
+  because "wait 27 s" and "5 min since the last probe" are elapsed-time facts. Only the wall
+  clock is injected — the monotonic side is virtual under `start_paused`, so it needs no seam.
+- **`PollBatch` carries its own spend.** `credits_spent` (this cycle) and `spent_today` (running
+  total) ride with the batch so the store writer (1.11) and the headless readout (1.12) read the
+  cost off the channel rather than reaching back into the poller's private ledger. An *empty*
+  `states` is delivered like any other — a quiet region is a real answer, and a consumer needs
+  to see that the cycle happened.
+- **The `Poller` never panics on a bad world.** A wild system clock reads as 0 / `i64::MAX`
+  rather than overflowing; a fully dead chain idles and retries forever (the plan's "the app
+  idles and retries; it never crashes"); only a dropped channel receiver stops `run`. No
+  `unwrap` outside tests; `Poller`'s `Debug` is manual (`Box<dyn LiveSource>` is not `Debug`).
+- **Verification.** 18 tests: the pure failover policy (transient-below/at-threshold, permanent
+  fails over first, `Refused` holds), the probe gate, a successful metered cycle (spend
+  recorded, batch emitted, stays primary), spend accumulation, the unmetered path (0 credits),
+  the budget veto (an `Arc`-shared scripted source proves `fetch` is *never called* and the
+  ceiling interval is returned), disabled-primary immediate failover, transient failover only
+  after the streak, refusal-holds, chain wraps, recovery-to-primary and stay-on-fallback, and
+  the dropped-receiver shutdown signal — all via an in-memory scripted `LiveSource`, no network
+  and no injected monotonic clock needed. Plus a live `#[ignore]`d test that drives the real
+  default chain with OpenSky disabled and asserts a real keyless-fallback batch, 0 credits. 284
+  tests (56 core, 180 ingest, 43 app, 5 render), 5 live tests ignored; fmt/clippy/test green.
+  Next: **1.9**, `core::merge` (dedup, out-of-order drop, sticky anonymity).

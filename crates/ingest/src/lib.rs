@@ -12,8 +12,12 @@
 //! the reply back to the bbox — differing only in host, id, spacing, and fixtures.
 //!
 //! [`budget`] is what keeps the primary inside `OpenSky`'s allowance: a daily credit ledger
-//! and the pure cadence controller (`ledger + cost + clock → poll interval`) the poller will
-//! drive in item 1.8.
+//! and the pure cadence controller (`ledger + cost + clock → poll interval`).
+//!
+//! [`poller`] ties it together: the loop that drives the active source at that cadence, fails
+//! over through the chain on error, probes for the primary's recovery, and emits
+//! [`PollBatch`](poller::PollBatch)es into the `crossbeam` channel the rest of the pipeline
+//! reads.
 
 pub mod adsb_lol;
 pub mod airplanes_live;
@@ -24,4 +28,5 @@ mod normalize;
 pub mod opensky;
 pub mod pacer;
 pub mod point;
+pub mod poller;
 pub mod readsb;

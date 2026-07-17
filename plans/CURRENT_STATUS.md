@@ -5,14 +5,20 @@
 
 ## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.7
-  done; 267 tests green (4 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.8
+  done; 284 tests green (5 live tests `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.8** — the poller: drive the active source at `ingest::budget`'s
-  cadence for the current region; failover chain opensky → airplaneslive → adsblol on repeated
-  `SourceError`s (branch on `is_transient`); recovery probe of the primary every 5 min; emit
-  batches into the `crossbeam` channel. It owns a `CreditLedger` per metered source, calls
-  `decide(cost, now)` each cycle, and skips (does not fetch) any cycle `can_afford` refuses.
+- **Next action:** **M1 item 1.9** — `core::merge`: dedup across sources (newest ts per icao24
+  wins), out-of-order drop, staleness tracking, and **sticky anonymity** (privacy 2.2 — once a
+  target is anonymous it stays so for the session, even if a later record carries identity),
+  with the unit tests docs/10 asks for. It consumes the `crossbeam` channel of `PollBatch`es
+  the 1.8 poller now emits.
+- **1.8 poller landed:** `ingest::poller` — `Poller` (async loop), `PollBatch` (channel
+  payload, carries per-cycle `credits_spent`/`spent_today`), `WallClock`/`SystemWallClock`.
+  Failover branches on `is_transient`: transient retries same then fails over after 3 in a row;
+  `Auth`/`Parse`/`Request` fail over on the first; **`Refused` holds (our bug, next source gets
+  the same wrong question — never a failover)**. Budget veto = **skip + idle**, not failover.
+  Recovery probe of the primary every 5 min is the separate path back. DECISION_LOG 1.8.
 - **1.7 seam settled:** the credit ledger is **in-memory for M1**, a small owned
   `CreditLedger` that resets at the UTC-day boundary; item 1.11 rehydrates it from
   `source_status.credits_used_today` through `CreditLedger::restored`. No reach into `store`
@@ -41,7 +47,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.7 done | — |
+| M1 | in progress — 1.1–1.8 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -60,6 +66,27 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.8: the poller. New `ingest::poller`: `Poller` (the async poll
+  loop), `PollBatch` (the `crossbeam` payload — source, states, and the cycle's own
+  `credits_spent`/`spent_today` so 1.11/1.12 read cost off the channel, not the private
+  ledger), and `WallClock`/`SystemWallClock` (the ledger's *calendar* clock, injected; the
+  cadence sleeps + the 5-min probe use tokio's *monotonic* clock — the two-clock split `budget`
+  already argued). 18 tests, 284 total. **Failover branches on `is_transient` three ways**
+  (a pure, unit-tested `error_response`): transient (`RateLimited`/`Network`/`Server`) retries
+  the *same* source with `http::backoff`, failing over only after **3 in a row** (one hiccup
+  isn't a dead source); permanent-but-real (`Auth`/`Parse`/`Request`) fails over on the
+  *first* (a disabled OpenSky returns `Auth` with no network call and drops straight to the
+  keyless fallbacks); **`Refused` holds and idles — never a failover**, because it is *our*
+  bug and the next source gets the same wrong question (error.rs already says so). Chain
+  advance wraps; the **5-min recovery probe of the primary is the separate, faster path back**.
+  **Budget veto = skip, not failover**: a cycle `can_afford` refuses is not fetched (proven by
+  an `Arc`-shared scripted source whose `fetch` is asserted *never called*) and the poller
+  idles at the ceiling until the UTC-day reset — a rationing primary is not a failed one
+  (candidate M4+ improvement noted: serve from free fallbacks when the primary is budget-capped).
+  The loop never panics on a wild clock and never crashes on a dead chain (idles + retries);
+  only a dropped receiver stops `run`. **Verified live** (`#[ignore]`d, keyless, free): OpenSky
+  disabled → failed over → real fallback batch, 0 credits. Next: **1.9**, `core::merge`.
 
 - **2026-07-17** — M1 item 1.7: the credit ledger + cadence controller. New `ingest::budget`:
   `CreditLedger` (an in-memory per-UTC-day credit count that resets itself at the day

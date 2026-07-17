@@ -119,9 +119,25 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       cap — the ceiling alone can't bound a 4-credit query). **Wall-clock `UnixSeconds`, not the
       monotonic `Instant`** auth uses — the day boundary is a calendar fact. Pure functions
       only; the poller (1.8) drives them. Rationale in DECISION_LOG.)*
-- [ ] 1.8 Poller: drives the active source at the budgeted cadence for the current region;
+- [x] 1.8 Poller: drives the active source at the budgeted cadence for the current region;
       failover chain opensky → airplaneslive → adsblol on repeated `SourceError`s; recovery
       probe of the primary every 5 min; emits batches into `crossbeam` channel.
+      *(2026-07-17: done — `ingest::poller`: `Poller` (the async loop), `PollBatch` (the
+      channel payload, carrying per-cycle `credits_spent`/`spent_today` so 1.11/1.12 need not
+      reach into the ledger), `WallClock`/`SystemWallClock` (the ledger's calendar clock,
+      injected; the cadence sleeps + 5-min probe use tokio's monotonic clock). 18 new tests,
+      284 total. **Failover branches on `is_transient` three ways**: transient
+      (`RateLimited`/`Network`/`Server`) retries the same source with `http::backoff` and only
+      fails over after `TRANSIENT_FAILOVER_THRESHOLD` (3) in a row; permanent-but-real
+      (`Auth`/`Parse`/`Request`) fails over on the first (a disabled OpenSky returns `Auth` and
+      drops straight to the keyless fallbacks); `Refused` (our own bug) **holds and idles** —
+      the next source gets the same wrong question, so it is deliberately *not* a failover
+      (error.rs already documents this). Chain advance wraps; the recovery probe is the
+      separate faster path back to the primary. **Budget veto = skip, not failover**: a cycle
+      `can_afford` refuses is not fetched and the poller idles at the ceiling until the UTC-day
+      reset — a rationing primary is not a failed one (DECISION_LOG 1.8). **Verified live**
+      (`#[ignore]`d, keyless, free): with OpenSky disabled the poller failed over and emitted a
+      real fallback batch, 0 credits. Rationale in DECISION_LOG.)*
 - [ ] 1.9 `core::merge`: dedup across sources (newest ts per icao24 wins), out-of-order drop,
       staleness tracking, **sticky anonymity** (privacy 2.2) — with the unit tests from docs/10.
 - [ ] 1.10 `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records → scrub → write to
