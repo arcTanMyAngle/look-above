@@ -88,7 +88,12 @@ contract summary the adapters implement.
 
 ### adsb.lol (second fallback, no key)
 - `GET https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}` — same response family as
-  airplanes.live (readsb JSON); shared parsing module, separate adapter id.
+  airplanes.live (readsb JSON); shared parsing module *and* shared point-query implementation
+  (`ingest::point`), separate adapter id + fixtures + live test (shapes can drift).
+- No documented rate limit, so the adapter mirrors airplanes.live's conservative ≥ 2 s
+  spacing (`ingest::pacer`) rather than a looser guess (DECISION_LOG 1.6).
+- Verified live 2026-07-17: 46 aircraft over Switzerland, units/`now`-in-ms/field names all
+  as believed, 0 credits.
 
 ### adsbdb (enrichment, on-selection only)
 - `GET https://api.adsbdb.com/v0/aircraft/{hex}` / `v0/callsign/{callsign}`

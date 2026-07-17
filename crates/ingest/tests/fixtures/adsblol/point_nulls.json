@@ -1,0 +1,30 @@
+{
+  "ac": [
+    {
+      "hex": "4b1a1a",
+      "type": "adsb_icao",
+      "flight": null,
+      "lat": 50.0379,
+      "lon": 8.5624,
+      "alt_baro": null,
+      "gs": null,
+      "track": null,
+      "baro_rate": null,
+      "squawk": null,
+      "category": null,
+      "seen_pos": 3.0,
+      "seen": 3.0
+    },
+    {
+      "hex": "4b2b2b",
+      "lat": 47.1,
+      "lon": 8.2,
+      "seen_pos": 0.0
+    }
+  ],
+  "msg": "No error",
+  "now": 1721000000000,
+  "total": 2,
+  "ctime": 1721000000000,
+  "ptime": 3
+}

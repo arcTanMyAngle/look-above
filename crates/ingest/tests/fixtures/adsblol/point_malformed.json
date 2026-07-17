@@ -1,0 +1,40 @@
+{
+  "ac": [
+    {
+      "hex": "4b1a1a",
+      "flight": "SWR22H  ",
+      "lat": 50.0379,
+      "lon": 8.5624,
+      "alt_baro": 36000,
+      "gs": 450.0,
+      "track": 87.3,
+      "seen_pos": 0.0
+    },
+    "not-an-aircraft",
+    12345,
+    null,
+    [],
+    {},
+    { "hex": "zzzzzz", "lat": 50.0, "lon": 8.0, "seen_pos": 1.0 },
+    { "hex": "~3f7c1d", "lat": 50.1, "lon": 8.1, "seen_pos": 1.0 },
+    { "hex": "4b3c3c", "lat": 91.0, "lon": 8.0, "seen_pos": 1.0 },
+    { "hex": "4b3c3d", "lon": 8.0, "seen_pos": 1.0 },
+    { "hex": "4b3c3e", "lat": 50.0, "seen_pos": 1.0 },
+    { "hex": "4b3c3f", "lat": 50.0, "lon": 8.0 },
+    {
+      "hex": "4b2c2c",
+      "lat": 47.4647,
+      "lon": 8.5492,
+      "alt_baro": 12000,
+      "gs": 360.0,
+      "track": 195.0,
+      "baro_rate": -1500,
+      "seen_pos": 1.5
+    }
+  ],
+  "msg": "No error",
+  "now": 1721000000000,
+  "total": 13,
+  "ctime": 1721000000000,
+  "ptime": 8
+}

@@ -750,3 +750,39 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   ms), every altitude/speed in SI ranges (so the conversions ran), 1 anonymous, 4 on the
   ground, 0 credits.** `#[ignore]`d; run once after changes, never in CI. 233 tests (56 core,
   129 ingest, 43 app, 5 render); fmt/clippy/test green.
+
+## 2026-07-17 — M1 item 1.6 (adsb.lol adapter; shared point-query in `ingest::point`)
+
+- **The second readsb fallback shares the *request*, not just the parser.** 1.5 shared the
+  field mapping (`ingest::readsb`) but wrote the bbox→circle geometry as "the adapter's own
+  geometry problem". adsb.lol proved that framing wrong: the whole request path — global →
+  `Refused`, covering circle, 250 nm clamp + partial-coverage warn, four-decimal URL, pacing
+  after the allowlist, `send_json`, bbox-trim — is byte-identical between the two services
+  (same `/v2/point/{lat}/{lon}/{radius}` shape, same readsb reply). Rule of two: it moved to
+  `ingest::point::PointSource`, and `airplanes_live` was refactored to delegate. Two copies of
+  ~65 lines + their geometry tests would have contradicted the same ethos that made
+  `readsb`/`normalize`/`pacer` shared. What each adapter still owns is exactly what differs:
+  **host, `SourceId`, spacing, fixtures, live test** — docs/09's "separate adapter per source"
+  is preserved by the thin wrappers, not by copied logic.
+- **adsb.lol's spacing mirrors airplanes.live's ≥ 2 s, though no limit is documented.** The
+  skill gives airplanes.live a number (1 req/s) but only "be gentle" for adsb.lol. Privacy
+  rule 1.3 is "never exceed documented limits"; with none documented, the safe reading is the
+  gentle one, not a licence to go faster. Inheriting the neighbour's conservative interval
+  costs nothing (the source is a last-resort fallback) and cannot under-honour an unknown cap.
+- **Fixtures are adsb.lol's own, with deliberately distinct identities.** Four hand-written
+  files + README in `tests/fixtures/adsblol/` (1.10's recorder still absent). Hexes are Swiss
+  `4b….` / US `a2b3c4`, unlike airplanes.live's `3c6444`/`a1b2c3`, so a test can never pass by
+  reading the wrong source's fixture. Parser null/empty tolerance is proven source-agnostically
+  in `readsb::tests`; each adapter re-checks empty/nulls/malformed through its *own* fetch to
+  confirm the wrapper (not just the parser) handles them and stamps the right id.
+- **Test placement.** Pure covering-circle geometry (midpoint, farthest-corner ceil, clamp,
+  degenerate floor), the on-the-wire URL shape, bbox-trim, and global-`Refused` are proven
+  once in `point::tests` (a representative `SourceId`); each adapter keeps only what is its
+  own — fixtures end-to-end, error mapping surviving the wrapper, endpoint-authorized, the
+  real-client refuses an unauthorized host, spacing wiring, and the live check.
+- **Verification — live, keyless, free.** `live_adsb_lol_point_matches_the_documented_shape`
+  ran once against the real `/v2/point`: **46 aircraft over Switzerland (73 nm circle around
+  47°N 8°E), every one inside the bbox, every `ts` within the hour (so `now` is confirmed ms
+  for adsb.lol too), every altitude/speed in SI ranges (so the conversions ran), 0 anonymous,
+  4 on the ground, 0 credits.** `#[ignore]`d; run once after changes, never in CI. 242 tests
+  (56 core, 138 ingest, 43 app, 5 render), 4 live tests ignored; fmt/clippy/test green.

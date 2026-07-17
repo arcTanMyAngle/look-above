@@ -5,14 +5,20 @@
 
 ## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.5
-  done; 233 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.6** — the adsb.lol adapter, reusing `ingest::readsb` (built for
-  exactly this in 1.5) and `ingest::pacer`; own endpoint, fixtures, and live check, since the
-  two services drift independently. No key needed; nothing blocks it, nothing is handed to it.
-- **Both live paths are proven** — OpenSky auth + data (1.3/1.4) and airplanes.live (1.5: 48
-  aircraft live, units and ms-timestamps confirmed, 0 credits). `credentials.json` stays
-  gitignored and read as-issued. [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 stays closed.
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.6
+  done; 242 tests green (4 live tests `#[ignore]`d). Plan:
+  [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.7** — `ingest::budget`: the daily credit ledger (persisted in
+  `source_status`), pro-rated spend targets, and the cadence controller (poll interval widens
+  as budget tightens; floor 5 s, ceiling 60 s). Pure functions per the design note
+  (`ledger + bbox + clock → next_poll_at`). Note this reaches into `store` for `source_status`,
+  which does not exist until 1.11 — decide the seam (in-memory ledger now, persistence at 1.11)
+  as the first order of business.
+- **All three live paths are proven** — OpenSky auth + data (1.3/1.4), airplanes.live (1.5: 48
+  aircraft), and adsb.lol (1.6: 46 aircraft, units + ms-timestamps confirmed independently, 0
+  credits). Both fallbacks share `ingest::point` (the bbox→circle point query) and
+  `ingest::readsb` (the parser). `credentials.json` stays gitignored and read as-issued.
+  [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 stays closed.
 - **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
   `look-above` and then push, in that order** — the existing repo has an underscore; the
   hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
@@ -31,7 +37,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.5 done | — |
+| M1 | in progress — 1.1–1.6 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -50,6 +56,28 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.6: the adsb.lol adapter. New `ingest::adsb_lol`
+  (`AdsbLolSource`), plus `ingest::point` (`PointSource`) — because the second readsb fallback
+  showed the shared thing is bigger than 1.5 thought: not just the parser but the whole
+  *request* path (bbox → covering circle, 250 nm clamp, pacing, send, bbox-trim), byte-for-byte
+  identical between the two services. It moved into `point`, and 1.5's `airplanes_live` was
+  refactored to delegate; each adapter is now only its host, `SourceId`, spacing, fixtures, and
+  live test. **The design call worth knowing** (DECISION_LOG 1.6): 1.5 wrote the geometry as
+  "the adapter's own problem", and that framing did not survive the second adapter — rule of
+  two, and two copies of ~65 lines + their tests would fight the same ethos that made
+  `readsb`/`normalize`/`pacer` shared. **adsb.lol's spacing mirrors airplanes.live's ≥ 2 s
+  though no limit is documented**: privacy 1.3 is "never exceed documented limits", so with
+  none published the safe reading is the gentle one, not licence to go faster. Four own fixtures
+  + README with identities deliberately distinct from airplanes.live's, so a test can't pass off
+  the wrong file. Geometry/URL/trim/global-`Refused` are proven once in `point::tests`; each
+  adapter keeps only its own end-to-end/error-mapping/allowlist/live tests. **Verified live**:
+  46 aircraft over Switzerland, all inside the bbox, `ts` within the hour, SI ranges — the same
+  three beliefs (ms `now`, feet/knots, field names) pinned against adsb.lol *independently*, 0
+  credits, `#[ignore]`d. 242 tests (56 core, 138 ingest, 43 app, 5 render); fmt/clippy/test
+  green. docs/09's adsb.lol entry gained the shared-`point`/spacing/live-verified detail. Next:
+  **1.7**, the credit ledger + cadence controller — which first needs the `store`-vs-now seam
+  decided, since `source_status` lands at 1.11.
 
 - **2026-07-17** — M1 item 1.5: the airplanes.live adapter. Four new modules:
   `ingest::readsb` (the shared `{ac: [...]}` parser, parameterized by `SourceId` so 1.6

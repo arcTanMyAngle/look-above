@@ -85,7 +85,21 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       `cost()` = 0. **Verified live**: 48 aircraft over Switzerland, all inside the bbox,
       `ts` within the hour (`now` confirmed ms), altitudes/speeds in SI ranges (conversions
       confirmed), 0 credits, `#[ignore]`d. Rationale in DECISION_LOG.)*
-- [ ] 1.6 adsb.lol adapter reusing the readsb parsing module; fixtures.
+- [x] 1.6 adsb.lol adapter reusing the readsb parsing module; fixtures.
+      *(2026-07-17: done — `ingest::adsb_lol` (`AdsbLolSource`), and the second readsb
+      fallback surfaced a bigger reuse than the parser: the *request* side (bbox → covering
+      circle, 250 nm clamp, pacing, send, bbox-trim) is byte-identical between the two, so it
+      was lifted into `ingest::point` (`PointSource`) and 1.5's `airplanes_live` refactored to
+      delegate — the "adapter's own geometry problem" framing didn't survive the second
+      adapter (rule of two). Each adapter is now only its host, `SourceId`, spacing, fixtures,
+      and live test. adsb.lol has no documented rate limit, so it mirrors airplanes.live's
+      conservative ≥ 2 s spacing rather than a looser guess (privacy 1.3: with no limit
+      documented, the safe reading is the gentle one). Four own fixtures + README (identities
+      deliberately distinct from airplanes.live's so a test can't pass off the wrong file).
+      **Verified live**: 46 aircraft over Switzerland, all inside the bbox, `ts` within the
+      hour, SI ranges — the same three beliefs (ms `now`, feet/knots, field names) pinned
+      against adsb.lol independently, 0 credits, `#[ignore]`d. Net 242 tests (138 ingest),
+      fmt/clippy/test green. Rationale in DECISION_LOG.)*
 - [ ] 1.7 `ingest::budget`: daily credit ledger (persisted in `source_status`), pro-rated
       spend targets, cadence controller (poll interval widens as budget tightens; floor 5 s,
       ceiling 60 s).
