@@ -78,9 +78,13 @@ contract summary the adapters implement.
 
 ### airplanes.live (fallback, no key)
 - `GET https://api.airplanes.live/v2/point/{lat}/{lon}/{radius_nm}` (radius ≤ 250 nm)
-- Limit: 1 request/second — poller enforces ≥ 2 s spacing.
-- Response: `{ ac: [{hex, flight, lat, lon, alt_baro, gs, track, baro_rate, ...}] }`;
-  `alt_baro` may be the string `"ground"` — adapter maps to `on_ground=true`.
+- Limit: 1 request/second — the adapter itself enforces ≥ 2 s spacing (`ingest::pacer`).
+- Response: `{ ac: [{hex, flight, lat, lon, alt_baro, gs, track, baro_rate, seen_pos, ...}],
+  now, ... }`; `alt_baro` may be the string `"ground"` — adapter maps to `on_ground=true`.
+- **Units are aviation units** (adapter converts to SI): `alt_baro` in **feet**, `gs` in
+  **knots**, `baro_rate` in **ft/min**. Position timestamp = `now − seen_pos` (`now` is epoch
+  **milliseconds** here, seconds in raw readsb — verified live 2026-07-17). `~`-prefixed
+  `hex` values are non-ICAO TIS-B/ADS-R synthetics and are skipped, not tracked.
 
 ### adsb.lol (second fallback, no key)
 - `GET https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}` — same response family as

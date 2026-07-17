@@ -69,8 +69,22 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       for M3**: `anonymous` catches only the no-callsign half of privacy 2.2 — a PIA hex that
       broadcasts a callsign needs FAA range data we do not have; the enrichment gate is where
       it binds. Rationale in DECISION_LOG.)*
-- [ ] 1.5 airplanes.live adapter: `/v2/point` query, readsb-JSON parsing (shared module),
+- [x] 1.5 airplanes.live adapter: `/v2/point` query, readsb-JSON parsing (shared module),
       `"ground"` altitude handling, ≥ 2 s request spacing; fixtures.
+      *(2026-07-17: done — `ingest::readsb` (the shared `{ac: [...]}` parser 1.6 reuses,
+      parameterized by `SourceId`), `ingest::airplanes_live` (`AirplanesLiveSource`
+      implementing `LiveSource`), `ingest::pacer` (≥ 2 s spacing in the adapter — the limit
+      is the source's, not a scheduling choice), `ingest::normalize` (`coordinate`/`narrow`
+      lifted from `opensky::states`). 37 new tests, 233 total; four fixtures + README per
+      docs/10 §2. The traps and their answers: **units are feet/knots/ft-per-min → SI at the
+      parse boundary** through named constants; **`alt_baro: "ground"` → `on_ground`, no
+      altitude**; **ts = `now − seen_pos`** (1.4's time-of-applicability call), with `now`
+      normalized ms-vs-s by magnitude; **`~`-hex TIS-B synthetics skipped**, never minted an
+      identity. bbox → covering circle (midpoint, farthest corner, ceil, clamp 250 nm with
+      warn), results filtered back to the bbox; global query → `Refused` (M4's problem);
+      `cost()` = 0. **Verified live**: 48 aircraft over Switzerland, all inside the bbox,
+      `ts` within the hour (`now` confirmed ms), altitudes/speeds in SI ranges (conversions
+      confirmed), 0 credits, `#[ignore]`d. Rationale in DECISION_LOG.)*
 - [ ] 1.6 adsb.lol adapter reusing the readsb parsing module; fixtures.
 - [ ] 1.7 `ingest::budget`: daily credit ledger (persisted in `source_status`), pro-rated
       spend targets, cadence controller (poll interval widens as budget tightens; floor 5 s,

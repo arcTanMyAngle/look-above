@@ -45,8 +45,10 @@ programmatic use (privacy rule 1.1). Everything here is free; only OpenSky needs
 ### airplanes.live — fallback 1 (no key)
 - **Endpoint:** `GET https://api.airplanes.live/v2/point/{lat}/{lon}/{radius_nm}` (radius ≤ 250).
 - **Limit:** 1 request/second (enforce ≥ 2 s spacing). Community-run: be gentle, credit them.
-- **Response:** readsb JSON `{ ac: [...] }`; `alt_baro` may be the string `"ground"`;
-  fields: `hex, flight, lat, lon, alt_baro, gs, track, baro_rate, squawk, category`.
+- **Response:** readsb JSON `{ ac: [...], now }`; `alt_baro` may be the string `"ground"`;
+  fields: `hex, flight, lat, lon, alt_baro, gs, track, baro_rate, squawk, category, seen_pos`.
+  **Units: feet / knots / ft-per-min** (convert to SI); position ts = `now − seen_pos` with
+  `now` in epoch **ms**; `~`-prefixed `hex` = non-ICAO TIS-B synthetic (skip).
 
 ### adsb.lol — fallback 2 (no key)
 - **Endpoint:** `GET https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}` — same readsb

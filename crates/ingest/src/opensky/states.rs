@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::http::{HttpClient, send_json};
+use crate::normalize::{coordinate, narrow};
 use crate::opensky::auth::OpenSkyAuth;
 
 /// `OpenSky`'s live-state endpoint (authorized-aviation-sources skill).
@@ -288,27 +289,6 @@ fn i64_at(record: &[Value], index: usize) -> Option<i64> {
 
 fn bool_at(record: &[Value], index: usize) -> Option<bool> {
     field(record, index)?.as_bool()
-}
-
-/// Accepts a coordinate only if it is finite and within `±limit` degrees.
-///
-/// `BBox` validates its own corners, but these come off the wire: `Web Mercator` of latitude
-/// 91 is not an error, it is a plausible-looking point in the wrong place, and NaN would
-/// propagate through the projection into the vertex buffer. Checked here, once, where the
-/// value enters.
-fn coordinate(value: f64, limit: f64) -> Option<f64> {
-    (value.is_finite() && value.abs() <= limit).then_some(value)
-}
-
-/// Narrows a source-reported `f64` to the `f32` the pipeline stores.
-///
-/// Lossy in the last decimal places and deliberately so: these are metres, metres per second,
-/// and degrees derived from a radio broadcast, and `f32` carries about seven significant
-/// digits — more than the measurement has. `StateVector` chose `f32` for the GPU's sake
-/// (docs/09); this is where that choice is paid.
-#[allow(clippy::cast_possible_truncation)]
-fn narrow(value: f64) -> f32 {
-    value as f32
 }
 
 #[cfg(test)]

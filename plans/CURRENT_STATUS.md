@@ -3,14 +3,15 @@
 > The single source of truth for "where are we". Every session reads this first and updates
 > it last. Keep the Now section ≤ 10 lines; move history to the log below.
 
-## Now (updated 2026-07-15)
+## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.4
-  done; 196 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.5** — the airplanes.live adapter (`/v2/point`, readsb JSON in a
-  shared module 1.6 reuses, `"ground"` altitude string, ≥ 2 s spacing). No key needed, so
-  nothing blocks it. Both of 1.3's carry-overs are closed in 1.4; nothing is handed to 1.5.
-- **OpenSky is now proven end to end** — auth (1.3) and live data (1.4). `credentials.json` is
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.5
+  done; 233 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.6** — the adsb.lol adapter, reusing `ingest::readsb` (built for
+  exactly this in 1.5) and `ingest::pacer`; own endpoint, fixtures, and live check, since the
+  two services drift independently. No key needed; nothing blocks it, nothing is handed to it.
+- **Both live paths are proven** — OpenSky auth + data (1.3/1.4) and airplanes.live (1.5: 48
+  aircraft live, units and ms-timestamps confirmed, 0 credits). `credentials.json` stays
   gitignored and read as-issued. [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 stays closed.
 - **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
   `look-above` and then push, in that order** — the existing repo has an underscore; the
@@ -30,7 +31,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.4 done | — |
+| M1 | in progress — 1.1–1.5 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -49,6 +50,32 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.5: the airplanes.live adapter. Four new modules:
+  `ingest::readsb` (the shared `{ac: [...]}` parser, parameterized by `SourceId` so 1.6
+  drops in), `ingest::airplanes_live` (`AirplanesLiveSource`), `ingest::pacer` (≥ 2 s
+  spacing), `ingest::normalize` (`coordinate`/`narrow` lifted out of `opensky::states`).
+  37 new tests, 233 total; fmt/clippy/test green. **The headline risk was units, and it is
+  the first adapter where that is true**: readsb sends feet/knots/ft-per-min where OpenSky
+  sent SI, and a missed conversion produces plausible-looking numbers in the wrong unit —
+  so conversion happens at the parse boundary through named constants, and the live test
+  asserts ranges an unconverted value cannot pass. **Verified live, keyless, free**: 48
+  aircraft over Switzerland (a 73 nm circle around 47°N 8°E), every one inside the
+  requested bbox, every `ts` within the hour — which pins the other belief at risk, that
+  the API's `now` is epoch *milliseconds* (raw readsb uses seconds; the parser normalizes
+  by magnitude). Judgement calls, all in DECISION_LOG: **ts = `now − seen_pos`** (1.4's
+  time-of-applicability reasoning); **`~`-hex TIS-B synthetics are skipped**, never minted
+  an identity (0.3's `Icao24` strictness paying off); **bbox → covering circle** (midpoint
+  center, farthest of the four corners — the sphere makes them unequal — ceil'd, clamped to
+  the documented 250 nm with a warn) and **results filtered back to the bbox** so every
+  source answers the same question for 1.9's merge; **a global query is `Refused`** rather
+  than approximated (M4's problem); **`cost()` = 0** — what this source meters is rate,
+  paid in time by the pacer, which lives in the *adapter* because the limit is the
+  source's, not a scheduling choice. Pacing is proven under tokio's paused clock
+  (`test-util`, dev-only); deliberately not re-proven over wiremock, where the
+  auto-advancing clock can fire the 10 s timeout mid-reply. docs/09 and the skill gained
+  the units/`seen_pos`/`~`-hex detail — the contract summary had field names but not
+  units, and units are the trap. Next: **1.6**, the adsb.lol adapter over the same parser.
 
 - **2026-07-15** — M1 item 1.4: the OpenSky `/states/all` adapter. `ingest::opensky::states` —
   `OpenSkySource` (implements `LiveSource`), positional-array parsing, `credit_cost`. 35 new

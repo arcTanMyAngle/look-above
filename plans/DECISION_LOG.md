@@ -687,3 +687,66 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   asserts *someone* has a callsign and *someone* a velocity, since reading the wrong indices
   would otherwise report every optional field absent and pass. `#[ignore]`d so CI never spends
   a credit. 196 tests (56 core, 92 ingest, 43 app, 5 render); fmt/clippy/test green.
+
+## 2026-07-17 — M1 item 1.5 (airplanes.live adapter, shared readsb parser)
+
+- **`ingest::readsb` is the shared parser; `ingest::airplanes_live` is the adapter.** docs/09
+  mandates the split (adsb.lol speaks the same readsb shape at 1.6): the field mapping is one
+  implementation parameterized by `SourceId`, while endpoint, spacing, fixtures, and the live
+  test stay per-adapter, because the two services drift independently. `coordinate`/`narrow`
+  were lifted from `opensky::states` into a `pub(crate)` `ingest::normalize` so the two
+  parsers share them instead of growing copies.
+- **Units convert at the parse boundary — readsb is aviation units, `StateVector` is SI.**
+  `alt_baro` in feet, `gs` in knots, `baro_rate` in ft/min (OpenSky sent SI already). A missed
+  conversion compiles and produces plausible-looking numbers in the wrong unit, so the factors
+  are named constants (`METRES_PER_FOOT` = 0.3048 exactly, knot = 1852/3600 m/s) and both the
+  fixture tests and the live test assert values that an unconverted number would fail.
+- **A position is dated `now − seen_pos`, never receipt time** — the same call as 1.4's
+  `time_position`: `seen_pos` is the position's age, and dating a stale fix to now would have
+  M2's dead reckoning advance the aircraft from a place it had left. A record without
+  `seen_pos` (or `hex`, `lat`, `lon`) is dropped. **`now` is normalized by magnitude**
+  (> 10¹¹ → milliseconds): the APIs send ms where readsb's own `aircraft.json` sends seconds,
+  and a wrong scale dates every position to 1970 or the year ~56,000 — the live test asserts
+  `ts` lands within the current hour. A response without a usable `now` yields zero records
+  (the loud all-skipped `warn`), not a parse error and not a receipt-time batch.
+- **`alt_baro: "ground"` → `on_ground = true`, altitude `None`** — a surface flag, not an
+  altitude of zero. Any other non-numeric `alt_baro` reads as absent-and-airborne (the
+  assumption that loses least, as in 1.4).
+- **`~`-prefixed hexes (TIS-B/ADS-R synthetics) are skipped, counted, and logged at `debug`.**
+  `Icao24::from_hex` already rejects them (0.3 built that in for exactly this): a synthetic
+  target must not be tracked under a minted identity. The all-records-lost `warn` tripwire is
+  reused from 1.4.
+- **bbox → covering circle: midpoint center, radius = farthest corner, ceil'd, clamped to the
+  documented 250 nm with a `warn`.** The endpoint takes a point and radius, the contract is a
+  bbox. All four corners are measured (the lat/lon midpoint is not equidistant from them on a
+  sphere — the pair farther from the pole is farther in metres); ceil so the circle
+  circumscribes rather than clips; floor 1 nm so a degenerate box still queries. Clamping an
+  oversized box (M1 allows up to ~1,000 km across → ~382 nm) trades partial coverage for a
+  working failover, loudly; the acceptance bbox (~500 × 500 km → ~191 nm) fits whole.
+- **Results are filtered back to the requested bbox.** The circle sees past the corners, and
+  every source must answer the same question or 1.9's merge compares different regions.
+- **A global query returns `Refused` without sending anything.** A point/radius endpoint
+  cannot answer "the world", and a max-radius circle around an arbitrary point would be a
+  confidently wrong answer. Global polling is M4's problem; `Refused` is not transient, so the
+  poller moves on.
+- **`cost()` is 0** (the contract's "0 when unmetered") — what airplanes.live meters is
+  *rate*, which is paid in time by the pacer, not in credits by the ledger.
+- **≥ 2 s spacing lives in the adapter (`ingest::pacer::Pacer`), not the poller.** The
+  documented limit (1 req/s; the skill directs ≥ 2 s) is the source's, not a scheduling
+  choice, so the adapter enforces it whatever the caller does: a tokio-mutexed timestamp,
+  lock held across the sleep so concurrent callers queue spaced rather than waking together.
+  Paced *after* the allowlist could refuse — a request that never leaves spends no interval.
+  Tested under `start_paused` (tokio `test-util`, dev-only — no injected `Clock` needed where
+  1.3 needed one); deliberately **not** re-proven over wiremock, where the auto-advancing
+  paused clock can fire the 10 s timeout while a real socket reply is in flight. The adapter
+  asserts its wiring (`interval == 2 s`) instead.
+- **Fixtures hand-written to the documented shape** (1.10's recorder still absent), per-case
+  README with provenance and units notes in `tests/fixtures/airplaneslive/`. docs/09 §airplanes.live
+  and the skill's response line gained the units/`seen_pos`/`~`-hex detail — the contract
+  summary listed field names but not units, and units are the trap.
+- **Verification — live, keyless, free.** `live_airplanes_live_point_matches_the_documented_shape`
+  ran once against the real `/v2/point`: **48 aircraft over Switzerland (73 nm circle around
+  47°N 8°E), every one inside the bbox, every `ts` within the hour (so `now` is confirmed
+  ms), every altitude/speed in SI ranges (so the conversions ran), 1 anonymous, 4 on the
+  ground, 0 credits.** `#[ignore]`d; run once after changes, never in CI. 233 tests (56 core,
+  129 ingest, 43 app, 5 render); fmt/clippy/test green.

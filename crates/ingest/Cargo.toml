@@ -21,6 +21,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The pacer tests run under tokio's paused clock: the sleeps are virtual, the schedule real.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]
