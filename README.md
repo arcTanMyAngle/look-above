@@ -177,6 +177,12 @@ cargo run -p look-above    # opens the window
 cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 point_nominal
 ```
 
+`cargo run -p look-above` opens a native window, so it needs a graphical desktop
+session. On Windows, run it from PowerShell. Under WSL it needs WSLg (or an X server
+with `DISPLAY` set) — without one it exits with *"Could not find wayland compositor"*,
+which is the environment having nowhere to draw, not a fault in the app. The tests and
+the fixture recorder are headless and run anywhere.
+
 Rust stable 1.96, pinned in `rust-toolchain.toml`. SQLite is compiled in; there's
 nothing to install. OpenSky is the one source that needs an account: its client id and
 secret come from the `LOOK_ABOVE_OPENSKY_*` environment variables, a gitignored
