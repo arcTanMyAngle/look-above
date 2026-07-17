@@ -5,14 +5,21 @@
 
 ## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.8
-  done; 284 tests green (5 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.9
+  done; 304 tests green (5 live tests `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.9** — `core::merge`: dedup across sources (newest ts per icao24
-  wins), out-of-order drop, staleness tracking, and **sticky anonymity** (privacy 2.2 — once a
-  target is anonymous it stays so for the session, even if a later record carries identity),
-  with the unit tests docs/10 asks for. It consumes the `crossbeam` channel of `PollBatch`es
-  the 1.8 poller now emits.
+- **Next action:** **M1 item 1.10** — `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records
+  → scrub credentials → write to `tests/fixtures/`; never prints payloads (docs/06 network
+  rule). This is the recorder the hand-written fixtures (1.4–1.6) have been standing in for; its
+  README notes already promise a re-record path through it.
+- **1.9 merge landed:** `core::merge` — `SessionTable` (one `StateVector` per `Icao24`,
+  freshest seen) + `MergeStats { new, updated, dropped }`. Dedup is strictly newest-`ts`-wins
+  (equal-`ts` duplicate and out-of-order both drop). **Sticky anonymity is a one-way latch
+  honored regardless of `ts`** — once anonymous, stays so for the session with callsign pinned
+  `None`, and it latches *even on a record dropped as stale* (an anonymity signal is a privacy
+  fact, not a position; privacy 2.2/5.2). Staleness tracked via `age`/`stale_count`/
+  `evict_stale` with `STALE_AFTER_S`=60 s / `DROP_AFTER_S`=90 s (skill-pinned; the visual fade
+  stays M2/render). Clock-free for merging; only staleness queries take a `now`. DECISION_LOG 1.9.
 - **1.8 poller landed:** `ingest::poller` — `Poller` (async loop), `PollBatch` (channel
   payload, carries per-cycle `credits_spent`/`spent_today`), `WallClock`/`SystemWallClock`.
   Failover branches on `is_transient`: transient retries same then fails over after 3 in a row;
@@ -47,7 +54,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.8 done | — |
+| M1 | in progress — 1.1–1.9 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -66,6 +73,26 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.9: the cross-source merge. New `core::merge`: `SessionTable` (the
+  session's deduplicated live picture — one `StateVector` per `Icao24`, the freshest seen) and
+  `MergeStats { new, updated, dropped }`. 20 tests, 304 total (71 core, 180 ingest, 43 app, 5
+  render); fmt/clippy/test green. **Dedup is strictly newest-`ts`-wins**: a record replaces the
+  held one only when `incoming.ts > stored.ts`; anything not strictly newer — an out-of-order
+  late arrival *or* an equal-`ts` duplicate from a second source — is dropped, the same
+  time-of-applicability reasoning as 1.4's `time_position` (a slower feed must not drag an
+  aircraft back to an older fix). **Sticky anonymity is a one-way latch honored independent of
+  `ts`** (privacy 2.2): once any record marks a hex anonymous it stays so for the session with
+  `callsign` pinned `None`, even against a *newer, identified* record — and the subtle call is
+  that **the latch fires even on a record dropped as stale**, because an anonymity signal is a
+  privacy fact, not a position. Insertion enforces the same invariant defensively rather than
+  trusting an adapter. **Staleness is tracked here but faded in M2**: `age(now)` (signed, so a
+  source clock ahead of us reads negative rather than underflowing), `stale_count(now, max_age)`,
+  and `evict_stale(now, max_age)`, with named horizons `STALE_AFTER_S`=60 s and `DROP_AFTER_S`=90
+  s pinned to the render skill's "begin fade" / "stop extrapolating" points — the visual fade
+  stays render's job. `MergeStats` is exactly the per-batch tally 1.12's new/updated/stale
+  readout consumes. Clock-free for merging (dedup/stickiness test in isolation); only staleness
+  queries take a `now`. DECISION_LOG 1.9. Next: **1.10**, `scripts/record_fixture.rs`.
 
 - **2026-07-17** — M1 item 1.8: the poller. New `ingest::poller`: `Poller` (the async poll
   loop), `PollBatch` (the `crossbeam` payload — source, states, and the cycle's own

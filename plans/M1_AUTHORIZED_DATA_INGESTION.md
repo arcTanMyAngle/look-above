@@ -138,8 +138,21 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       reset — a rationing primary is not a failed one (DECISION_LOG 1.8). **Verified live**
       (`#[ignore]`d, keyless, free): with OpenSky disabled the poller failed over and emitted a
       real fallback batch, 0 credits. Rationale in DECISION_LOG.)*
-- [ ] 1.9 `core::merge`: dedup across sources (newest ts per icao24 wins), out-of-order drop,
+- [x] 1.9 `core::merge`: dedup across sources (newest ts per icao24 wins), out-of-order drop,
       staleness tracking, **sticky anonymity** (privacy 2.2) — with the unit tests from docs/10.
+      *(2026-07-17: done — `core::merge`: `SessionTable` (one `StateVector` per `Icao24`, the
+      freshest seen) and `MergeStats { new, updated, dropped }`. 20 tests, 304 total. **Dedup is
+      strictly newest-`ts`-wins**; not-strictly-newer (out-of-order *or* equal-`ts` duplicate) is
+      dropped — the same time-of-applicability reasoning as 1.4. **Sticky anonymity is a one-way
+      latch honored independent of `ts`**: once any record marks a hex anonymous it stays so for
+      the session and its callsign is pinned `None`, even against a newer identified record — and
+      **the latch fires even for a record dropped as stale**, because an anonymity signal is a
+      privacy fact, not a position (privacy 2.2 / 5.2). **Staleness tracked here, faded in M2**:
+      `age`/`stale_count`/`evict_stale` with horizons `STALE_AFTER_S` = 60 s and `DROP_AFTER_S` =
+      90 s pinned to the render skill's "begin fade" / "stop extrapolating" points; the visual
+      fade stays render's job. `MergeStats` is the per-batch tally 1.12's new/updated/stale
+      readout consumes. Clock-free for merging (dedup/stickiness test in isolation); only the
+      staleness queries take a `now`. Rationale in DECISION_LOG.)*
 - [ ] 1.10 `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records → scrub → write to
       tests/fixtures/ (never prints payloads; docs/06 network rule).
 - [ ] 1.11 `store`: migrations 0001 (aircraft, source_status) + writer thread skeleton;

@@ -891,3 +891,48 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   default chain with OpenSky disabled and asserts a real keyless-fallback batch, 0 credits. 284
   tests (56 core, 180 ingest, 43 app, 5 render), 5 live tests ignored; fmt/clippy/test green.
   Next: **1.9**, `core::merge` (dedup, out-of-order drop, sticky anonymity).
+
+## 2026-07-17 — M1 item 1.9 (`core::merge`: dedup, out-of-order drop, sticky anonymity, staleness)
+
+- **`SessionTable` in `core`, not `ingest`.** The merge is the *pipeline's* source of truth
+  (docs/09), keyed on `Icao24` with one `StateVector` per aircraft, and it depends on nothing
+  but the core vocabulary — so it lives in `core::merge` (the crate the plan reserved for it),
+  clock-free and I/O-free. `ingest` produces `PollBatch`es; `core::merge` consumes their
+  `states`. The store (1.11) and headless readout (1.12) will drive it.
+- **Dedup is strictly newest-`ts`-wins; equal `ts` is a drop.** A record replaces the held one
+  only when `incoming.ts > stored.ts`. Anything not strictly newer — an out-of-order late
+  arrival *or* an equal-`ts` duplicate from a second source — is dropped, because there is no
+  newer information in it. This is the same time-of-applicability reasoning as item 1.4's
+  `time_position` choice: a slower feed must never drag an aircraft back to an older fix, or M2's
+  dead reckoning would advance it from a place it had already left.
+- **Sticky anonymity is a one-way latch, honored independent of `ts` (privacy rule 2.2).** Once
+  *any* record for a hex is `anonymous`, the tracked target stays anonymous for the session and
+  its `callsign` is pinned to `None` — even a *newer, identified* record does not un-anonymize
+  it (`stored.anonymous || incoming.anonymous`, and clear the callsign whenever the result is
+  true). The subtle call: the latch fires **even for a record we drop as stale**. An anonymity
+  signal is a privacy fact, not a position; a stale out-of-order record that reveals a hex is
+  anonymous still latches the flag though its position is discarded. Insertion enforces the same
+  invariant defensively (an anonymous first sighting is stripped of any callsign an adapter left
+  on) rather than trusting upstream. This is the code side of docs/04 §2.2 and §5.2 (anonymity
+  survives into replay).
+- **Staleness is tracked here but *faded* in M2.** Entries carry their `ts`, so `age(now)`,
+  `stale_count(now, max_age)`, and `evict_stale(now, max_age)` are the data-layer view of
+  staleness. The horizons are named constants pinned to the render skill: `STALE_AFTER_S` = 60 s
+  (the skill's "begin fade" point — a track *reported* stale but still tracked) and
+  `DROP_AFTER_S` = 90 s (the skill's "stop extrapolating" point — past which holding the entry
+  only serves a frozen ghost, so it is forgotten). The methods take the horizon as a parameter
+  (fully testable), and the constants are the standard values 1.12 will pass. The *visual* fade
+  (alpha ramp, frozen extrapolation) stays the render layer's job — merge only decides fresh /
+  stale / forgotten. `age` is signed (`now − ts`), so a source clock ahead of this machine reads
+  negative rather than underflowing; callers wanting an unsigned age clamp at zero.
+- **`MergeStats { new, updated, dropped }` is the per-batch tally** the headless readout (1.12)
+  needs — "new/updated/stale" counts come from `merge` (new/updated/dropped) plus
+  `stale_count`. `total()` equals the batch length, so every record is accounted for.
+- **Verification.** 20 tests: newest-`ts`-wins across sources, out-of-order drop, equal-`ts`
+  duplicate drop, distinct aircraft tracked separately, in-batch reconciliation; the three
+  anonymity cases (first anonymous sighting strips a callsign, a later identified record does not
+  un-anonymize, a stale out-of-order anonymous record still latches while its position is
+  dropped) plus the negative case (an ordinary target is never touched by the latch); age,
+  `stale_count`, and `evict_stale` against explicit horizons, the `STALE ≤ DROP` invariant as a
+  `const` assertion, and the stats-total accounting. 304 tests (71 core, 180 ingest, 43 app, 5
+  render), 5 live ignored; fmt/clippy/test green. Next: **1.10**, `scripts/record_fixture.rs`.
