@@ -100,9 +100,25 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       hour, SI ranges — the same three beliefs (ms `now`, feet/knots, field names) pinned
       against adsb.lol independently, 0 credits, `#[ignore]`d. Net 242 tests (138 ingest),
       fmt/clippy/test green. Rationale in DECISION_LOG.)*
-- [ ] 1.7 `ingest::budget`: daily credit ledger (persisted in `source_status`), pro-rated
+- [x] 1.7 `ingest::budget`: daily credit ledger (persisted in `source_status`), pro-rated
       spend targets, cadence controller (poll interval widens as budget tightens; floor 5 s,
       ceiling 60 s).
+      *(2026-07-17: done — `ingest::budget`: `CreditLedger` (per-UTC-day credit count that
+      resets itself at the day boundary), the pure `poll_interval`/`can_afford`/
+      `prorated_target`/`remaining_budget` functions, and `CreditLedger::decide` bundling them
+      into a `BudgetDecision`. 25 tests, 267 total. **The seam decided first** (per
+      CURRENT_STATUS): the ledger is a small owned struct, **in-memory for M1**, restored from
+      `source_status.credits_used_today` at 1.11 via `CreditLedger::restored` — no reach into
+      `store`, which does not exist yet. **The number defended is 3,200 = 80% of the 4,000/day
+      allowance** (privacy rule 1.3's margin), not 4,000. **Cadence = even-spread of the
+      *remaining* budget over the *remaining* seconds of the UTC day**, clamped to [5 s, 60 s]:
+      this *is* the pro-rating — on the pro-rata line it gives the steady ~27 s/credit that just
+      fills the day; under budget it shrinks toward the floor, over budget it widens toward the
+      ceiling ("interval widens as budget tightens"). **Two separate protections**: the cadence
+      (soft, within [5,60]) and `can_afford` (the hard stop that refuses the cycle crossing the
+      cap — the ceiling alone can't bound a 4-credit query). **Wall-clock `UnixSeconds`, not the
+      monotonic `Instant`** auth uses — the day boundary is a calendar fact. Pure functions
+      only; the poller (1.8) drives them. Rationale in DECISION_LOG.)*
 - [ ] 1.8 Poller: drives the active source at the budgeted cadence for the current region;
       failover chain opensky → airplaneslive → adsblol on repeated `SourceError`s; recovery
       probe of the primary every 5 min; emits batches into `crossbeam` channel.

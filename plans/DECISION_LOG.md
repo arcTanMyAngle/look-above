@@ -786,3 +786,52 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   for adsb.lol too), every altitude/speed in SI ranges (so the conversions ran), 0 anonymous,
   4 on the ground, 0 credits.** `#[ignore]`d; run once after changes, never in CI. 242 tests
   (56 core, 138 ingest, 43 app, 5 render), 4 live tests ignored; fmt/clippy/test green.
+
+## 2026-07-17 — M1 item 1.7 (`ingest::budget`: credit ledger + cadence controller)
+
+- **The `store`-vs-now seam, decided first (as CURRENT_STATUS asked).** The daily ledger is a
+  small **owned struct held in memory** for M1, not a handle into `store` — `source_status`
+  does not exist until item 1.11. The commitment is "in-memory now, persisted then":
+  `CreditLedger::restored(spent, now)` is the single seam 1.11 rehydrates through, and the
+  poller (1.8) owns the ledger meanwhile. Building it as a reach into a not-yet-existent table
+  would have coupled 1.7 to 1.11 for no gain; a pure owned counter is testable today and
+  trivially serialisable later.
+- **The number defended is 3,200, not 4,000.** Privacy rule 1.3 is "stay under 80% of any
+  documented limit with margin", so `DAILY_BUDGET = 0.8 × 4,000` is the cap the whole module
+  enforces; the real 4,000 is never the target. `const` cannot do the `f64` multiply, so the
+  value is written out and a test pins it to `(4000 · 0.8) as u32`.
+- **Cadence = even-spread of the remaining budget over the remaining UTC day, and that *is*
+  the pro-rating.** `poll_interval = seconds_until_midnight ÷ (remaining_budget ÷ cost)`,
+  clamped to [5 s, 60 s]. On the pro-rata line (spent = budget × fraction-of-day) this reduces
+  to a constant `86400 × cost / 3200 ≈ 27 s`/credit — the steady state that just fills the day.
+  Spend *slower* than pro-rata → more budget into less day → interval shrinks toward the 5 s
+  floor (we have savings, poll faster). Spend *faster* → interval grows toward the 60 s ceiling
+  (ahead of budget, slow down). So "poll interval widens as the budget tightens" and "pro-rated
+  spend targets" are one calculation, not two — `prorated_target` is exposed only as an
+  at-a-glance health number (1.12), never read by the cadence. Rejected the alternative of
+  "poll at the floor while under a pro-rata threshold, else widen": at cost 1 the 5 s floor is
+  17,280 credits/day, ~5× the budget, so a floor-by-default cadence would blow the allowance in
+  hours — the floor must be the *exception* (banked budget late in the day), not the norm.
+- **Two protections, deliberately separate.** The cadence is soft and bounded to [5 s, 60 s];
+  the hard stop is `can_afford` (`spent + cost ≤ 3,200`), which the poller must honour by not
+  running a refused cycle. The ceiling alone cannot bound spend — a 4-credit query every 60 s
+  is 5,760 credits/day — so the cap, not the interval, is what guarantees rule 1.3. When the
+  budget is exhausted the cadence returns the ceiling (idle slowly, pick back up at the
+  midnight reset) and `can_afford` is what actually stops the fetch.
+- **Wall-clock `UnixSeconds`, not the monotonic `Instant`** the token refresh (1.3) uses. A
+  daily budget resets on a *calendar* boundary, and a duration cannot roll over at midnight; a
+  user correcting their wall clock across the day boundary *should* reset the ledger, which is
+  behaviour to want, not a bug to guard. `div_euclid`/`rem_euclid` on the UTC-day index keep
+  the arithmetic total even pre-epoch (nothing polls in 1969, but the functions stay total).
+- **`cost == 0` (the unmetered fallbacks) is always affordable and polls at the floor.** The
+  credit budget governs credits; a source that spends none is bounded by its own `pacer`
+  (1.5/1.6), not by this ledger — so budget imposes nothing on it. `record` uses
+  `saturating_add` so a runaway count pins at `u32::MAX` rather than wrapping to a small number
+  that would read as budget restored.
+- **Verification.** 25 unit tests: day-boundary arithmetic (incl. pre-epoch and rollover), the
+  pro-rata steady state, floor/ceiling clamping under a swept `(spent, cost, time-of-day)`
+  grid, the hard-cap boundary, the ledger's daily reset and restore, and `decide` agreeing with
+  the free functions it composes. Pure functions, no network, no clock injection needed (`now`
+  is a parameter). 267 tests (56 core, 163 ingest, 43 app, 5 render), 4 live tests ignored;
+  fmt/clippy/test green. Next: **1.8**, the poller that drives this cadence and the failover
+  chain.

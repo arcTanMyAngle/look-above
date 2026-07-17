@@ -5,15 +5,19 @@
 
 ## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.6
-  done; 242 tests green (4 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.7
+  done; 267 tests green (4 live tests `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.7** — `ingest::budget`: the daily credit ledger (persisted in
-  `source_status`), pro-rated spend targets, and the cadence controller (poll interval widens
-  as budget tightens; floor 5 s, ceiling 60 s). Pure functions per the design note
-  (`ledger + bbox + clock → next_poll_at`). Note this reaches into `store` for `source_status`,
-  which does not exist until 1.11 — decide the seam (in-memory ledger now, persistence at 1.11)
-  as the first order of business.
+- **Next action:** **M1 item 1.8** — the poller: drive the active source at `ingest::budget`'s
+  cadence for the current region; failover chain opensky → airplaneslive → adsblol on repeated
+  `SourceError`s (branch on `is_transient`); recovery probe of the primary every 5 min; emit
+  batches into the `crossbeam` channel. It owns a `CreditLedger` per metered source, calls
+  `decide(cost, now)` each cycle, and skips (does not fetch) any cycle `can_afford` refuses.
+- **1.7 seam settled:** the credit ledger is **in-memory for M1**, a small owned
+  `CreditLedger` that resets at the UTC-day boundary; item 1.11 rehydrates it from
+  `source_status.credits_used_today` through `CreditLedger::restored`. No reach into `store`
+  (which doesn't exist yet). Cadence is even-spread of the remaining 80%-of-4,000 budget over
+  the remaining day, clamped [5 s, 60 s]; `can_afford` is the separate hard cap. DECISION_LOG 1.7.
 - **All three live paths are proven** — OpenSky auth + data (1.3/1.4), airplanes.live (1.5: 48
   aircraft), and adsb.lol (1.6: 46 aircraft, units + ms-timestamps confirmed independently, 0
   credits). Both fallbacks share `ingest::point` (the bbox→circle point query) and
@@ -37,7 +41,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.6 done | — |
+| M1 | in progress — 1.1–1.7 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -56,6 +60,28 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.7: the credit ledger + cadence controller. New `ingest::budget`:
+  `CreditLedger` (an in-memory per-UTC-day credit count that resets itself at the day
+  boundary), the pure `poll_interval` / `can_afford` / `prorated_target` / `remaining_budget`
+  functions, and `CreditLedger::decide` that bundles them into a `BudgetDecision`. 25 tests,
+  267 total; fmt/clippy/test green. **The seam was the first call** (CURRENT_STATUS flagged it):
+  the ledger is a small **owned struct, in memory now**, rehydrated from
+  `source_status.credits_used_today` at 1.11 via `CreditLedger::restored` — no reach into
+  `store`, which does not exist yet. **The number defended is 3,200 = 80% of OpenSky's
+  4,000/day** (privacy rule 1.3's margin), never 4,000. **The cadence is even-spread of the
+  *remaining* budget over the *remaining* seconds of the UTC day, clamped [5 s, 60 s] — and
+  that *is* the pro-rating**: on the pro-rata line it gives the steady ~27 s/credit that just
+  fills the day, under budget it shrinks toward the floor, over budget it widens toward the
+  ceiling, which is exactly "interval widens as budget tightens". Rejected floor-by-default:
+  the 5 s floor at cost 1 is ~5× the daily budget, so it must be the exception (banked budget
+  late in the day), not the norm. **Two protections kept separate**: the soft cadence (bounded
+  [5,60]) and the hard `can_afford` cap — the ceiling alone can't bound a 4-credit query, so
+  the cap is what guarantees rule 1.3, and an exhausted budget idles at the ceiling until the
+  midnight reset. **Wall-clock `UnixSeconds`, not the monotonic `Instant`** auth uses: the day
+  boundary is a calendar fact, and a clock correction that shifts the day *should* reset the
+  ledger. All pure functions — the poller (1.8) drives them. Next: **1.8**, the poller +
+  failover chain.
 
 - **2026-07-17** — M1 item 1.6: the adsb.lol adapter. New `ingest::adsb_lol`
   (`AdsbLolSource`), plus `ingest::point` (`PointSource`) — because the second readsb fallback

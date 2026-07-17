@@ -10,10 +10,15 @@
 //! [`adsb_lol`]) share one readsb parser ([`readsb`]) and one point-query implementation
 //! ([`point`]) — bbox → covering circle, the 250 nm clamp, [`pacer`] spacing, and trimming
 //! the reply back to the bbox — differing only in host, id, spacing, and fixtures.
+//!
+//! [`budget`] is what keeps the primary inside `OpenSky`'s allowance: a daily credit ledger
+//! and the pure cadence controller (`ledger + cost + clock → poll interval`) the poller will
+//! drive in item 1.8.
 
 pub mod adsb_lol;
 pub mod airplanes_live;
 pub mod allowlist;
+pub mod budget;
 pub mod http;
 mod normalize;
 pub mod opensky;
