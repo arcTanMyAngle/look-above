@@ -25,5 +25,15 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
+# The fixture recorder (item 1.10). It lives at the repo-root `scripts/` the docs name
+# (docs/06, docs/10) rather than under `src/bin/`, and is a bin of this crate because it is
+# the one sanctioned live fetch besides the app: it reuses this crate's allowlist-enforcing
+# `HttpClient`, the OpenSky auth, and the source endpoints so a recording goes out exactly as
+# a poll would. It is never built by `cargo build -p look-above-ingest` unless asked for by
+# name, and its pure trim/scrub logic is unit-tested offline like everything else.
+[[bin]]
+name = "record-fixture"
+path = "../../scripts/record_fixture.rs"
+
 [lints]
 workspace = true

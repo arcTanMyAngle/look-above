@@ -153,8 +153,25 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       fade stays render's job. `MergeStats` is the per-batch tally 1.12's new/updated/stale
       readout consumes. Clock-free for merging (dedup/stickiness test in isolation); only the
       staleness queries take a `now`. Rationale in DECISION_LOG.)*
-- [ ] 1.10 `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records → scrub → write to
+- [x] 1.10 `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records → scrub → write to
       tests/fixtures/ (never prints payloads; docs/06 network rule).
+      *(2026-07-17: done — `scripts/record_fixture.rs`, wired as a `[[bin]]` of `ingest`
+      (`path = "../../scripts/record_fixture.rs"`) so a recording goes out exactly as a poll
+      would: it reuses the allowlist-enforcing `HttpClient`, the OpenSky `OAuth2` client, the
+      source endpoint constants, and `point::MAX_RADIUS_NM` rather than reconstructing any. CLI
+      speaks each source's native region shape (OpenSky bbox / readsb `point/{lat}/{lon}/{radius}`),
+      which is what avoided a third copy of `point`'s covering-circle math — the recorded
+      *response shape* is identical either way. Trims the record array to ≤ 20, then scrubs a
+      denylist of credential/account-shaped keys (a tripwire — removes nothing from today's
+      anonymous feeds), and writes pretty JSON to `crates/ingest/tests/fixtures/<source>/`,
+      printing only a count and path (docs/06). OpenSky creds are env-only (`LOOK_ABOVE_OPENSKY_*`)
+      — reaching `app`'s config loader would invert the crate direction. **Not a drop-in
+      re-record**: the crafted `*_nominal` fixtures pin exact values the parser tests assert, and
+      the `empty`/`nulls`/`malformed` cases stay hand-authored; the tool refreshes *shape*. 9
+      offline tests (trim/scrub/naming/parse), plus the **live path exercised** (`adsblol 47 8 73`
+      → 16 real aircraft, valid trimmed file, count-only output, checked structurally and deleted).
+      313 tests, fmt/clippy/test green. `Box<dyn Error>` not `anyhow` (that stays in `app`). READMEs
+      (root + three fixture) updated with the command and the re-record caveat. DECISION_LOG 1.10.)*
 - [ ] 1.11 `store`: migrations 0001 (aircraft, source_status) + writer thread skeleton;
       poller updates source_status (last_success/error, credits_used_today).
 - [ ] 1.12 Headless mode: `look-above --headless` logs per-cycle counts (new/updated/stale,

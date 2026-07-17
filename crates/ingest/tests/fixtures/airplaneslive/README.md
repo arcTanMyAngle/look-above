@@ -7,16 +7,30 @@ every optional field, the `"ground"` altitude string, and a malformed record mid
 ## Provenance
 
 **Hand-written to readsb's documented shape** — not recorded from the live API, for the
-same two reasons as `../opensky/README.md`: the recording script (item 1.10) does not
-exist yet, and the awkward cases are the point — a TIS-B record or an all-null aircraft
-arrives when it arrives; authoring them is the only way to have them.
+same reason as `../opensky/README.md`: the awkward cases are the point — a TIS-B record or
+an all-null aircraft arrives when it arrives; authoring them is the only way to have them.
 
 These therefore encode what we *believe* airplanes.live sends. The beliefs at risk — that
 `now` is **milliseconds**, that `alt_baro`/`gs`/`baro_rate` are **feet/knots/ft-per-min**,
 and the field names themselves — are asserted against the real service by
 `live_airplanes_live_point_matches_the_documented_shape` in `airplanes_live.rs`
 (`#[ignore]`d; keyless and free, but run it once, not in a loop). Run it after any change
-here. Re-record these once item 1.10 lands.
+here.
+
+## Re-recording
+
+The recorder from item 1.10 refreshes a fixture's *shape* from the live API (keyless, free):
+
+```text
+cargo run -p look-above-ingest --bin record-fixture -- airplaneslive 47 8 73 point_nominal
+```
+
+It fetches, trims to ≤ 20 records, scrubs, and overwrites the file without printing the
+payload. It is not a drop-in: `point_nominal.json` is crafted so the parser tests assert
+*exact* converted values (36,000 ft → 10,972.8 m, and the `~`-hex synthetic that must be
+dropped), which live data will not match — a re-record means updating those assertions too.
+The `empty` / `nulls` / `malformed` cases stay hand-authored. Use the recorder to confirm the
+live shape still parses, or to reset a fixture after a documented source change.
 
 ## Privacy
 

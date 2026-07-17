@@ -6,13 +6,10 @@ and a malformed record mid-array.
 
 ## Provenance
 
-**Hand-written to OpenSky's documented shape** — not recorded from the live API. Two reasons:
-
-- CLAUDE.md forbids pasting raw API responses into context, and `scripts/record_fixture.rs`
-  (item 1.10), the tool that records and trims them without doing so, does not exist yet.
-- The awkward cases are the point, and they are hard to *catch* live: a response with a
-  non-array element mid-`states`, or an aircraft with every optional field null, arrives when
-  it arrives. Authoring them is the only way to have them.
+**Hand-written to OpenSky's documented shape** — not recorded from the live API. The awkward
+cases are the point, and they are hard to *catch* live: a response with a non-array element
+mid-`states`, or an aircraft with every optional field null, arrives when it arrives.
+Authoring them is the only way to have them.
 
 The cost of authoring is that these encode what we *believe* OpenSky sends, so a test passing
 against them proves the parser matches our belief, not reality. That gap is closed by
@@ -20,7 +17,22 @@ against them proves the parser matches our belief, not reality. That gap is clos
 fetches real aircraft and asserts the shape (notably that every one lands inside the
 requested bbox, which is what a lon/lat swap fails). Run it after any change here.
 
-Re-record these from the live API once item 1.10 lands.
+## Re-recording
+
+The recorder from item 1.10 can refresh a fixture's *shape* against the live API (it needs
+credentials — see the module docs):
+
+```text
+cargo run -p look-above-ingest --bin record-fixture -- opensky 46 7 48 9 states_nominal
+```
+
+That fetches, trims to ≤ 20 records, credential-scrubs, and overwrites the file without ever
+printing the payload. But it is not a drop-in: `states_nominal.json` is crafted so the parser
+tests assert *exact* values (`DLH9LF` at Frankfurt, the JFK ground record, the anonymous one),
+and live data will not match those — a re-record means updating the paired assertions too. The
+`empty` / `nulls` / `malformed` cases stay hand-authored; the recorder captures the nominal
+sky, not those. Use it to confirm the live shape still parses and to reset a fixture after a
+documented source change, not as a routine refresh.
 
 ## Privacy
 

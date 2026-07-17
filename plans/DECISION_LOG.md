@@ -936,3 +936,56 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `stale_count`, and `evict_stale` against explicit horizons, the `STALE ≤ DROP` invariant as a
   `const` assertion, and the stats-total accounting. 304 tests (71 core, 180 ingest, 43 app, 5
   render), 5 live ignored; fmt/clippy/test green. Next: **1.10**, `scripts/record_fixture.rs`.
+
+## 2026-07-17 — M1 item 1.10 (`scripts/record_fixture.rs`: the fixture recorder)
+
+- **The tool the hand-written fixtures have stood in for since 1.4.** docs/06 sanctions exactly
+  two live fetches during development — running the app, and this recorder — and every fixture
+  README promised "re-record once item 1.10 lands". It fetches from an authorized source, trims
+  the record array to ≤ 20, credential-scrubs (privacy 7.2), and writes to
+  `crates/ingest/tests/fixtures/<source>/<name>.json`, **printing only a count and a path,
+  never the payload** (docs/06 network rule).
+- **A bin of the `ingest` crate, sourced from repo-root `scripts/`.** The docs name
+  `scripts/record_fixture.rs`, so the file lives there and is wired as `[[bin]]` with
+  `path = "../../scripts/record_fixture.rs"` (Cargo accepts the out-of-package path cleanly —
+  probed before building on it). It is a bin of `ingest`, not a standalone crate, because a
+  recording must go out *exactly as a poll would*: it reuses the allowlist-enforcing
+  `HttpClient`, the OpenSky `OAuth2` client, `STATES_ENDPOINT`, the two `POINT_ENDPOINT`s, and
+  `point::MAX_RADIUS_NM` rather than reconstructing any of them. It is never built unless asked
+  for by name, so it costs nothing on a normal `cargo build -p look-above-ingest`.
+- **Region parameters are each source's own native shape, not a bbox everywhere.** OpenSky takes
+  its `lamin/lomin/lamax/lomax` bbox; the readsb feeds take `/point/{lat}/{lon}/{radius_nm}`
+  directly. This is what let the recorder avoid a *third* copy of `point`'s covering-circle
+  geometry — the recorded *response shape* is identical however the region was specified, and
+  the recorder is a tool, not a production request path, so the honest move was to speak each
+  endpoint's own language rather than duplicate 30 lines of sphere math the rule-of-two ethos
+  already consolidated (item 1.6).
+- **Credentials: env-only, and that is forced by layering, not laziness.** OpenSky recording
+  reads `LOOK_ABOVE_OPENSKY_CLIENT_ID` / `_SECRET` — the highest-precedence rung of privacy 7.1.
+  It cannot read `config.toml`/`credentials.json` because that loader lives in `app`, and
+  `ingest` depending on `app` would invert the crate direction. A manual tool run by the account
+  owner can set two env vars.
+- **Trim before scrub; the scrub is a tripwire, not a cleaner.** Trimming first keeps the scrub
+  off discarded records. The scrub recursively drops a denylist of credential/account-shaped
+  keys (case-insensitively) — and on today's authorized responses it removes *nothing*, because
+  the readsb feeds are anonymous and `/states/all` is public aircraft data. It exists so the
+  tool stays safe the day a source echoes an account field, precisely because docs/06 forbids
+  reading the payload to check by eye.
+- **Not a drop-in re-record.** The crafted `*_nominal.json` fixtures pin *exact* values the
+  parser tests assert (e.g. 36,000 ft → 10,972.8 m, the lon-before-lat Frankfurt record), which
+  live data will not reproduce, and the `empty`/`nulls`/`malformed` cases capture shapes that
+  arrive only when they arrive. So the recorder refreshes a fixture's *shape* and resets one
+  after a documented source change; it is not a routine overwrite. The three fixture READMEs and
+  the root README now say so and carry the command.
+- **Errors are `Box<dyn Error>`, not `anyhow`.** CLAUDE.md reserves `anyhow` for the `app`
+  binary, and adding it to `ingest` for a script would pull a dep into the wrong crate; the std
+  boxed error takes `?` from `SourceError`/`io`/`serde_json` and `.into()` from a `&str`/`String`
+  usage message with no new dependency.
+- **Verification.** 9 offline unit tests (trim to the ceiling / leave a short list / a null array
+  is zero records; scrub at every depth, case-insensitively, leaving public fields untouched, and
+  a no-op on an ordinary body; source→dir/key mapping; an unsafe fixture name refused before any
+  write; output-name index tracking region arity; bbox parse order). Then the **live path itself
+  was exercised**, since a recording tool is only proven by recording: `adsblol 47 8 73` fetched
+  16 real aircraft over Switzerland, wrote a valid trimmed `{ac, now, …}` file, printed only the
+  count — checked structurally (never by printing values) and deleted. 313 tests total (the 9 in
+  the new bin target), fmt/clippy/test green. Next: **1.11**, `store` migrations + writer thread.

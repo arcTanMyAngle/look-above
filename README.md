@@ -141,15 +141,21 @@ vocabulary and both trait seams can be unit-tested without a socket or a GPU.
 
 ## Where it stands
 
-Honest answer: the foundation is poured, nothing flies yet.
+Honest answer: aircraft data flows and is deduplicated, but nothing is drawn yet.
 
-- **Done** — cargo workspace, pinned dependencies, the `core` vocabulary
-  (`StateVector`, `Icao24`, `CallSign`, `BBox`), the `LiveSource` / `Store` trait
-  seams, and the geo math: haversine distance, initial bearing, destination point,
-  Web Mercator forward and inverse. 51 unit tests.
-- **Next** — config loading, then a window, then CI. That closes M0.
-- **Not yet** — no API client, no database, no pixels. First live aircraft is M1;
-  first frame is M2.
+- **Done — M0 (foundation):** the cargo workspace, pinned dependencies, the `core`
+  vocabulary (`StateVector`, `Icao24`, `CallSign`, `BBox`), the `LiveSource` / `Store`
+  trait seams, the geo math (haversine, initial bearing, destination point, Web
+  Mercator forward and inverse), config loading, a native window, and CI.
+- **Done — M1 so far (live ingestion):** a shared HTTP client that enforces the host
+  allowlist, OpenSky OAuth2, and three live position sources normalized into one
+  `StateVector` stream — OpenSky `/states/all` (credit-metered) plus the keyless readsb
+  feeds airplanes.live and adsb.lol, all three verified against the real sky. On top of
+  them: a daily credit budget with a cadence controller, a failover poller, cross-source
+  dedup with sticky anonymity, and the fixture recorder below. 313 tests, all offline.
+- **Next — the rest of M1:** SQLite persistence, a headless mode that logs per-cycle
+  counts, then the milestone's supervised live run.
+- **Not yet** — no pixels. First frame is M2.
 
 The truthful status always lives in [plans/CURRENT_STATUS.md](plans/CURRENT_STATUS.md),
 and every non-obvious decision, with its reasoning, is in
@@ -161,13 +167,21 @@ believe those.
 ## Running it
 
 ```sh
-cargo test --workspace     # this works today
-cargo run -p look-above    # opens a window from M0 item 0.6 onward
+cargo test --workspace     # all offline; the default
+cargo run -p look-above    # opens the window
+
+# Re-record a source's nominal test fixture from the live API — the only sanctioned
+# live fetch besides running the app. Keyless for the community feeds; writes the
+# trimmed, credential-scrubbed reply to crates/ingest/tests/fixtures/ and prints only
+# a count, never the payload.
+cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 point_nominal
 ```
 
 Rust stable 1.96, pinned in `rust-toolchain.toml`. SQLite is compiled in; there's
-nothing to install. Credentials, when there are any, go in `config.toml`, which is
-gitignored and never committed.
+nothing to install. OpenSky is the one source that needs an account: its client id and
+secret come from the `LOOK_ABOVE_OPENSKY_*` environment variables, a gitignored
+`config.toml`, or the gitignored `credentials.json` OpenSky issues — never committed.
+The community feeds need no key.
 
 ---
 

@@ -10,15 +10,29 @@ that service alone (docs/09, item 1.6).
 ## Provenance
 
 **Hand-written to readsb's documented shape** — not recorded from the live API, for the same
-reasons as `../airplaneslive/README.md` and `../opensky/README.md`: the recording script
-(item 1.10) does not exist yet, and the awkward cases are the point.
+reason as `../airplaneslive/README.md` and `../opensky/README.md`: the awkward cases are the
+point.
 
 These encode what we *believe* adsb.lol sends. The beliefs at risk — that `now` is
 **milliseconds**, that `alt_baro`/`gs`/`baro_rate` are **feet/knots/ft-per-min**, and the
 field names themselves — are asserted against the real service by
 `live_adsb_lol_point_matches_the_documented_shape` in `adsb_lol.rs` (`#[ignore]`d; keyless
-and free, but run it once, not in a loop). Run it after any change here. Re-record these once
-item 1.10 lands.
+and free, but run it once, not in a loop). Run it after any change here.
+
+## Re-recording
+
+The recorder from item 1.10 refreshes a fixture's *shape* from the live API (keyless, free):
+
+```text
+cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 point_nominal
+```
+
+Same caveat as the other sources: it fetches, trims to ≤ 20 records, scrubs, and overwrites
+without printing the payload, but `point_nominal.json` is crafted so the parser tests assert
+*exact* values, which live data will not match — a re-record means updating those assertions,
+and the `empty` / `nulls` / `malformed` cases stay hand-authored. Its identities are kept
+deliberately distinct from airplanes.live's; a fresh recording will not preserve that, so
+prefer editing over re-recording unless the source's shape actually changed.
 
 ## Privacy
 

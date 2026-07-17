@@ -5,13 +5,22 @@
 
 ## Now (updated 2026-07-17)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.9
-  done; 304 tests green (5 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.10
+  done; 313 tests green (5 live tests `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.10** — `scripts/record_fixture.rs`: fetch → trim to ≤ 20 records
-  → scrub credentials → write to `tests/fixtures/`; never prints payloads (docs/06 network
-  rule). This is the recorder the hand-written fixtures (1.4–1.6) have been standing in for; its
-  README notes already promise a re-record path through it.
+- **Next action:** **M1 item 1.11** — `store`: migrations 0001 (aircraft, source_status) +
+  writer-thread skeleton; the poller updates `source_status` (last_success/error,
+  credits_used_today). This is the first `store` crate code and what rehydrates 1.7's
+  `CreditLedger` via `CreditLedger::restored`; watch the single-writer-thread seam (docs/08).
+- **1.10 recorder landed:** `scripts/record_fixture.rs` — a `[[bin]]` of `ingest` (out-of-package
+  `path`), the one sanctioned live fetch besides the app. Fetches through the real
+  `HttpClient`/OpenSky auth/endpoint constants (a recording goes out exactly as a poll would),
+  trims the record array to ≤ 20, scrubs credential-shaped keys (a tripwire; today's anonymous
+  feeds carry none), writes pretty JSON to `crates/ingest/tests/fixtures/<source>/`, and prints
+  only a count + path — never the payload (docs/06). OpenSky creds env-only (layering forbids
+  reaching `app`'s loader). **Not a drop-in re-record** — the crafted `*_nominal` fixtures pin
+  exact asserted values and the edge cases stay hand-authored; it refreshes *shape*. Live path
+  exercised (adsb.lol → 16 aircraft, deleted). READMEs updated. DECISION_LOG 1.10.
 - **1.9 merge landed:** `core::merge` — `SessionTable` (one `StateVector` per `Icao24`,
   freshest seen) + `MergeStats { new, updated, dropped }`. Dedup is strictly newest-`ts`-wins
   (equal-`ts` duplicate and out-of-order both drop). **Sticky anonymity is a one-way latch
@@ -54,7 +63,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.9 done | — |
+| M1 | in progress — 1.1–1.10 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -73,6 +82,30 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-17** — M1 item 1.10: the fixture recorder. New `scripts/record_fixture.rs`, wired
+  as a `[[bin]]` of `ingest` from the repo-root `scripts/` the docs name (out-of-package
+  `path`, which Cargo accepts — probed first). It is the recorder docs/06 sanctions and the
+  fixture READMEs have promised since 1.4: fetch from an authorized source → trim the record
+  array to ≤ 20 → credential-scrub → write to `crates/ingest/tests/fixtures/<source>/`, printing
+  only a count and path, **never the payload**. A bin of `ingest` (not a standalone crate)
+  because a recording must go out exactly as a poll would — it reuses the allowlist-enforcing
+  `HttpClient`, the OpenSky `OAuth2` client, `STATES_ENDPOINT`/the two `POINT_ENDPOINT`s, and
+  `point::MAX_RADIUS_NM`. CLI speaks each source's native region shape (OpenSky bbox / readsb
+  point+radius), which is what let it avoid a *third* copy of `point`'s covering-circle math —
+  the recorded response *shape* is identical either way. OpenSky creds are env-only
+  (`LOOK_ABOVE_OPENSKY_*`): reaching `app`'s `config.toml`/`credentials.json` loader would invert
+  the crate direction. Scrub is a tripwire (denylist of account-shaped keys) that removes nothing
+  from today's anonymous feeds but keeps the tool safe without reading the payload. **Not a
+  drop-in re-record**: the crafted `*_nominal` fixtures pin exact values the parser tests assert,
+  and `empty`/`nulls`/`malformed` stay hand-authored — the tool refreshes shape and resets after
+  a documented source change. `Box<dyn Error>`, not `anyhow` (that stays in `app`). 9 offline
+  unit tests (trim/scrub/naming/parse-order), and the **live path exercised** — `adsblol 47 8 73`
+  fetched 16 real aircraft over Switzerland, wrote a valid trimmed `{ac, now, …}` file, printed
+  only the count; checked structurally (never printing values) and deleted. 313 tests (the 9 in
+  the new bin), fmt/clippy/test green. Root README's stale "51 tests / no API client" section and
+  all three fixture READMEs updated. DECISION_LOG 1.10. Next: **1.11**, `store` migrations +
+  writer thread.
 
 - **2026-07-17** — M1 item 1.9: the cross-source merge. New `core::merge`: `SessionTable` (the
   session's deduplicated live picture — one `StateVector` per `Icao24`, the freshest seen) and
