@@ -26,8 +26,10 @@ credentials — see the module docs):
 cargo run -p look-above-ingest --bin record-fixture -- opensky 46 7 48 9 states_nominal
 ```
 
-That fetches, trims to ≤ 20 records, credential-scrubs, and overwrites the file without ever
-printing the payload. But it is not a drop-in: `states_nominal.json` is crafted so the parser
+That fetches, trims to ≤ 20 records, credential-scrubs, and **overwrites `states_nominal.json`
+in place** without ever printing the payload — if you only meant to inspect the live shape,
+record to a scratch name instead, or `git checkout` this file to restore it. It is not a
+drop-in: `states_nominal.json` is crafted so the parser
 tests assert *exact* values (`DLH9LF` at Frankfurt, the JFK ground record, the anonymous one),
 and live data will not match those — a re-record means updating the paired assertions too. The
 `empty` / `nulls` / `malformed` cases stay hand-authored; the recorder captures the nominal

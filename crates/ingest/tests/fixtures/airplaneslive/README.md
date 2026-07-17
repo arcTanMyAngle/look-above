@@ -25,8 +25,9 @@ The recorder from item 1.10 refreshes a fixture's *shape* from the live API (key
 cargo run -p look-above-ingest --bin record-fixture -- airplaneslive 47 8 73 point_nominal
 ```
 
-It fetches, trims to ≤ 20 records, scrubs, and overwrites the file without printing the
-payload. It is not a drop-in: `point_nominal.json` is crafted so the parser tests assert
+It fetches, trims to ≤ 20 records, scrubs, and **overwrites `point_nominal.json` in place**
+without printing the payload — to inspect the live shape without clobbering it, record to a
+scratch name, or `git checkout` this file to restore it. It is not a drop-in: `point_nominal.json` is crafted so the parser tests assert
 *exact* converted values (36,000 ft → 10,972.8 m, and the `~`-hex synthetic that must be
 dropped), which live data will not match — a re-record means updating those assertions too.
 The `empty` / `nulls` / `malformed` cases stay hand-authored. Use the recorder to confirm the

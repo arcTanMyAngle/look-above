@@ -27,8 +27,9 @@ The recorder from item 1.10 refreshes a fixture's *shape* from the live API (key
 cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 point_nominal
 ```
 
-Same caveat as the other sources: it fetches, trims to ≤ 20 records, scrubs, and overwrites
-without printing the payload, but `point_nominal.json` is crafted so the parser tests assert
+Same caveat as the other sources: it fetches, trims to ≤ 20 records, scrubs, and **overwrites
+`point_nominal.json` in place** without printing the payload (record to a scratch name to
+inspect the shape, or `git checkout` to restore) — and `point_nominal.json` is crafted so the parser tests assert
 *exact* values, which live data will not match — a re-record means updating those assertions,
 and the `empty` / `nulls` / `malformed` cases stay hand-authored. Its identities are kept
 deliberately distinct from airplanes.live's; a fresh recording will not preserve that, so

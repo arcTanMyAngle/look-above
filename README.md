@@ -170,11 +170,14 @@ believe those.
 cargo test --workspace     # all offline; the default
 cargo run -p look-above    # opens the window
 
-# Re-record a source's nominal test fixture from the live API — the only sanctioned
-# live fetch besides running the app. Keyless for the community feeds; writes the
-# trimmed, credential-scrubbed reply to crates/ingest/tests/fixtures/ and prints only
-# a count, never the payload.
-cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 point_nominal
+# Record a fixture from the live API — the only sanctioned live fetch besides running
+# the app. Keyless for the community feeds; writes the trimmed, credential-scrubbed
+# reply to crates/ingest/tests/fixtures/<source>/<name>.json and prints only a count,
+# never the payload. The LAST argument is the output file name: use a scratch name to
+# inspect a source's shape. Passing an existing fixture name (e.g. point_nominal)
+# OVERWRITES that committed fixture with live data and will break its exact-value tests
+# — only do that deliberately, per the fixture READMEs; `git checkout` restores it.
+cargo run -p look-above-ingest --bin record-fixture -- adsblol 47 8 73 sample
 ```
 
 `cargo run -p look-above` opens a native window, so it needs a graphical desktop
