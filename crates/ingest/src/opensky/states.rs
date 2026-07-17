@@ -40,9 +40,8 @@ pub const STATES_ENDPOINT: &str = "https://opensky-network.org/api/states/all";
 ///
 /// The whole reason this module has named constants: `record[5]` and `record[6]` are lon and
 /// lat *in that order*, and no compiler will ever notice them swapped. Indices past
-/// `VERTICAL_RATE` (sensors, geo_altitude, squawk, spi, position_source, category) are not
-/// listed because nothing downstream consumes them yet — see the module docs on
-/// `geo_altitude` in particular.
+/// `VERTICAL_RATE` (`sensors`, `geo_altitude`, `squawk`, `spi`, `position_source`,
+/// `category`) are not listed because nothing downstream consumes them yet.
 mod field {
     pub const ICAO24: usize = 0;
     pub const CALLSIGN: usize = 1;
@@ -271,7 +270,7 @@ fn state_vector(record: &Value) -> Option<StateVector> {
 /// float belongs is a source bug, and treating one bad optional field as a missing optional
 /// field keeps the aircraft on screen. It does not weaken the required fields — those use
 /// `?`, so absent still drops the record.
-fn field<'a>(record: &'a [Value], index: usize) -> Option<&'a Value> {
+fn field(record: &[Value], index: usize) -> Option<&Value> {
     record.get(index).filter(|value| !value.is_null())
 }
 
@@ -406,7 +405,9 @@ mod tests {
     async fn mock_states(server: &MockServer, body: &str) {
         Mock::given(method("GET"))
             .and(path("/api/states/all"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(body.to_owned(), "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.to_owned(), "application/json"),
+            )
             .mount(server)
             .await;
     }
@@ -596,8 +597,20 @@ mod tests {
     /// Names each way the fixture above is broken, so a regression says which one.
     #[test]
     fn every_kind_of_unusable_record_is_rejected() {
-        let good = json!(["3c6444", "DLH9LF  ", "Germany", 1_721_000_000, 1_721_000_000,
-                          8.5624, 50.0379, 10972.8, false, 231.45, 87.3, 0.0]);
+        let good = json!([
+            "3c6444",
+            "DLH9LF  ",
+            "Germany",
+            1_721_000_000,
+            1_721_000_000,
+            8.5624,
+            50.0379,
+            10972.8,
+            false,
+            231.45,
+            87.3,
+            0.0
+        ]);
         assert!(state_vector(&good).is_some(), "the control must parse");
 
         let cases = [
@@ -605,27 +618,74 @@ mod tests {
             (json!([]), "an empty record"),
             (json!(null), "a null record"),
             (
-                json!(["zzzzzz", "BAD1", "Nowhere", 1_721_000_000, 1_721_000_000, 8.0, 50.0]),
+                json!([
+                    "zzzzzz",
+                    "BAD1",
+                    "Nowhere",
+                    1_721_000_000,
+                    1_721_000_000,
+                    8.0,
+                    50.0
+                ]),
                 "a non-hex address",
             ),
             (
-                json!(["3c6444", "X", "Germany", 1_721_000_000, 1_721_000_000, null, 50.0379]),
+                json!([
+                    "3c6444",
+                    "X",
+                    "Germany",
+                    1_721_000_000,
+                    1_721_000_000,
+                    null,
+                    50.0379
+                ]),
                 "no longitude",
             ),
             (
-                json!(["3c6444", "X", "Germany", 1_721_000_000, 1_721_000_000, 8.5624, null]),
+                json!([
+                    "3c6444",
+                    "X",
+                    "Germany",
+                    1_721_000_000,
+                    1_721_000_000,
+                    8.5624,
+                    null
+                ]),
                 "no latitude",
             ),
             (
-                json!(["3c6444", "X", "Germany", null, 1_721_000_000, 8.5624, 50.0379]),
+                json!([
+                    "3c6444",
+                    "X",
+                    "Germany",
+                    null,
+                    1_721_000_000,
+                    8.5624,
+                    50.0379
+                ]),
                 "no time_position — the position has no time of applicability",
             ),
             (
-                json!(["3c6444", "X", "Germany", 1_721_000_000, 1_721_000_000, 500.0, 91.0]),
+                json!([
+                    "3c6444",
+                    "X",
+                    "Germany",
+                    1_721_000_000,
+                    1_721_000_000,
+                    500.0,
+                    91.0
+                ]),
                 "coordinates outside the globe",
             ),
             (
-                json!(["3c6444", "X", "Germany", 1_721_000_000, 1_721_000_000, 8.5624]),
+                json!([
+                    "3c6444",
+                    "X",
+                    "Germany",
+                    1_721_000_000,
+                    1_721_000_000,
+                    8.5624
+                ]),
                 "a record that stops before the latitude",
             ),
         ];
@@ -659,8 +719,19 @@ mod tests {
     /// tolerance rule is "wrong type on an optional field reads as absent".
     #[test]
     fn a_wrongly_typed_optional_field_reads_as_absent() {
-        let record = json!(["3c6444", 42, "Germany", 1_721_000_000, 1_721_000_000,
-                            8.5624, 50.0379, "high", false, "fast", 87.3]);
+        let record = json!([
+            "3c6444",
+            42,
+            "Germany",
+            1_721_000_000,
+            1_721_000_000,
+            8.5624,
+            50.0379,
+            "high",
+            false,
+            "fast",
+            87.3
+        ]);
         let state = state_vector(&record).expect("the required fields are all good");
         assert_eq!(state.callsign, None, "a numeric callsign is no callsign");
         assert!(state.anonymous);
@@ -723,7 +794,10 @@ mod tests {
     #[test]
     fn a_degenerate_bbox_is_still_priced() {
         // A zero-area box is a legal BBox (min == max). It must price, not divide by zero.
-        assert_eq!(credit_cost(&RegionQuery::region(bbox(50.0, 8.0, 50.0, 8.0))), 1);
+        assert_eq!(
+            credit_cost(&RegionQuery::region(bbox(50.0, 8.0, 50.0, 8.0))),
+            1
+        );
     }
 
     #[test]
@@ -896,7 +970,7 @@ mod tests {
 
     /// docs/10 §2 asks for a 429 case. The status mapping itself belongs to `http` and is
     /// tested there; what matters here is that it survives the adapter intact, including
-    /// OpenSky's own non-standard retry header.
+    /// `OpenSky`'s own non-standard retry header.
     #[tokio::test]
     async fn a_rate_limited_fetch_surfaces_opensky_s_retry_hint() {
         let server = MockServer::start().await;
@@ -909,7 +983,10 @@ mod tests {
             .await;
 
         let source = source_against(&server).await;
-        let error = source.fetch(&a_region()).await.expect_err("429 is an error");
+        let error = source
+            .fetch(&a_region())
+            .await
+            .expect_err("429 is an error");
         assert_eq!(
             error,
             SourceError::RateLimited {
@@ -930,7 +1007,10 @@ mod tests {
             .await;
 
         let source = source_against(&server).await;
-        let error = source.fetch(&a_region()).await.expect_err("503 is an error");
+        let error = source
+            .fetch(&a_region())
+            .await
+            .expect_err("503 is an error");
         assert_eq!(error, SourceError::Server { status: 503 });
         assert!(error.is_transient());
     }
@@ -961,7 +1041,10 @@ mod tests {
             .await;
 
         let source = source_against(&server).await;
-        let error = source.fetch(&a_region()).await.expect_err("401 is an error");
+        let error = source
+            .fetch(&a_region())
+            .await
+            .expect_err("401 is an error");
         assert!(matches!(error, SourceError::Auth { .. }), "{error:?}");
         assert!(!error.is_transient());
     }
@@ -970,7 +1053,10 @@ mod tests {
 
     #[test]
     fn the_states_endpoint_is_the_documented_one_and_is_authorized() {
-        assert_eq!(STATES_ENDPOINT, "https://opensky-network.org/api/states/all");
+        assert_eq!(
+            STATES_ENDPOINT,
+            "https://opensky-network.org/api/states/all"
+        );
         let host = reqwest::Url::parse(STATES_ENDPOINT)
             .expect("the endpoint parses")
             .host_str()
@@ -990,7 +1076,10 @@ mod tests {
         let server = MockServer::start().await;
         let auth = auth_against(&server).await;
         assert!(
-            auth.token().await.expect("the token fetch succeeds").is_some(),
+            auth.token()
+                .await
+                .expect("the token fetch succeeds")
+                .is_some(),
             "the refusal below must be about the states host, not about auth"
         );
 
@@ -1014,8 +1103,8 @@ mod tests {
 
     /// The one test here that fetches real aircraft, and the reason the rest can be trusted.
     ///
-    /// Every fixture in this module is **hand-written from OpenSky's documentation**, so the
-    /// mocks above prove only that we parse what we *believe* OpenSky sends. The belief is the
+    /// Every fixture in this module is **hand-written from `OpenSky`'s documentation**, so the
+    /// mocks above prove only that we parse what we *believe* `OpenSky` sends. The belief is the
     /// risky part: field order in a positional array is invisible to the compiler, and lon/lat
     /// being backwards from every other source is exactly the kind of thing docs get wrong.
     /// This asserts the shape against the live endpoint.
@@ -1059,7 +1148,11 @@ mod tests {
         // in the 1-credit tier.
         let region = bbox(46.0, 7.0, 48.0, 9.0);
         let query = RegionQuery::region(region);
-        assert_eq!(credit_cost(&query), 1, "this test must stay in the cheap tier");
+        assert_eq!(
+            credit_cost(&query),
+            1,
+            "this test must stay in the cheap tier"
+        );
 
         let states = source.fetch(&query).await.expect("OpenSky answers");
         assert!(

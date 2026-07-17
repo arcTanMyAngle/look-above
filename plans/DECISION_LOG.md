@@ -612,3 +612,78 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `flightradar24.com` host planted in `TOKEN_ENDPOINT` failed the scan test with file, host and
   remedy named, then reverted. 161 tests (56 core, 57 ingest, 43 app, 5 render); fmt/clippy/test
   green.
+
+## 2026-07-15 — M1 item 1.4 (OpenSky `/states/all` adapter)
+
+- **`ingest::opensky::states`: `OpenSkySource` (implements `LiveSource`), positional-array
+  parsing, and `credit_cost`.** Split from `auth` because the two fail differently: a token
+  endpoint blip is survivable inside the refresh slack, a bad bbox is not.
+- **Field indices are named constants (`mod field`), not literals.** OpenSky sends **lon
+  before lat** — backwards from every other source here and from every map UI. A swap
+  compiles, parses, and puts aircraft in the wrong hemisphere. Nothing in the type system can
+  catch it, so it is pinned by a test asserting real geography (Frankfurt is at 50°N 8.6°E,
+  not 8.6°N 50°E) and, live, by asserting every returned aircraft falls inside the requested
+  bbox.
+- **Parsing is per-field tolerant, per-record fallible.** `states` elements are `Value`, not
+  `Vec<Value>` — typing them as arrays would make one non-array record fail the whole batch,
+  where docs/10 §2 requires skipping it. Four facts are required (`icao24`, `time_position`,
+  lon, lat) and a record missing any is dropped, because the pipeline treats those as given.
+  A *wrongly typed* optional field reads as absent (a string altitude is no altitude), which
+  keeps the aircraft on screen. Skips are counted: routine ones log at `debug`, but losing
+  **every** record logs a `warn` — that is what a changed field order looks like, and an empty
+  sky does not explain itself.
+- **`time_position` (index 3), not `last_contact` (index 4).** They differ when OpenSky has
+  heard the aircraft recently but not its position. Using the newer one would date a stale fix
+  to now, and M2's dead reckoning would then advance it from a place it had already left —
+  drawing a confidently wrong aircraft. No `time_position` means no position to report.
+- **Coordinates are range-checked on arrival.** `BBox` validates its own corners, but these
+  come off the wire: Web Mercator of latitude 91 is not an error, it is a plausible-looking
+  point in the wrong place, and NaN would propagate into the vertex buffer.
+- **`states: null` is an empty sky, not a parse error.** OpenSky sends `null`, not `[]`, for a
+  quiet region — this would otherwise fail on every quiet bbox.
+- **`on_ground` absent → airborne.** Documented non-null, so absence means drift; airborne is
+  the assumption that loses least (a glyph, versus the whole aircraft).
+- **A global query sends no bbox parameters.** The endpoint's default *is* the world; a ±180°
+  box is a different, 4-credit question with a worse answer. This is why `RegionQuery` keeps
+  global distinct from a whole-world box (docs/09).
+- **`credit_cost` is a free `pub fn`, not only a trait method** — 1.7's ledger needs the price
+  without holding a source, and the alternative has it construct an adapter to ask a question
+  about arithmetic. **Tier boundaries round to the dearer band**: OpenSky documents "0–25",
+  "25–100", "100–400", leaving each edge in two tiers. Guessing cheap is the direction that
+  hurts — the ledger would believe it holds credits it has already spent, and overrunning a
+  documented allowance is what privacy rule 1.3 forbids. Guessing dear costs a slightly wider
+  poll interval.
+- **A disabled source returns `Auth`, and deliberately does not fall back to anonymous
+  access.** OpenSky also serves unauthenticated callers at 400 credits/day; silently dropping
+  to that would turn a missing credential into a tenth of the budget with no clue why. `Auth`
+  is not transient, so the poller fails over to the keyless fallbacks (1.5–1.6) instead.
+- **Closed from 1.3: OpenSky's 429 header.** `http::retry_after` now reads a list —
+  `Retry-After` first, then **`X-Rate-Limit-Retry-After-Seconds`** — taking the first
+  *usable* hint, so an unparseable standard header cannot shadow a good vendor one. Naming a
+  vendor header in the shared client leaks one source into a place that serves all of them;
+  the alternative was threading a per-adapter header list through `send_json`, which is a lot
+  of machinery for a header no other authorized source sends and none can be harmed by us
+  looking for. Revisit if a second source needs its own spelling.
+- **Closed from 1.3: `reqwest`'s `query` feature enabled**, as predicted, for the bbox params.
+  `async-trait` added to `ingest` (implementing the dyn-compatible `LiveSource`);
+  `OpenSkyAuth::build` widened to `pub(crate)`, the precedent `HttpClient::build` set.
+- **⚠ Known gap, binds in M3: the anonymity flag catches only half of privacy rule 2.2.**
+  `anonymous` is set when a record carries no callsign — the "position with no identity" case.
+  A **PIA hex that does broadcast a callsign is not detected**: that needs the FAA's assigned
+  address ranges, which we do not have. Rule 2.1 notes our feeds already honor the programs,
+  and the enrichment gate (M3) is where this binds and where the range data must land.
+- **Fixtures are hand-written to the documented shape**, not recorded: `scripts/record_fixture.rs`
+  (item 1.10) does not exist yet, CLAUDE.md forbids pasting raw responses into context, and the
+  awkward cases (a non-array mid-`states`, every field null) arrive live when they arrive.
+  Provenance and the re-record-at-1.10 note are in `tests/fixtures/opensky/README.md`. No
+  credential material (privacy 7.2).
+- **Verification — the project's first live *data* request, and the reason the mocks can be
+  trusted.** Hand-written fixtures prove only that the parser matches our belief; the belief is
+  the risky part, and field order in a positional array is invisible to the compiler. An
+  `#[ignore]`d `live_opensky_states_match_the_documented_shape` was run against the real
+  endpoint: **72 aircraft over Switzerland, every one inside the requested bbox, 20 on the
+  ground, 1 credit spent**. Containment is the assertion that matters — swapped coordinates
+  would put these near (8°N, 47°E), in Somalia, and every one would have failed. It also
+  asserts *someone* has a callsign and *someone* a velocity, since reading the wrong indices
+  would otherwise report every optional field absent and pass. `#[ignore]`d so CI never spends
+  a credit. 196 tests (56 core, 92 ingest, 43 app, 5 render); fmt/clippy/test green.

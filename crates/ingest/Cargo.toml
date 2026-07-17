@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 look-above-core.workspace = true
 
+# `LiveSource` is dyn-compatible via async-trait (docs/09); implementing it needs the macro.
+async-trait.workspace = true
 crossbeam-channel.workspace = true
 fastrand.workspace = true
 reqwest.workspace = true

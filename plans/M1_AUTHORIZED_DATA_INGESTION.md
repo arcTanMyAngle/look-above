@@ -45,12 +45,30 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       without a second copy of privacy rule 7.1. `HttpClient::post_form` added — the allowlist
       choke point covered GET only, and the grant is a POST carrying the secret. Rationale in
       DECISION_LOG.)*
-- [ ] 1.4 OpenSky adapter: `/states/all` bbox query → `Vec<StateVector>`; positional-array
+- [x] 1.4 OpenSky adapter: `/states/all` bbox query → `Vec<StateVector>`; positional-array
       parsing tolerant of nulls per field; credit cost function (bbox area → 1–4);
       fixture set per docs/10 §2.
-      **Two things 1.3 found:** OpenSky's 429 carries `X-Rate-Limit-Retry-After-Seconds`, not
-      the standard `Retry-After` that `http::retry_after` reads — the backoff floor misses it
-      today. And `reqwest`'s `query` feature is off; the bbox params need it enabled.
+      *(2026-07-15: done — `ingest::opensky::states`: `OpenSkySource` (implements
+      `LiveSource`), positional-array parsing, `credit_cost`. 35 new tests, 196 total; four
+      fixtures per docs/10 §2 (nominal, empty, nulls, malformed) — hand-written to the
+      documented shape, since 1.10's recorder does not exist yet (provenance +
+      re-record note in `tests/fixtures/opensky/README.md`). **The project's first live data
+      request**: an `#[ignore]`d test fetched **72 real aircraft over Switzerland, every one
+      inside the requested bbox, 1 credit spent** — containment is what proves OpenSky's
+      **lon-before-lat** order, which no compiler can catch and which swapped would have put
+      them in Somalia. Field indices are named constants for the same reason. Parsing is
+      per-field tolerant, per-record fallible: `states` elements stay `Value` so one bad
+      record cannot fail the batch; losing *every* record warns, since that is what a shape
+      change looks like. `time_position`, not `last_contact` — the newer one would date a
+      stale fix to now and M2's dead reckoning would advance it from a place it had left.
+      Credit tiers round to the **dearer** band (under-pricing overruns the allowance rule 1.3
+      caps; over-pricing costs a wider poll interval). A disabled source returns `Auth` rather
+      than silently dropping to OpenSky's 400-credit anonymous tier. **Both 1.3 carry-overs
+      closed**: `retry_after` now reads `X-Rate-Limit-Retry-After-Seconds` after the standard
+      header (first *usable* hint wins), and `reqwest`'s `query` feature is on. **⚠ Known gap
+      for M3**: `anonymous` catches only the no-callsign half of privacy 2.2 — a PIA hex that
+      broadcasts a callsign needs FAA range data we do not have; the enrichment gate is where
+      it binds. Rationale in DECISION_LOG.)*
 - [ ] 1.5 airplanes.live adapter: `/v2/point` query, readsb-JSON parsing (shared module),
       `"ground"` altitude handling, ≥ 2 s request spacing; fixtures.
 - [ ] 1.6 adsb.lol adapter reusing the readsb parsing module; fixtures.

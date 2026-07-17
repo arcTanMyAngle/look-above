@@ -5,16 +5,13 @@
 
 ## Now (updated 2026-07-15)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.3
-  done; 161 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.4** — OpenSky `/states/all` bbox adapter. Auth is live, so
-  nothing blocks it. Two findings from 1.3 land in its lap: OpenSky's 429 uses
-  **`X-Rate-Limit-Retry-After-Seconds`**, not the standard `Retry-After` that 1.1 parses, so
-  the backoff floor misses their hint today; and `reqwest`'s **`query` feature is off** and the
-  bbox params need it.
-- **The OpenSky account is no longer a blocker** — the owner supplied `credentials.json`; it is
-  gitignored and read as-issued. **Live-verified**: the token endpoint accepted it (TTL 1798 s).
-  [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 is closed.
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.4
+  done; 196 tests green. Plan: [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
+- **Next action:** **M1 item 1.5** — the airplanes.live adapter (`/v2/point`, readsb JSON in a
+  shared module 1.6 reuses, `"ground"` altitude string, ≥ 2 s spacing). No key needed, so
+  nothing blocks it. Both of 1.3's carry-overs are closed in 1.4; nothing is handed to 1.5.
+- **OpenSky is now proven end to end** — auth (1.3) and live data (1.4). `credentials.json` is
+  gitignored and read as-issued. [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 stays closed.
 - **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
   `look-above` and then push, in that order** — the existing repo has an underscore; the
   hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
@@ -22,16 +19,18 @@
   M0's one unmet line.
 - **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step"), and
   M1 now runs ahead of it — a failure there will surface mid-M1.
-- **The first live API call has now been made** (1.3, token endpoint — no credits, they meter
-  `/states/*`). It is an `#[ignore]`d test, so CI never repeats it. Every *automatic* ingest
-  test is still a local mock; the first live **data** request is item 1.4.
+- **Credit spend to date: 1 of 4,000/day** (1.4's live test). Both live tests are `#[ignore]`d,
+  so CI never repeats them and never spends. Every *automatic* ingest test is a local mock.
+- **⚠ Carried to M3 (enrichment gate):** `anonymous` currently catches only the no-callsign
+  half of privacy rule 2.2. A PIA hex that broadcasts a callsign is not detected — that needs
+  FAA assigned-range data we do not have. Recorded in DECISION_LOG 1.4.
 
 ## Gate record
 
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1, 1.2, 1.3 done | — |
+| M1 | in progress — 1.1–1.4 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -50,6 +49,35 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-15** — M1 item 1.4: the OpenSky `/states/all` adapter. `ingest::opensky::states` —
+  `OpenSkySource` (implements `LiveSource`), positional-array parsing, `credit_cost`. 35 new
+  tests, 196 total; fmt/clippy/test green. **The project made its first live *data* request,
+  and it is the headline**: every fixture here is hand-written to OpenSky's documented shape,
+  so the mocks prove only that we parse what we *believe* they send — and the belief is the
+  risky part, because **OpenSky sends lon before lat**, backwards from every other source and
+  invisible to the compiler. An `#[ignore]`d live test fetched **72 real aircraft over
+  Switzerland and asserted every one falls inside the requested bbox** (swapped, they would be
+  near 8°N 47°E — Somalia — and every one would have failed). 20 on the ground, **1 credit of
+  4,000** spent, `#[ignore]`d so CI never repeats it. It also asserts *someone* has a callsign
+  and *someone* a velocity: reading the wrong indices would otherwise call every optional field
+  absent and pass. Field indices are named constants for the same reason. Parsing is per-field
+  tolerant, per-record fallible — `states` elements stay `Value` so one non-array record cannot
+  fail the batch (docs/10 §2), and losing *every* record logs a **warn**, since that is exactly
+  what a shape change looks like and an empty sky does not explain itself. Four judgement calls
+  worth knowing, all in DECISION_LOG: **`time_position`, not `last_contact`** (the newer one
+  dates a stale fix to now, and M2's dead reckoning would then advance an aircraft from a place
+  it had already left); **credit tiers round to the dearer band** (under-pricing overruns the
+  allowance rule 1.3 caps, over-pricing only widens the poll interval); **a disabled source
+  returns `Auth`** rather than silently dropping to OpenSky's 400-credit anonymous tier, which
+  would turn a missing credential into a tenth of the budget with no clue why; and **a global
+  query sends no bbox params**, since the endpoint's default *is* the world. **Both of 1.3's
+  carry-overs are closed**: `retry_after` now reads a list — standard header, then
+  `X-Rate-Limit-Retry-After-Seconds` — taking the first *usable* hint so a bad standard header
+  cannot shadow a good vendor one; and `reqwest`'s `query` feature is on. **One gap found and
+  carried to M3**: `anonymous` catches only the no-callsign half of privacy 2.2 — a PIA hex
+  broadcasting a callsign needs FAA range data we do not have, and the enrichment gate is where
+  it binds. Next: **1.5**, the airplanes.live adapter.
 
 - **2026-07-15** — M1 item 1.3: OpenSky OAuth2. `ingest::opensky::auth` — `OpenSkyAuth`
   (token fetch, cache, refresh at 80% TTL, `Ok(None)` when disabled), `Credentials`, an

@@ -363,6 +363,57 @@ mod tests {
         );
     }
 
+    /// `OpenSky`'s 429 carries only their own spelling of the hint — reading the standard
+    /// header alone would throw away the one number the source actually told us (item 1.3).
+    #[tokio::test]
+    async fn opensky_s_own_retry_header_is_honored() {
+        let server = server_returning(
+            ResponseTemplate::new(429).insert_header("x-rate-limit-retry-after-seconds", "42"),
+        )
+        .await;
+        assert_eq!(
+            get_body(&server).await.expect_err("is an error"),
+            SourceError::RateLimited {
+                retry_after: Some(Duration::from_secs(42))
+            }
+        );
+    }
+
+    /// The standard header wins when a source sends both — it is the one with a spec.
+    #[tokio::test]
+    async fn the_standard_retry_header_takes_precedence_over_the_vendor_one() {
+        let server = server_returning(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "30")
+                .insert_header("x-rate-limit-retry-after-seconds", "42"),
+        )
+        .await;
+        assert_eq!(
+            get_body(&server).await.expect_err("is an error"),
+            SourceError::RateLimited {
+                retry_after: Some(Duration::from_secs(30))
+            }
+        );
+    }
+
+    /// An unreadable standard header must not shadow a perfectly good vendor one: the rule is
+    /// "the first *usable* hint", not "the first header present".
+    #[tokio::test]
+    async fn an_unusable_standard_header_falls_through_to_the_vendor_one() {
+        let server = server_returning(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")
+                .insert_header("x-rate-limit-retry-after-seconds", "42"),
+        )
+        .await;
+        assert_eq!(
+            get_body(&server).await.expect_err("is an error"),
+            SourceError::RateLimited {
+                retry_after: Some(Duration::from_secs(42))
+            }
+        );
+    }
+
     #[tokio::test]
     async fn rate_limit_without_a_usable_retry_after_falls_back_to_backoff() {
         // Bare 429, an HTTP-date we don't parse, and outright garbage all mean "we have
