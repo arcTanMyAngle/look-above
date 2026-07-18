@@ -197,6 +197,22 @@ impl Poller {
         self.sources[self.active].id()
     }
 
+    /// Overwrites the ledger at `index`, discarding whatever it held.
+    ///
+    /// `ledgers` is private, so this is the only way a caller outside this module can seed
+    /// one — which is exactly what the headless binary (item 1.12) needs at startup: read
+    /// `source_status.credits_used_today` back through `store::Writer` and hand
+    /// [`CreditLedger::restored`] in here for [`PRIMARY`], so a restart mid-day resumes the
+    /// day's spend instead of believing the whole budget is fresh (item 1.7's seam, closed
+    /// here). A no-op if `index` is out of range — unreachable via
+    /// [`with_default_chain`](Self::with_default_chain), but a hand-built [`new`](Self::new)
+    /// chain is not asserted against it, so this stays defensive rather than panicking.
+    pub fn restore_ledger(&mut self, index: usize, ledger: CreditLedger) {
+        if let Some(slot) = self.ledgers.get_mut(index) {
+            *slot = ledger;
+        }
+    }
+
     /// Runs until the pipeline receiver is dropped.
     ///
     /// Each iteration either re-probes the primary (if we have failed over and the probe is
@@ -736,6 +752,64 @@ mod tests {
             tick.interval, MAX_INTERVAL,
             "an exhausted budget idles at the ceiling until the daily reset"
         );
+    }
+
+    // ---- Ledger restore (item 1.12's startup seam) ----------------------------------------------
+
+    #[tokio::test]
+    async fn restore_ledger_seeds_the_named_index_so_a_restart_resumes_todays_spend() {
+        // Same shape as the budget-veto test above, but going through the public method a
+        // caller outside this module (the headless binary) actually has, rather than reaching
+        // into the private `ledgers` field directly.
+        let source = Arc::new(ScriptedSource::always_ok(SourceId::OpenSky, 2));
+        let (tx, rx) = unbounded();
+        let mut poller = Poller::new(
+            vec![Box::new(SharedSource(Arc::clone(&source)))],
+            a_region(),
+            tx,
+            Arc::new(FixedClock(NOON)),
+        );
+
+        // Only two credits of headroom left; the restored ledger must be what the next cycle
+        // is judged against, not a fresh (zero-spend) one.
+        poller.restore_ledger(PRIMARY, CreditLedger::restored(DAILY_BUDGET - 2, NOON));
+
+        let tick = poller.poll_active().await;
+
+        let batch = rx
+            .try_recv()
+            .expect("the restored headroom covered exactly this cycle");
+        assert_eq!(
+            batch.spent_today, DAILY_BUDGET,
+            "spend accumulated on top of the restored total, not from zero"
+        );
+        assert_eq!(
+            tick.interval, MAX_INTERVAL,
+            "the restored spend plus this cycle exhausted the budget; idle at the ceiling"
+        );
+
+        // A further cycle has nothing left and must be skipped.
+        source.calls.store(0, Ordering::SeqCst);
+        poller.poll_active().await;
+        assert_eq!(
+            source.call_count(),
+            0,
+            "the restored spend correctly leaves no headroom for a second cycle"
+        );
+    }
+
+    #[test]
+    fn restore_ledger_on_an_out_of_range_index_is_a_harmless_no_op() {
+        let (tx, _rx) = unbounded();
+        let mut poller = Poller::new(
+            vec![ScriptedSource::always_ok(SourceId::OpenSky, 1).boxed()],
+            a_region(),
+            tx,
+            Arc::new(FixedClock(NOON)),
+        );
+
+        // One source, so index 1 is out of range; must not panic.
+        poller.restore_ledger(1, CreditLedger::restored(DAILY_BUDGET, NOON));
     }
 
     // ---- Failover -------------------------------------------------------------------------------

@@ -1,15 +1,46 @@
 //! `look-above` — a native flight tracker.
 //!
-//! M0 item 0.5 wires configuration and logging; 0.6 opens the window.
+//! M0 item 0.5 wires configuration and logging; 0.6 opens the window. M1 item 1.12 adds
+//! `--headless`, the mode the gate run (item 1.13) drives the pipeline through with no GPU
+//! and no display attached.
 
 mod config;
 mod frame_stats;
+mod headless;
 mod logging;
 mod window;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::config::{Config, SystemEnv};
+
+/// Which loop `main` hands off to, decided by [`parse_args`].
+#[derive(Debug)]
+enum Mode {
+    /// The default: open a window and render.
+    Window,
+    /// `--headless`: no window, no GPU — just the ingest pipeline logging per-cycle counts.
+    Headless,
+}
+
+/// Reads `--headless` from the real process arguments (`argv[0]` skipped).
+///
+/// An unrecognized argument is a hard error rather than a silent ignore, the same call
+/// `config` makes for an unknown key: a typo'd flag should not quietly run the default mode.
+fn parse_args() -> Result<Mode> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Mode> {
+    let mut mode = Mode::Window;
+    for arg in args {
+        match arg.as_str() {
+            "--headless" => mode = Mode::Headless,
+            other => bail!("unrecognized argument: {other} (only --headless is accepted)"),
+        }
+    }
+    Ok(mode)
+}
 
 fn main() -> Result<()> {
     // Configuration first: it carries the log filter. Failures here predate the subscriber
@@ -18,7 +49,10 @@ fn main() -> Result<()> {
     logging::init(&config.log.filter)?;
     log_startup(&config);
 
-    window::run()
+    match parse_args()? {
+        Mode::Window => window::run(),
+        Mode::Headless => headless::run(&config),
+    }
 }
 
 /// Record what was loaded.
@@ -53,4 +87,39 @@ fn log_startup(config: &Config) {
         retention_hours = config.storage.retention_hours,
         "configuration"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn no_arguments_is_window_mode() {
+        assert!(matches!(
+            parse_args_from(args(&[]).into_iter()).expect("no arguments parses"),
+            Mode::Window
+        ));
+    }
+
+    #[test]
+    fn the_headless_flag_selects_headless_mode() {
+        assert!(matches!(
+            parse_args_from(args(&["--headless"]).into_iter()).expect("--headless parses"),
+            Mode::Headless
+        ));
+    }
+
+    #[test]
+    fn an_unrecognized_argument_is_a_hard_error() {
+        let err = parse_args_from(args(&["--bogus"]).into_iter())
+            .expect_err("an unknown flag is rejected");
+        assert!(
+            err.to_string().contains("--bogus"),
+            "the message must name the argument at fault: {err}"
+        );
+    }
 }

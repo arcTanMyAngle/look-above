@@ -5,80 +5,31 @@
 
 ## Now (updated 2026-07-18)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.11
-  done; 329 tests green (5 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, M0 gate at 6/7 — see below). Items 1.1–1.12 done; 334
+  tests green (5 live `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.12** — headless mode: `look-above --headless` logs per-cycle
-  counts (new/updated/stale, credits spent) — the M1 gate evidence tool. This is the first
-  item that wires the poller's `PollBatch` channel into a running consumer in `app`, and the
-  natural point to also drive 1.11's `Writer` from a live poll loop (source_status updates)
-  and rehydrate `CreditLedger` via `CreditLedger::restored` at startup — neither is wired yet.
-- **1.11 store landed:** `crates/store`'s first real code — `migrations::apply` (numbered,
-  embedded, `user_version`-tracked, idempotent-by-version) + migration 0001 (`aircraft`,
-  `source_status` only — docs/08's other tables land at their own M3/M5 migrations) +
-  `writer::Writer`, the single-writer-thread skeleton: one `Command` enum behind one
-  `crossbeam` channel, a dedicated thread owning the one connection. **`core::contracts::Store`
-  is deliberately not implemented yet** — its other methods need tables (`positions`,
-  `airports`) that don't exist until later milestones; `Writer`'s inherent API (`record_success`/
-  `record_error`/`source_status`) is scoped to exactly what 0001 backs. Dependency direction
-  verified from `Cargo.toml` (store → core only, no `ingest` edge), so the API takes plain
-  `SourceId`/`UnixSeconds`/`u32`/`String` rather than `ingest::poller::PollBatch` or
-  `ingest::budget::CreditLedger` — the `credits_used_today` readback is exactly the value
-  `CreditLedger::restored` will take once something calls it (that wiring is 1.12+, not this
-  item). 16 new tests incl. an on-disk WAL smoke test (`:memory:` can't prove WAL; on-disk can).
-  329 tests, fmt/clippy/test green — re-verified independently this session. DECISION_LOG 1.11.
-- **1.10 recorder landed:** `scripts/record_fixture.rs` — a `[[bin]]` of `ingest` (out-of-package
-  `path`), the one sanctioned live fetch besides the app. Fetches through the real
-  `HttpClient`/OpenSky auth/endpoint constants (a recording goes out exactly as a poll would),
-  trims the record array to ≤ 20, scrubs credential-shaped keys (a tripwire; today's anonymous
-  feeds carry none), writes pretty JSON to `crates/ingest/tests/fixtures/<source>/`, and prints
-  only a count + path — never the payload (docs/06). OpenSky creds env-only (layering forbids
-  reaching `app`'s loader). **Not a drop-in re-record** — the crafted `*_nominal` fixtures pin
-  exact asserted values and the edge cases stay hand-authored; it refreshes *shape*. Live path
-  exercised (adsb.lol → 16 aircraft, deleted). READMEs updated. DECISION_LOG 1.10.
-- **1.9 merge landed:** `core::merge` — `SessionTable` (one `StateVector` per `Icao24`,
-  freshest seen) + `MergeStats { new, updated, dropped }`. Dedup is strictly newest-`ts`-wins
-  (equal-`ts` duplicate and out-of-order both drop). **Sticky anonymity is a one-way latch
-  honored regardless of `ts`** — once anonymous, stays so for the session with callsign pinned
-  `None`, and it latches *even on a record dropped as stale* (an anonymity signal is a privacy
-  fact, not a position; privacy 2.2/5.2). Staleness tracked via `age`/`stale_count`/
-  `evict_stale` with `STALE_AFTER_S`=60 s / `DROP_AFTER_S`=90 s (skill-pinned; the visual fade
-  stays M2/render). Clock-free for merging; only staleness queries take a `now`. DECISION_LOG 1.9.
-- **1.8 poller landed:** `ingest::poller` — `Poller` (async loop), `PollBatch` (channel
-  payload, carries per-cycle `credits_spent`/`spent_today`), `WallClock`/`SystemWallClock`.
-  Failover branches on `is_transient`: transient retries same then fails over after 3 in a row;
-  `Auth`/`Parse`/`Request` fail over on the first; **`Refused` holds (our bug, next source gets
-  the same wrong question — never a failover)**. Budget veto = **skip + idle**, not failover.
-  Recovery probe of the primary every 5 min is the separate path back. DECISION_LOG 1.8.
-- **1.7 seam settled:** the credit ledger is **in-memory for M1**, a small owned
-  `CreditLedger` that resets at the UTC-day boundary; item 1.11 rehydrates it from
-  `source_status.credits_used_today` through `CreditLedger::restored`. No reach into `store`
-  (which doesn't exist yet). Cadence is even-spread of the remaining 80%-of-4,000 budget over
-  the remaining day, clamped [5 s, 60 s]; `can_afford` is the separate hard cap. DECISION_LOG 1.7.
-- **All three live paths are proven** — OpenSky auth + data (1.3/1.4), airplanes.live (1.5: 48
-  aircraft), and adsb.lol (1.6: 46 aircraft, units + ms-timestamps confirmed independently, 0
-  credits). Both fallbacks share `ingest::point` (the bbox→circle point query) and
-  `ingest::readsb` (the parser). `credentials.json` stays gitignored and read as-issued.
-  [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #2 stays closed.
-- **Blockers:** `origin` is now set, but **the owner must rename the repo `look_above` →
-  `look-above` and then push, in that order** — the existing repo has an underscore; the
-  hyphen is what the User-Agent and badge use, and it 404s. No SSH key on this machine, so the
-  push is the owner's ([NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1). Until then CI has never run —
-  M0's one unmet line.
-- **Watch at first CI run:** the Linux job is unproven (DECISION_LOG 0.7, "no apt step"), and
-  M1 now runs ahead of it — a failure there will surface mid-M1.
-- **Credit spend to date: 1 of 4,000/day** (1.4's live test). Both live tests are `#[ignore]`d,
-  so CI never repeats them and never spends. Every *automatic* ingest test is a local mock.
-- **⚠ Carried to M3 (enrichment gate):** `anonymous` currently catches only the no-callsign
-  half of privacy rule 2.2. A PIA hex that broadcasts a callsign is not detected — that needs
-  FAA assigned-range data we do not have. Recorded in DECISION_LOG 1.4.
+- **Next action:** **M1 item 1.13**, the gate — a 10-min supervised live run of
+  `look-above --headless` (1.12) per acceptance §M1; record the numbers; human review. Last
+  M1 checklist item.
+- **1.12 headless mode landed:** `app::headless` + `--headless` run the poller, merge, and
+  store writer together as one process for the first time, closing 1.7's ledger-restore seam
+  and 1.11's writer-wiring gap. Verified live against real OpenSky auth: dedup and credit
+  spend both carried correctly across a restart. `record_error` stays unwired (the poller's
+  channel never carries a failure) — carried forward, not an oversight. DECISION_LOG 1.12.
+- **Blockers:** the owner must rename the repo `look_above` → `look-above`, then push (no SSH
+  key on this machine) — CI has never run; M0's one unmet gate line.
+  [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1.
+- **Credit spend to date: 7 of 4,000/day** (1 from 1.4's live test, 6 from verifying 1.12's
+  headless pipeline live). Every automatic test stays a mock; only these two items have spent.
+- **⚠ Carried to M3:** `anonymous` catches only the no-callsign half of privacy rule 2.2 — a
+  PIA hex broadcasting a callsign needs FAA range data not yet available. DECISION_LOG 1.4.
 
 ## Gate record
 
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.11 done | — |
+| M1 | in progress — 1.1–1.12 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -97,6 +48,42 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M1 item 1.12: headless mode. New `app::headless` (`headless::run`) plus a
+  `--headless` CLI switch in `main.rs` (`parse_args`/`parse_args_from`; any other argument is a
+  hard error, matching `config`'s "a typo must not silently default" call). This is the first
+  item that runs M1's pieces together as one live process rather than in isolation under a
+  test: `Poller::with_default_chain` feeds a `crossbeam` channel; each `PollBatch` merges into
+  a `core::merge::SessionTable`; `store::Writer::record_success` persists the cycle against
+  `source_status` — the wiring 1.11 deliberately left open. **Closes 1.7's ledger-restore
+  seam**: at startup, `Writer::source_status(OpenSky)`'s `credits_used_today` seeds the
+  primary's ledger through `CreditLedger::restored`, so a restart mid-day resumes the day's
+  spend rather than believing the budget is fresh — needed a new `Poller::restore_ledger`
+  (`ledgers` is private, so nothing outside `ingest` could seed it before this; a no-op on an
+  out-of-range index rather than a panic). **The fixed region**: with no camera to drive
+  `RegionQuery` yet, headless mode polls a constant ~530×555 km bbox over the Alps
+  (44.5–49.5°N, 4.5–11.5°E) — sized to match acceptance §M1's "~500×500 km bbox" credit-budget
+  line and landing OpenSky's area pricing in its middle (2-credit) tier, the same airspace
+  every adapter's own live test has flown since item 1.4. Per-cycle log carries
+  `new`/`updated`/`dropped`/`stale`/`tracked`/`credits_spent`/`spent_today`/`source` — the
+  checklist's "new/updated/stale, credits spent" plus what acceptance §M1's dedup and
+  credit-budget lines need "observed in logs". **`record_error` is not wired**: the poller's
+  channel only ever carries a successful `PollBatch` (1.8: failures are logged internally and
+  never reach the channel), so there is no error here to hand `Writer::record_error` —
+  extending the poller to surface failures over the channel is a real change, not this item's
+  smallest-correct-change scope; carried forward. No graceful shutdown: the gate run (1.13) is
+  operator-supervised and stopped with `Ctrl+C`, so a shutdown protocol would be scope the
+  checklist does not ask for. 5 new tests (3 CLI parsing, 2 `restore_ledger` on the poller
+  side); 334 total, fmt/clippy/test green. **Verified live** against the owner's real
+  `credentials.json` (the actual OpenSky OAuth2 path, not just the keyless fallbacks): two
+  short runs of the binary itself — 249 aircraft on the first cycle, then 231 updated / 1 new
+  / 18 dropped on the second (dedup visibly correct), 2 credits/cycle, 6 of 3,200 spent; the
+  second run's startup line read `credits_used_today=4`, confirming the restore round-tripped
+  through a real restart. `source_status` writes confirmed by the *absence* of this module's
+  own "could not record source_status" warning — what a failed write would have logged.
+  Along the way: `Config::credentials()` had carried `#[allow(dead_code)]` and a stale "the
+  poller reaches this in item 1.4" comment since 1.3; both are gone now that `headless::run`
+  is the real caller. DECISION_LOG 1.12. Next: **1.13**, the M1 gate.
 
 - **2026-07-18** — M1 item 1.11: `store` migrations + writer-thread skeleton. New
   `crates/store` code (the crate's first): `migrations::apply` (numbered, `include_str!`-embedded

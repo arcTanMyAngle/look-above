@@ -202,8 +202,46 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       `journal_mode` is actually `wal` — `:memory:` can't be, so that's the one place it's
       checked). 329 tests (43 app, 71 core, 180 ingest, 9 `record_fixture` bin, 5 render, 16
       store), 5 live ignored; fmt/clippy/test green. Rationale in DECISION_LOG.)*
-- [ ] 1.12 Headless mode: `look-above --headless` logs per-cycle counts (new/updated/stale,
+- [x] 1.12 Headless mode: `look-above --headless` logs per-cycle counts (new/updated/stale,
       credits spent) — the M1 gate evidence tool.
+      *(2026-07-18: done — new `app::headless` and a `main.rs` CLI switch (`--headless`; any
+      other argument is a hard error, the same "typo must not silently default" call
+      `config` makes). This is the first item that runs M1's pieces together as one process:
+      `Poller::with_default_chain` feeds a `crossbeam` channel, each `PollBatch` merges into a
+      `core::merge::SessionTable`, and `store::Writer::record_success` persists the cycle
+      against `source_status` — the wiring 1.11 left open on purpose. **Closes 1.7's ledger
+      seam**: at startup, `Writer::source_status(OpenSky)`'s `credits_used_today` seeds the
+      primary's ledger via `CreditLedger::restored`, so a restart mid-day resumes the day's
+      spend instead of believing the budget is fresh again — verified live across two runs
+      (spend carried 0→4→6 credits across a restart). Needed a new `Poller::restore_ledger`
+      (ingest): `ledgers` is private, so nothing outside the module could seed it before this;
+      a no-op on an out-of-range index rather than a panic. **The fixed region**: with no
+      camera to drive `RegionQuery` yet (design note below), headless mode uses a constant
+      ~530×555 km bbox centered on the Alps (44.5–49.5°N, 4.5–11.5°E) — sized to match
+      acceptance §M1's "~500×500 km bbox" credit-budgeting line and landing OpenSky's area
+      pricing in its middle (2-credit) tier rather than the cheapest or dearest, and it is the
+      same airspace every adapter's own live test has flown since item 1.4. Per-cycle log
+      carries `new`/`updated`/`dropped`/`stale`/`tracked`/`credits_spent`/`spent_today`/
+      `source` — the checklist's "new/updated/stale, credits spent" plus the extra fields the
+      dedup and credit-budget gate lines (acceptance §M1) need to be "observed in logs".
+      **`record_error` is not wired**: the poller's channel only ever carries a successful
+      `PollBatch` (errors are logged internally by the poller, per 1.8, and never reach the
+      channel), so a consumer here has no error to hand `Writer::record_error` — extending the
+      poller to surface failures over the channel is a real change, not this item's "smallest
+      correct change" scope; carried forward, not an oversight. No graceful shutdown: the gate
+      run (1.13) is operator-supervised and stopped with `Ctrl+C`, so adding a shutdown
+      protocol here would be scope the checklist does not ask for. 5 new tests (3 CLI parsing,
+      2 `restore_ledger`); 334 total, fmt/clippy/test green. **Verified live** (keyless-free
+      fallback untouched — the owner's real `credentials.json` was configured, so this
+      exercised the actual OpenSky OAuth2 path, not just the fallbacks): two short runs,
+      `#[ignore]`-free because this is the binary itself, not a test — 249 aircraft on the
+      first cycle, then 231 updated / 1 new / 18 dropped on the second (dedup visibly
+      working), 2 credits/cycle, 6 of 3,200 spent total. `source_status` write confirmed by
+      the *absence* of this module's own "could not record source_status" warning, which is
+      what a failed write would have logged. Also found and fixed while wiring this: `Config::
+      credentials()` was `#[allow(dead_code)]` since 1.3 with a comment saying the poller
+      would reach it "in item 1.4" — it never did until now; the attribute and the stale
+      comment are gone. DECISION_LOG 1.12.)*
 - [ ] 1.13 Gate: 10-min supervised live run per acceptance §M1; record numbers; human review.
 
 ## Design notes

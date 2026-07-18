@@ -172,11 +172,7 @@ impl OpenSkyConfig {
     ///
     /// `None` is the disabled source, not a failure:
     /// [`OpenSkyAuth::from_optional`](look_above_ingest::opensky::OpenSkyAuth::from_optional)
-    /// is the other side of this seam.
-    ///
-    /// Exercised by this module's tests; the caller that consumes it is the poller in item
-    /// 1.4, which is why the binary itself does not reach it yet.
-    #[allow(dead_code)]
+    /// is the other side of this seam — `headless::run` (item 1.12) is the caller.
     pub fn credentials(&self) -> Option<Credentials> {
         match (&self.client_id, &self.client_secret) {
             (Some(client_id), Some(client_secret)) => {

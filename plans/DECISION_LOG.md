@@ -1065,3 +1065,71 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `record_fixture` bin, 5 render, 16 store), 5 live ignored; fmt/clippy/test green — independently
   re-run, not just taken on the implementing agent's word. Next: **1.12**, headless mode (the
   `--headless` per-cycle counts readout — the M1 gate evidence tool).
+
+## 2026-07-18 — M1 item 1.12 (headless mode)
+
+- **The region had no owner yet, so this item had to pick one.** `RegionQuery` has existed
+  since M0's contracts, but nothing before this fed it a real bbox outside a test — the
+  poller's own doc says the camera drives it "in M2/M4", and no config key for it exists.
+  Headless mode needed *some* fixed region to poll, so it is a `const` in `app::headless`
+  rather than new config surface: acceptance §M1 already names a size ("10-min live run over a
+  ~500×500 km bbox stays ≤ 80% of pro-rated daily budget"), so the constant was sized to match
+  it (44.5–49.5°N, 4.5–11.5°E; ≈530×555 km, 35 deg² of `OpenSky` bbox area — the middle,
+  2-credit pricing tier, not the cheapest or dearest) rather than reusing the smaller
+  Switzerland box every adapter's unit/live tests fly against. Adding a config key for a value
+  nothing yet varies (M1 has exactly one region, ever) would be surface with no second caller —
+  the camera work in M2/M4 is the right point to make it configurable, not now.
+- **`Poller` needed a new public method to make the ledger-restore seam reachable.** Item 1.7
+  named the seam and item 1.11 built the persistence half, but `Poller::ledgers` is a private
+  field — nothing outside `crates/ingest` could have seeded it even with a `CreditLedger` in
+  hand. `restore_ledger(&mut self, index: usize, ledger: CreditLedger)` is the minimal opening:
+  it overwrites one slot and is a no-op out of range rather than panicking, since a hand-built
+  chain (via `Poller::new`, used only in tests) isn't asserted against a valid index the way
+  `with_default_chain` is. Only the primary (`OpenSky`, index `PRIMARY`) is ever metered, so
+  only it is ever restored — the fallbacks' ledgers start and stay at zero, harmlessly.
+- **`record_error` is not wired, and can't be without a further poller change.** The
+  `PollBatch` channel (1.8) only ever carries a *successful* cycle — a fetch error is handled
+  entirely inside `handle_error` (backoff/failover/hold) and only ever reaches `tracing`, never
+  the channel. So a consumer here has no error value to hand `Writer::record_error`; wiring it
+  would mean teaching the poller to emit failures too, a real behavioral addition outside
+  "logs per-cycle counts", the checklist line this item is scoped to. Recorded here rather than
+  silently doing half the job and calling it done — a future item's problem, not an oversight
+  discovered later.
+- **No graceful shutdown.** The gate run this unblocks (1.13) is a *supervised* 10-minute
+  session — an operator watches it and stops it. Building a shutdown protocol (signal handler,
+  channel teardown, drain-in-flight) for a debug tool that is never run unattended would be
+  scope invented ahead of a need; the OS's default `Ctrl+C`/`SIGINT` behavior already ends the
+  process correctly (the writer thread and the poller task simply stop existing).
+- **A CLI parser was written by hand, not via a dependency.** One flag (`--headless`) doesn't
+  justify `clap` or any argument-parsing crate; `parse_args_from` is nine lines. It rejects an
+  unrecognized argument rather than ignoring it — the same call `app::config` already makes for
+  an unknown TOML key ("a typo must not silently default"), so a mistyped flag is loud instead
+  of quietly running the window.
+- **Errors cross the `store`/`ingest` → `anyhow` boundary for free.** `StoreError` and
+  `SourceError` are both `thiserror`-derived (`std::error::Error + Send + Sync + 'static`), so
+  `anyhow::Context`/`?` accept them without a manual `map_err` — confirmed by the code
+  compiling with none written; recorded because it's easy to reach for `map_err` out of habit
+  when it isn't needed here.
+- **Found while wiring, not part of the plan:** `app::config::OpenSkyConfig::credentials()` had
+  carried `#[allow(dead_code)]` and a comment claiming "the poller reaches this in item 1.4"
+  since item 1.3 — 1.4 never called it, and nothing did until this item. Removed the attribute
+  and the now-wrong comment along with landing the real caller, rather than leaving a stale
+  note next to code that finally does what it always claimed to.
+- **Verification.** 5 new tests: 3 on `main::parse_args_from` (no arguments → window mode;
+  `--headless` → headless mode; an unknown flag is a hard error naming itself), 2 on
+  `Poller::restore_ledger` (a restored ledger is what the next cycle is judged against, not a
+  fresh one; an out-of-range index is a harmless no-op). 334 tests total (46 app, 71 core, 182
+  ingest, 9 `record_fixture` bin, 5 render, 16 store), 5 live ignored; fmt/clippy/test green.
+  **Verified live, twice, against the owner's real `credentials.json`** (the actual OpenSky
+  OAuth2 path, not the keyless fallbacks — the first time this project's own binary, not a
+  test, has authenticated live): run 1 — 249 aircraft on the first cycle (`new=249`), then
+  `new=1, updated=231, dropped=18` on the second (dedup visibly correct across cycles), 2
+  credits/cycle, spend `2 → 4`; run 2 (a fresh process) logged `restored the OpenSky credit
+  ledger from source_status credits_used_today=4` at startup and then `spent_today=6` after
+  its first cycle — proving the restore round-tripped through a real process restart, not just
+  the unit test. Total live spend this session: 6 of 3,200 credits (7 lifetime with 1.4's).
+  `source_status` writes were confirmed by the *absence* of this module's own "could not
+  record source_status" warning, which a failed write would have logged; the scratch
+  `look_above.db` created by the live runs was deleted afterward (gitignored; not evidence
+  worth keeping past the session). Next: **1.13**, the M1 gate — a 10-min supervised live run
+  per acceptance §M1, numbers recorded, human review.
