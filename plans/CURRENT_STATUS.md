@@ -5,12 +5,22 @@
 
 ## Now (updated 2026-07-18)
 
-- **Phase:** **M1 checklist complete (1.1–1.13); gate run, not fully closed — 6/7.** 329
-  tests green (5 live `#[ignore]`d). Plan:
-  [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **human review** of 1.13's open gate line (OAuth2 token-refresh, needs a
-  > 30 min observed run — see below), then owner decides whether to close M1 as-is or extend
-  the run. M2 does not start until that call is made (CLAUDE.md milestone-gate rule).
+- **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
+  open, see below — same shape as M0→M1). Item 2.1 done. Plan:
+  [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.2** — base map (Natural Earth land/coastlines, tessellated once
+  at startup, line + fill pipelines).
+- **2.1 landed:** DX12-preferred backend (env-var bisection still wins), 4x MSAA render-target
+  plumbing (adapter-capability-checked, not just assumed), F3-toggled frame-stats mode with
+  real p50/p95. **Item was split 2.1/2.1b**: the on-screen text the checklist's "overlay"
+  implies needs a glyph atlas that doesn't exist until 2.5/2.7, so 2.1 ships the toggle +
+  richer log line now and 2.1b (drawing it on screen) is deferred, tracked explicitly in the
+  M2 plan rather than left implicit. 332 tests green (5 live `#[ignore]`d, +3 from 2.1).
+- **M1 gate (2026-07-18, carried forward):** 6 of 7 acceptance §M1 lines pass; the OAuth2
+  token auto-refresh line (needs an observed refresh across a > 30 min run) stays **open** —
+  owner chose the checklist's literal 10-min scope. Not re-litigated at M2 open; carried the
+  same way M0's CI-badge line was carried into M1. Full evidence: M1 plan 1.13,
+  DECISION_LOG 1.13.
 - **1.13 gate run (2026-07-18):** 10 min 20 s live `look-above --headless` against the
   owner's real `credentials.json`, 98 poll cycles, 0 panics, 0 429s/rate-limit hits, 196/3,200
   credits spent (6.1%, well under the 80% line), dedup and retry/backoff both observed live on
@@ -38,7 +48,7 @@
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
 | M1 | **gate run 2026-07-18 — 6/7; token-refresh line open, owner-accepted** | M1 plan 1.13 |
-| M2 | not started | — |
+| M2 | **opened 2026-07-18 (owner call, M1 gate left at 6/7)** | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ### M0 acceptance §M0 — evidence (run 2026-07-15, Windows 11, rustc 1.96.0, Intel Arc / Vulkan)
@@ -56,6 +66,38 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.1: device/queue/surface init, MSAA 4x, F3 stats toggle. Split
+  from the checklist's literal wording first (owner-approved via a quick check): "frame-stats
+  overlay ... toggled with F3" reads as on-screen text, but no glyph/text pipeline exists
+  until 2.5/2.7 — building throwaway text-rendering code now to show four numbers was rejected
+  in favor of shipping everything else and tracking the on-screen part as 2.1b, explicit in
+  the M2 plan rather than silently deferred. **DX12 preferred on Windows**
+  (`Renderer::request_backend`): tries a DX12-only instance first, falls back to wgpu's normal
+  multi-backend selection if that adapter request fails, and steps aside entirely if
+  `WGPU_BACKEND` is set (the documented bisection path from M0 0.6 still wins). **MSAA 4x**:
+  a multisampled color target is created alongside the swapchain, checked against the
+  adapter's actual format features first (`RenderError::UnsupportedMsaa` rather than a panic
+  on an incapable adapter), rebuilt on every `reconfigure`, resolved onto the swapchain view on
+  submit. **F3** (press-edge only) toggles `App::stats_visible`, which widens the existing
+  once-a-second frame-stats log from `debug` to `info` and adds real `p50`/`p95` (a new
+  per-window sample buffer + nearest-rank `percentile` helper in `frame_stats.rs`, integer
+  arithmetic to dodge float-cast clippy lints) plus `instances=0` (pinned until 2.5 gives the
+  loop something to count). Delegated to the renderer-agent; this session independently
+  re-verified rather than trusting its report, which turned out to matter — **the agent's own
+  test count (282) was wrong**, corrected to the real, independently re-run figure: **332
+  passed, 5 ignored, 0 failed** (+3 from 2.1). Diff read in full (exactly the 4 files scoped
+  were touched), and a live run driven fresh over Win32 confirmed `backend=dx12`, two live
+  resizes with the MSAA target rebuilding cleanly and no panic, F3 toggling the log format as
+  designed, and a clean `WM_CLOSE` exit. fmt/clippy also re-run clean by this session, not
+  assumed from the agent. DECISION_LOG 2.1. Next: **2.2**, the base map.
+
+- **2026-07-18** — **M2 opened at the owner's direction**, told plainly ("continue with M2")
+  with M1's gate still at 6/7 (the token-refresh line open per 1.13). No new information since
+  1.13's ask — the owner already made that call there ("literal 10-min scope"); this is the
+  same decision carried one step further into starting the next milestone, exactly the M0→M1
+  precedent. Nothing about the open line changes; it stays carried, not silently dropped.
+  Next: **2.1**, `render::gpu` init.
 
 - **2026-07-18** — M1 item 1.13: the gate, run but not fully closed. Found a real conflict
   before running anything: this item's own checklist line says "10-min supervised live run",

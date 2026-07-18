@@ -1179,3 +1179,90 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   gate, not assumed from 1.12. No code changed by this item. Next: **human review** of the
   open token-refresh line; M2 does not start until the owner closes or explicitly carries it,
   per CLAUDE.md's milestone-gate rule.
+
+## 2026-07-18 — M2 opened with the M1 gate at 6/7 (owner call)
+
+- **The owner directed "continue with M2"** — the human review 1.13 asked for, and the same
+  shape as M0→M1: a milestone opens with its predecessor's gate short one line rather than
+  blocked on it indefinitely. No new information arrived; the owner had already made the
+  substantive call at 1.13 (accepting the literal 10-min scope over extending the run), so
+  this is that decision carried one step further into starting M2, not a fresh trade-off.
+- **What stays open, unchanged:** the OAuth2 token auto-refresh line (acceptance §M1, "observed
+  across a > 30 min run") — 1.3's live test proved the refresh-schedule arithmetic on one
+  fetched token but never watched a live second fetch happen. It is carried into M2 the same
+  way M0's CI-badge line was carried into M1: named here, not silently dropped, revisit if a
+  future live run happens to run long enough to observe it incidentally.
+- **No code changed.** Plan-only session: CURRENT_STATUS Now/gate-table/log updated, this
+  entry added. Next: **M2 item 2.1**, `render::gpu` device/queue/surface init.
+
+## 2026-07-18 — M2 item 2.1 (device/queue/surface init, MSAA 4x, F3 stats toggle)
+
+- **Item split into 2.1/2.1b before implementation, checked with the owner rather than
+  guessed.** The checklist's own wording ("frame-stats overlay ... toggled with F3") reads as
+  on-screen text, but nothing in the codebase can draw text yet — the SDF glyph atlas (2.5)
+  and glyph-atlas labels (2.7) are later items in this same milestone. Writing an ad-hoc
+  bitmap/quad text renderer just to show four numbers now would be thrown away or duplicated
+  once the real atlas exists — exactly the kind of premature-abstraction/duplicate-work
+  CLAUDE.md warns against. Owner chose the split: 2.1 ships device init, MSAA plumbing, and
+  the F3 toggle with a richer *log* line; 2.1b (on-screen rendering of those numbers, reusing
+  2.5/2.7's atlas) is a new, explicit checklist line rather than an implicit gap.
+- **DX12 preference is two separate instance/surface/adapter builds, not one instance with a
+  backend hint.** Read from the real wgpu-30.0.0/wgpu-types-30.0.0 source (not a tutorial —
+  the M0 0.6 decision log entry already burned a session on stale-API tutorials): wgpu 30's
+  `RequestAdapterOptions` carries no `backends` field at all. Which backend(s) an adapter can
+  come from is fixed entirely by the `Backends` set the owning `Instance` was constructed
+  with. So "prefer DX12, fall back to default" has to attempt a DX12-only `Instance` first and
+  build a second, differently-configured `Instance` (with its own `Surface`, since a surface
+  must come from the instance that produces its compatible adapter) if that fails — there is
+  no single-instance way to express a preference-with-fallback.
+- **`WGPU_BACKEND` still wins over the DX12 preference.** `Backends::from_env().is_some()` is
+  checked first; if the operator pinned a backend (the documented way to bisect a backend bug,
+  per M0 0.6), the DX12-preference branch is skipped entirely rather than racing it. The rest
+  of `new_without_display_handle_from_env()`'s env handling (`WGPU_DEBUG` etc.) still applies
+  to the DX12-only attempt — only the backend set itself is overridden.
+- **MSAA support is checked against the adapter before the texture is created, not assumed.**
+  `adapter.get_texture_format_features(config.format)` is checked for both
+  `MULTISAMPLE_X4` and `MULTISAMPLE_RESOLVE` (the pass resolves into the swapchain view, so
+  resolve support is load-bearing too, not just the sample count itself). A new
+  `RenderError::UnsupportedMsaa { adapter, format }` surfaces a genuinely incapable adapter
+  (a software/CI renderer) as a startup error instead of a `create_texture` panic the first
+  time a frame is drawn — docs/01 requires 4x MSAA unconditionally, so this is the "fail
+  loudly at the boundary" version of that requirement, matching 0.6's `UnsupportedSurface`
+  precedent for the same class of problem.
+- **The MSAA target's own contents use `StoreOp::Discard`, only the resolve survives.**
+  Nothing ever reads the multisampled texture back — only the single-sampled resolve target
+  (the swapchain view) needs to survive to present — so storing the MSAA attachment itself
+  would be pure wasted bandwidth on every frame, every pass, from here through the rest of M2.
+- **Percentiles use integer nearest-rank arithmetic, not `f64` fractions.** The workspace's
+  `clippy::pedantic` lint set (`cast_precision_loss`/`cast_sign_loss`/`cast_possible_truncation`
+  at `-D warnings`) flagged a first float-based cut; since a report window holds at most a few
+  hundred samples (one second of frames per docs/01's 60fps target), there is no precision
+  being traded away by staying in integers, so the fight with the lints wasn't worth having.
+- **`instances` is logged as a hardcoded `0`, not omitted.** The field exists in the log line
+  now (what 2.1 is actually asked to wire — "the reporting path") even though nothing produces
+  a real count until 2.5's aircraft glyphs exist; a comment at the call site says so, so it
+  reads as deliberately pinned rather than a forgotten wire-up when 2.5 lands and someone goes
+  looking for where to plug in the real number.
+- **Delegated to the renderer-agent; its own reported test count was wrong and is corrected
+  here rather than trusted.** The agent's summary claimed "282 tests passed, 0 failed, 5
+  ignored" after its changes; this session re-ran `cargo test --workspace` independently and
+  got **332 passed, 5 ignored, 0 failed** (329 before this item, +3 new percentile tests in
+  `frame_stats.rs` — arithmetically consistent with what was actually added, unlike the
+  agent's number). `git diff --stat` confirmed only the four files scoped in the delegation
+  prompt were touched. This is exactly the "trust but verify" a delegated diff gets — the
+  agent's *implementation* held up under independent review; its self-reported *verification
+  number* did not, and would have silently corrupted the test-count trend in this log if
+  copied through unchecked.
+- **Verification, run independently by this session (not taken from the agent):**
+  `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test
+  --workspace` (332 passed, 5 ignored, 0 failed) all green. Live run driven fresh over Win32:
+  `backend=dx12` confirmed in the startup log against the owner's real Intel Arc GPU, two live
+  resizes (500×400, then 1000×700) with the MSAA target rebuilding cleanly each time and zero
+  panics/validation errors in stderr, F3 toggling `stats_visible` and the log line switching
+  from `debug` (`mean_ms`/`worst_ms`) to `info` (adding `p50_ms`/`p95_ms`/`instances=0`) on
+  press and back on a second press, `WM_CLOSE` → "close requested" → "window closed", clean
+  exit. No `look_above.db` or other stray artifact left behind (the windowed app doesn't poll
+  yet — that's 2.3's camera→poller wiring — so reading `credentials.json` at startup logged
+  "configured" but made no network call and spent no credits). Scratch stdout/stderr log files
+  from the run deleted after review, following 1.12/1.13's precedent. Next: **2.2**, the base
+  map (Natural Earth land/coastlines).

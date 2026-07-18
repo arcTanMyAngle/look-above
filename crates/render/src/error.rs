@@ -37,4 +37,16 @@ pub enum RenderError {
     /// `get_current_texture` raised a validation error, which is a bug on our side.
     #[error("the GPU surface reported a validation error")]
     SurfaceValidation,
+
+    /// The adapter can present to the surface but cannot multisample the swapchain format at
+    /// 4x. docs/01 requires 4x MSAA; this exists so a software/CI adapter that genuinely can't
+    /// do it fails loudly at startup instead of panicking the first time a pass tries to
+    /// create the render target.
+    #[error("GPU adapter '{adapter}' does not support 4x MSAA for format {format:?}")]
+    UnsupportedMsaa {
+        /// The adapter that came up short, for the bug report.
+        adapter: String,
+        /// The swapchain format MSAA support was checked against.
+        format: wgpu::TextureFormat,
+    },
 }

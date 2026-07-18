@@ -1,8 +1,13 @@
-//! Frame-time accounting for the debug log.
+//! Frame-time accounting for the debug log, and (from M2 2.1) the F3 stats mode.
 //!
-//! A stub, per M0 item 0.6: it gives the window a heartbeat and makes an obviously wrong
-//! frame time visible now rather than at M2. The real thing — a p95 overlay drawn on screen
-//! and held to the 16.6 ms budget in docs/11 §M2 — replaces it there.
+//! M0 item 0.6 built the mean/worst stub to give the window a heartbeat. M2 2.1 adds p50/p95
+//! alongside it — percentiles need the interval's individual frame times, not just a running
+//! sum, so this keeps a small per-window buffer and sorts it once a second. That's a few
+//! hundred `Duration`s at most, well under the ≤4 ms render-thread budget in docs/01 since it
+//! only runs on the once-per-second reporting edge, never per frame.
+//!
+//! On-screen text (the "overlay" the M2 checklist item names) is 2.1b, deferred until the
+//! glyph atlas (2.5/2.7) exists — this module only produces the numbers.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +26,12 @@ pub struct FrameSummary {
     pub mean: Duration,
     /// The worst single gap: where a stutter shows up that the mean hides.
     pub worst: Duration,
+    /// Median frame time: half the interval's frames were at or under this.
+    pub p50: Duration,
+    /// 95th-percentile frame time: the budget docs/01 actually cares about, since it survives
+    /// the occasional stutter the mean hides without being dominated by one outlier the way
+    /// `worst` is.
+    pub p95: Duration,
 }
 
 impl FrameSummary {
@@ -41,9 +52,11 @@ impl FrameSummary {
 pub struct FrameStats {
     window_start: Option<Instant>,
     last_frame: Option<Instant>,
-    frames: u32,
     total: Duration,
     worst: Duration,
+    /// This interval's individual frame times, cleared on each report. Needed for
+    /// percentiles — `total`/`worst` alone can't yield them.
+    samples: Vec<Duration>,
 }
 
 impl FrameStats {
@@ -57,30 +70,49 @@ impl FrameStats {
 
         if let Some(previous) = self.last_frame.replace(now) {
             let frame_time = now.saturating_duration_since(previous);
-            self.frames += 1;
             self.total += frame_time;
             self.worst = self.worst.max(frame_time);
+            self.samples.push(frame_time);
         }
 
         let elapsed = now.saturating_duration_since(started);
-        if elapsed < REPORT_INTERVAL || self.frames == 0 {
+        let frames = u32::try_from(self.samples.len()).unwrap_or(u32::MAX);
+        if elapsed < REPORT_INTERVAL || frames == 0 {
             return None;
         }
 
+        self.samples.sort_unstable();
         let summary = FrameSummary {
-            frames: self.frames,
+            frames,
             elapsed,
-            mean: self.total / self.frames,
+            mean: self.total / frames,
             worst: self.worst,
+            p50: percentile(&self.samples, 50),
+            p95: percentile(&self.samples, 95),
         };
 
         self.window_start = Some(now);
-        self.frames = 0;
         self.total = Duration::ZERO;
         self.worst = Duration::ZERO;
+        self.samples.clear();
 
         Some(summary)
     }
+}
+
+/// The `percent`-th percentile (`0..=100`) of an already-sorted, non-empty slice.
+///
+/// Nearest-rank, in whole samples: rank `ceil(percent * n / 100)`, 1-based and clamped into
+/// range. Integer arithmetic throughout — this module's sample counts are at most a few
+/// hundred (one reporting window's worth of frames per docs/01), so there's no precision to
+/// lose by avoiding floats, and it sidesteps the `f64`/`usize` cast lints entirely.
+fn percentile(sorted: &[Duration], percent: usize) -> Duration {
+    debug_assert!(!sorted.is_empty(), "percentile of an empty sample set");
+    debug_assert!(percent <= 100, "percent out of range");
+    let n = sorted.len();
+    let rank = percent.saturating_mul(n).div_ceil(100).max(1);
+    let index = (rank - 1).min(n - 1);
+    sorted[index]
 }
 
 #[cfg(test)]
@@ -179,5 +211,66 @@ mod tests {
         assert_eq!(summary.frames, 1);
         assert_eq!(summary.worst, Duration::from_secs(1));
         assert_eq!(summary.elapsed, Duration::from_secs(1));
+    }
+
+    /// With no variance in frame time, every percentile reads back as the spacing itself.
+    #[test]
+    fn p50_and_p95_equal_the_spacing_when_frame_times_are_uniform() {
+        let origin = Instant::now();
+        let mut stats = FrameStats::default();
+
+        let mut reported = None;
+        for frame in 0..=63 {
+            if let Some(summary) = stats.record(at(origin, frame * 16)) {
+                reported = Some(summary);
+                break;
+            }
+        }
+
+        let summary = reported.expect("a second of 16 ms frames reports");
+        assert_eq!(summary.p50, Duration::from_millis(16));
+        assert_eq!(summary.p95, Duration::from_millis(16));
+    }
+
+    /// A single stall among nine quick frames is rare enough that the median doesn't see it,
+    /// but common enough (1 in 10) that p95 does — that's the whole reason p95 exists
+    /// alongside `mean`/`worst`.
+    #[test]
+    fn p95_catches_a_stall_that_p50_does_not() {
+        let origin = Instant::now();
+        let mut stats = FrameStats::default();
+
+        stats.record(origin); // starts the clock; the first call contributes no sample
+        let mut elapsed_ms = 0u64;
+        for _ in 0..9 {
+            elapsed_ms += 10;
+            assert_eq!(stats.record(at(origin, elapsed_ms)), None);
+        }
+
+        // The tenth gap is a 910 ms stall, which is also what pushes the window's elapsed
+        // time past the 1 s reporting boundary.
+        let summary = stats
+            .record(at(origin, 1_000))
+            .expect("the interval reports once 1s has elapsed");
+
+        assert_eq!(summary.frames, 10);
+        assert_eq!(summary.worst, Duration::from_millis(910));
+        assert_eq!(summary.p50, Duration::from_millis(10));
+        assert_eq!(summary.p95, Duration::from_millis(910));
+    }
+
+    /// The percentile helper itself, independent of [`FrameStats`]'s bookkeeping: nearest-rank
+    /// on a small, hand-checkable sample set.
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let samples: Vec<Duration> = [10, 20, 30, 40, 50]
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect();
+
+        assert_eq!(percentile(&samples, 1), Duration::from_millis(10));
+        assert_eq!(percentile(&samples, 50), Duration::from_millis(30));
+        assert_eq!(percentile(&samples, 95), Duration::from_millis(50));
+        assert_eq!(percentile(&samples, 100), Duration::from_millis(50));
     }
 }

@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use look_above_render::{FrameOutcome, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::frame_stats::FrameStats;
@@ -42,6 +43,10 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     stats: FrameStats,
+    /// Toggled by F3. Widens the once-a-second frame-stats log from `debug` to `info` and
+    /// adds p50/p95 — see [`FrameStats`]. No on-screen overlay yet (M2 2.1b, blocked on the
+    /// glyph atlas in 2.5/2.7).
+    stats_visible: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -84,13 +89,28 @@ impl App {
         match renderer.render() {
             Ok(FrameOutcome::Presented) => {
                 if let Some(summary) = self.stats.record(Instant::now()) {
-                    tracing::debug!(
-                        frames = summary.frames,
-                        fps = format!("{:.1}", summary.fps()),
-                        mean_ms = format!("{:.2}", summary.mean.as_secs_f64() * 1e3),
-                        worst_ms = format!("{:.2}", summary.worst.as_secs_f64() * 1e3),
-                        "frame stats"
-                    );
+                    if self.stats_visible {
+                        tracing::info!(
+                            frames = summary.frames,
+                            fps = format!("{:.1}", summary.fps()),
+                            mean_ms = format!("{:.2}", summary.mean.as_secs_f64() * 1e3),
+                            p50_ms = format!("{:.2}", summary.p50.as_secs_f64() * 1e3),
+                            p95_ms = format!("{:.2}", summary.p95.as_secs_f64() * 1e3),
+                            worst_ms = format!("{:.2}", summary.worst.as_secs_f64() * 1e3),
+                            // Pinned to 0 until M2 2.5 gives the render loop aircraft glyph
+                            // instances to count; this only wires the reporting path.
+                            instances = 0,
+                            "frame stats"
+                        );
+                    } else {
+                        tracing::debug!(
+                            frames = summary.frames,
+                            fps = format!("{:.1}", summary.fps()),
+                            mean_ms = format!("{:.2}", summary.mean.as_secs_f64() * 1e3),
+                            worst_ms = format!("{:.2}", summary.worst.as_secs_f64() * 1e3),
+                            "frame stats"
+                        );
+                    }
                 }
             }
             // The surface had nothing to give us; the next frame is already queued.
@@ -133,6 +153,17 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Only the press edge, not repeat (an OS auto-repeat while F3 is held) or
+                // release — otherwise holding the key would flicker the mode.
+                if !event.repeat
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::F3)
+                {
+                    self.stats_visible = !self.stats_visible;
+                    tracing::info!(stats_visible = self.stats_visible, "F3 toggled");
                 }
             }
             WindowEvent::RedrawRequested => self.draw(event_loop),

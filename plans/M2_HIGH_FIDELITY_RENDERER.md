@@ -7,9 +7,40 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
 
 ## Checklist
 
-- [ ] 2.1 `render::gpu`: device/queue/surface init (prefer DX12 on Windows, fall back per
-      wgpu defaults), swapchain resize, MSAA 4x target, frame-stats overlay (p50/p95 frame
-      time, instance counts) toggled with F3.
+- [x] 2.1 Device/queue/surface init: prefer DX12 on Windows, fall back per wgpu defaults;
+      swapchain resize (already in place from 0.6); MSAA 4x render-target plumbing; F3 toggles
+      a frame-stats mode that computes p50/p95 (not just mean/worst) and surfaces them (log at
+      info while toggled, since no on-screen overlay exists yet — see 2.1b).
+      *(Split 2026-07-18, owner-approved: the checklist's "frame-stats overlay ... toggled with
+      F3" implies on-screen text, but no text/glyph pipeline exists until 2.5 (SDF atlas) /
+      2.7 (glyph-atlas labels) — building one now for a debug overlay would be thrown away or
+      duplicated once the real atlas lands. This item ships everything else now; drawing the
+      numbers on screen is 2.1b.)*
+      *(2026-07-18: implemented — `Renderer::request_backend` tries DX12-only first on
+      `cfg(windows)` (skipped if `WGPU_BACKEND` is set, so the documented bisection path still
+      wins), falling back to wgpu's default multi-backend selection on failure; verified live,
+      `backend=dx12` on this machine. A 4x-multisampled color target (`Renderer::msaa_view`) is
+      created alongside the swapchain and rebuilt in `reconfigure`, with an
+      `adapter.get_texture_format_features` check gating a new `RenderError::UnsupportedMsaa`
+      rather than letting an incapable adapter panic; `render`'s pass now targets it and
+      resolves onto the swapchain view (`StoreOp::Discard` on the MSAA attachment itself, only
+      the resolve needs to survive to present). `FrameStats` gained a per-window
+      `Vec<Duration>` sample buffer and a nearest-rank `percentile` helper (integer arithmetic,
+      sidesteps float-cast clippy lints) yielding `p50`/`p95` alongside the existing
+      `mean`/`worst`; F3 (press-edge only, via `winit::keyboard`) toggles `App::stats_visible`,
+      which widens the once-a-second log line from `debug` to `info` and adds
+      `p50_ms`/`p95_ms`/`instances=0` (the last pinned until 2.5 gives the render loop
+      something to count). Delegated to the renderer-agent, independently verified by this
+      session: `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test
+      --workspace` re-run fresh (**332 passed, 5 ignored, 0 failed** — the agent's own reported
+      count was wrong, corrected here rather than trusted), diff read in full, and a live run
+      driven over Win32 independent of the agent's own: `backend=dx12` confirmed, two live
+      resizes (500×400 then 1000×700) with no panic and the MSAA target rebuilding cleanly
+      each time, F3 toggled `stats_visible` with the log line switching format as designed,
+      `WM_CLOSE` → "close requested" → "window closed", clean exit. DECISION_LOG 2.1.)*
+- [ ] 2.1b Render the F3 frame-stats overlay (p50/p95, instance counts) on screen, reusing the
+      glyph atlas built in 2.5/2.7 rather than a one-off text renderer. Depends on 2.7; do not
+      start before it lands.
 - [ ] 2.2 Base map: Natural Earth 1:50m land + coastlines bundled as GeoJSON; tessellate once
       at startup (`lyon`) into static vertex buffers; line + fill pipelines; desaturated dark
       palette per docs/01.
