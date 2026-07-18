@@ -6,16 +6,27 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Item 2.1 done. Plan:
+  open, see below — same shape as M0→M1). Items 2.1 and 2.2a done. Plan:
   [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.2** — base map (Natural Earth land/coastlines, tessellated once
-  at startup, line + fill pipelines).
+- **Next action:** **M2 item 2.2b** — tessellate the bundled base-map `GeoJSON` (`lyon`) into
+  static vertex buffers; line + fill pipelines; desaturated dark palette per docs/01.
+- **2.2a landed:** the base map's real Natural Earth 1:50m land + coastline data, fetched once
+  and bundled as `GeoJSON` in `crates/render/assets/basemap/` (1,421 polygon / 1,429 line
+  features, ~2.5 MB combined) — `render` itself never touches the network. New workspace crate
+  `crates/import` (`look-above-import`, depended on by nothing) holds the one-off fetch tool;
+  docs/03's documented download host (`naturalearthdata.com`) 404s on its own direct links, so
+  the tool fetches from Natural Earth's real CDN (`naciscdn.org`), verified live and recorded
+  in docs/03. **Item was split 2.2/2.2a/2.2b**: bundling GeoJSON presumes the data exists
+  first, and acquiring it (live download, shapefile→GeoJSON conversion, a new network-capable
+  crate that must stay out of `render`'s dependency tree) is cleanly separable from the
+  tessellation/pipeline work — same shape as 2.1/2.1b. 342 tests green (5 live `#[ignore]`d,
+  +10 from 2.2a).
 - **2.1 landed:** DX12-preferred backend (env-var bisection still wins), 4x MSAA render-target
   plumbing (adapter-capability-checked, not just assumed), F3-toggled frame-stats mode with
   real p50/p95. **Item was split 2.1/2.1b**: the on-screen text the checklist's "overlay"
   implies needs a glyph atlas that doesn't exist until 2.5/2.7, so 2.1 ships the toggle +
   richer log line now and 2.1b (drawing it on screen) is deferred, tracked explicitly in the
-  M2 plan rather than left implicit. 332 tests green (5 live `#[ignore]`d, +3 from 2.1).
+  M2 plan rather than left implicit.
 - **M1 gate (2026-07-18, carried forward):** 6 of 7 acceptance §M1 lines pass; the OAuth2
   token auto-refresh line (needs an observed refresh across a > 30 min run) stays **open** —
   owner chose the checklist's literal 10-min scope. Not re-litigated at M2 open; carried the
@@ -66,6 +77,34 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.2a: base map data. Split 2.2 into 2.2a (this item — fetch and
+  bundle) and 2.2b (tessellate and render), the same shape 2.1/2.1b was split, because
+  "bundled as `GeoJSON`" presumes the data exists and acquiring it is its own scoped piece of
+  work. **Found the documented download host dead before writing any code**: docs/03 pointed
+  at `naturalearthdata.com/downloads/`, but that page's own direct file links 404 — checked
+  with `curl -I`, not assumed. The same page links to Natural Earth's real CDN, `naciscdn.org`,
+  confirmed live (`200`, ~450 KB per zip); docs/03 updated to record the real host. **New
+  workspace crate `crates/import`** (`look-above-import`), depended on by nothing in the `app`
+  graph — a network+zip+shapefile stack has no business near `render`'s Cargo.toml, which the
+  M0 gate's "no network" check would otherwise start failing. One bin, `import-basemap`:
+  downloads the two zips (host-gated exact-match/https-only, mirroring `ingest::allowlist`'s
+  rigor), extracts `.shp` bytes in memory (no `.shx`/`.dbf` needed), parses with the pure-Rust
+  `shapefile` crate (API confirmed by reading its vendored source, not guessed), and converts
+  to `GeoJSON` — land polygons via an outer/inner ring-grouping heuristic (each outer ring
+  starts a feature, holes attach to the one immediately before them, matching how real
+  shapefile writers order rings), coastline via one `LineString` per shapefile part.
+  Coordinates rounded to 1e-4° (~11 m) to keep the bundled text compact; no further geometric
+  simplification, since 1:50m is already Natural Earth's own generalized tier. **Run live**:
+  1,420 land shapefile records → 1,421 polygon features, 1,428 coastline records → 1,429 line
+  features, written to `crates/render/assets/basemap/{land,coastline}.geojson` (~1.2 MB each).
+  Verified structurally with a scratch Node script (feature/geometry-type counts, point totals,
+  lon/lat extents sane at the expected ±180°/±90° bounds) — no coordinate was ever printed into
+  this session (docs/06). 10 new offline unit tests (host gate, coordinate rounding, the
+  two-disjoint-outer-rings case, hole attachment, ring-closure survival, polyline part
+  splitting); 342 tests total (5 live `#[ignore]`d), fmt/clippy/test all green.
+  `crates/render/assets/basemap/README.md` records provenance, format, and the regeneration
+  command. DECISION_LOG 2.2a. Next: **2.2b**, `lyon` tessellation + line/fill WGSL pipelines.
 
 - **2026-07-18** — M2 item 2.1: device/queue/surface init, MSAA 4x, F3 stats toggle. Split
   from the checklist's literal wording first (owner-approved via a quick check): "frame-stats

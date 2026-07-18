@@ -58,8 +58,12 @@ metadata. All sources below are **free and require no signup**.
 ## Base map geometry — Natural Earth
 
 - **What:** public-domain coastlines, land polygons, country borders (1:10m / 1:50m / 1:110m).
-- **Where:** `https://www.naturalearthdata.com/downloads/` (bundle simplified GeoJSON with the
-  app; no runtime fetch).
+- **Where:** described at `https://www.naturalearthdata.com/downloads/`, but that page's own
+  direct file links 404 (verified M2 item 2.2a) — the actual files are served from Natural
+  Earth's CDN, `https://naciscdn.org/naturalearth/<scale>/physical/<name>.zip` (e.g.
+  `.../50m/physical/ne_50m_land.zip`). Bundle simplified GeoJSON with the app; no runtime
+  fetch. Fetched once by `crates/import`'s `import-basemap` tool, not by `ingest` or `render`
+  — see `crates/render/assets/basemap/README.md`.
 - **Used for:** the map itself. Vector data is tessellated once at startup (CPU, `lyon`),
   cached as vertex buffers per LOD tier.
 

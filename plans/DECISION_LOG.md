@@ -1266,3 +1266,70 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   "configured" but made no network call and spent no credits). Scratch stdout/stderr log files
   from the run deleted after review, following 1.12/1.13's precedent. Next: **2.2**, the base
   map (Natural Earth land/coastlines).
+
+## 2026-07-18 — M2 item 2.2a (base map data: fetch + bundle Natural Earth as GeoJSON)
+
+- **Split 2.2 into 2.2a/2.2b, same shape as 2.1/2.1b.** The checklist's "bundled as GeoJSON"
+  presumes the data already exists; acquiring it is a live download plus a format conversion,
+  genuinely separable from the tessellation/pipeline half and requiring tooling that must
+  never touch `render`'s Cargo.toml (see next point). Self-approved mid-session — no owner
+  ambiguity here, just a scope split the same way 2.1 was split, recorded rather than left
+  implicit per the token-managed-implementation skill.
+- **New workspace crate, `crates/import` (`look-above-import`), depended on by nothing.**
+  `render`'s Cargo.toml is one of the M0 gate's checked invariants ("no winit, no network, no
+  DB" — verified from `cargo metadata` edges, not `cargo tree`, per CLAUDE.md); adding
+  `reqwest`/`zip`/`shapefile` there to fetch a one-time asset would break that claim even if
+  gated behind a bin-only target, since Cargo has no per-target dependency isolation within one
+  package. A separate crate that nothing in the `app` dependency graph reaches keeps the
+  invariant intact and matches what M1 1.2's decision log already anticipated: "[static-download
+  hosts] are fetched by import tooling at setup time, not by `ingest` ... that tooling extends
+  the list on purpose when it lands." One bin today (`import-basemap`); a natural home for a
+  future OurAirports/FAA importer if one lands, but not built out ahead of that need.
+- **The documented download host is dead; the real one is `naciscdn.org`.** docs/03 named
+  `https://www.naturalearthdata.com/downloads/`, but that page's own direct file links
+  (`.../download/50m/physical/ne_50m_land.zip`) return `404` — checked live with `curl -I`,
+  not assumed. The same downloads page links to Natural Earth's actual CDN, `naciscdn.org`;
+  both files confirmed there with a live `200` and a plausible size (~450 KB each, `AmazonS3`/
+  `CloudFront` headers). docs/03 updated to record the real host rather than silently working
+  around a stale doc. `ALLOWED_STATIC_HOSTS` in the import tool gates on it exact-match,
+  https-only — the same shape as `ingest::allowlist`, even though this tool never ships.
+- **`shapefile` crate over GDAL/`ogr2ogr`.** Natural Earth ships shapefiles, not GeoJSON
+  directly. `ogr2ogr` would need a system GDAL install (a new, undocumented host dependency for
+  anyone running this tool); the pure-Rust `shapefile` crate parses `.shp` bytes with zero
+  system dependencies, matching the project's "bundled SQLite, no system dependency" bias
+  (ADR-004's reasoning, extended here). The exact API (`ShapeReader::new`/`read_as`,
+  `PolygonRing::Outer`/`Inner`, `Polyline::parts`, `Point { x, y }`) was confirmed by reading
+  the vendored crate source under `~/.cargo/registry/src/`, not guessed from a tutorial or a
+  possibly-stale doc page — the same discipline M0 0.6 established for wgpu. Only `.shp` bytes
+  are read; `.shx`/`.dbf` are skipped entirely since this tool reads every shape once,
+  sequentially, and wants no attribute columns — one less thing that could fail to parse.
+- **The outer/inner ring grouping is a documented heuristic, not a format guarantee.** A
+  shapefile `Polygon` record can hold several disjoint outer rings (e.g. a continent plus its
+  islands packed into one record); GeoJSON's `Polygon` type allows exactly one shell, so each
+  outer ring starts a new output feature and any inner (hole) rings attach to whichever outer
+  ring immediately precedes them. The shapefile spec technically says ring order is
+  insignificant, but every common shapefile writer — including Natural Earth's own toolchain —
+  emits a shell immediately followed by its holes, so the heuristic matches reality; a
+  point-in-polygon nesting analysis would be more format-correct but is unneeded complexity for
+  data that, verified live, contains no holes needing it (land is 1,420 records → 1,421
+  features — one extra feature from a single two-outer-ring record — with `total_point_count`
+  matching exactly). Coastline parts need no such grouping: each shapefile part becomes its own
+  `LineString` feature independently.
+- **Coordinates rounded to 1e-4° (~11 m), no further geometric simplification.** 1:50m is
+  already Natural Earth's own generalization tier (as opposed to 1:10m); the checklist's
+  "simplified" reads as "use the simplified tier they publish," not "simplify further" — adding
+  a Douglas-Peucker pass would be complexity the checklist didn't ask for and this data (1.2 MB
+  each, ~60k points each, well under the 256 MB render-asset budget) doesn't need to justify.
+  Revisit only if 2.2b's tessellation or the ≤ 2 s startup budget shows otherwise.
+- **Verified live, structurally, never printing a coordinate into this session** (docs/06):
+  1,420 land shapefile records → 1,421 polygon features, 1,428 coastline records → 1,429 line
+  features; a scratch Node script (no `jq`/`python3` available here) checked feature counts,
+  geometry-type histograms, total point counts, and lon/lat extents (exactly `±180°` and
+  `[-89.9989°, 83.5996°]`/`[-85.1922°, 83.5996°]` — sane, no swapped axes, no garbage) without
+  ever loading a raw coordinate into the transcript. 10 new offline unit tests (host gate,
+  coordinate rounding, the two-outer-rings-in-one-record split, hole attachment, ring closure
+  survival, polyline part splitting) — all synthetic, no network in `cargo test` per docs/10.
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` green.
+  `crates/render/assets/basemap/README.md` records provenance, format, sizes, and the
+  regeneration command. Next: **2.2b**, `lyon` tessellation + line/fill WGSL pipelines
+  consuming this bundle.

@@ -6,6 +6,7 @@ members = [
     "crates/store",
     "crates/render",
     "crates/app",
+    "crates/import",
 ]
 
 [workspace.package]

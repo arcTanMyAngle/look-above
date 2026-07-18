@@ -41,9 +41,45 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
 - [ ] 2.1b Render the F3 frame-stats overlay (p50/p95, instance counts) on screen, reusing the
       glyph atlas built in 2.5/2.7 rather than a one-off text renderer. Depends on 2.7; do not
       start before it lands.
-- [ ] 2.2 Base map: Natural Earth 1:50m land + coastlines bundled as GeoJSON; tessellate once
-      at startup (`lyon`) into static vertex buffers; line + fill pipelines; desaturated dark
-      palette per docs/01.
+- [x] 2.2a Base map data: fetch Natural Earth 1:50m land + coastlines and bundle as GeoJSON in
+      `crates/render/assets/basemap/` (no runtime fetch — `render` stays network-free, ADR-002).
+      *(Split 2026-07-18, self-approved same-session: the checklist's "bundled as GeoJSON"
+      needs the data to actually exist first, and acquiring it — a live download, format
+      conversion, a new crate to hold tooling that must never touch `render`'s Cargo.toml — is
+      its own scoped piece of work, cleanly separable from the tessellation/pipeline half.
+      Same shape as 2.1/2.1b's split.)*
+      *(2026-07-18: implemented — new workspace crate `crates/import` (`look-above-import`),
+      not depended on by anything (`app` never sees it; it exists only to be run by hand), one
+      bin: `import-basemap`. **The documented download host is dead**: docs/03 pointed at
+      `naturalearthdata.com/downloads/`, but that page's own direct file links 404 — checked
+      live, not assumed. The actual files are served from Natural Earth's own CDN,
+      `naciscdn.org` (linked from the same downloads page), confirmed with a live `200` on
+      both zips (~450 KB each); docs/03 updated to record this. `ALLOWED_STATIC_HOSTS` gates
+      the fetch exact-match/https-only, mirroring `ingest::allowlist`'s rigor even though
+      nothing here ships in the app. **Shapefile, not GDAL**: the `shapefile` crate (pure
+      Rust, no system GDAL dependency) parses `.shp` bytes read straight out of the downloaded
+      zip via the `zip` crate — no `.shx`/`.dbf` needed, since this tool reads every shape once
+      sequentially and wants no attribute columns. API confirmed by reading the vendored crate
+      source directly (CLAUDE.md's dependency-discovery rule), not guessed. **The grouping
+      heuristic**: a shapefile `Polygon` record can hold several disjoint outer rings (a
+      continent plus its islands in one record), which GeoJSON's `Polygon` type cannot
+      represent — each outer ring starts a new output feature, and inner (hole) rings attach to
+      the outer ring immediately preceding them, the same ordering convention every common
+      shapefile writer (including Natural Earth's own) actually produces. Coastline parts each
+      become their own `LineString` feature. Coordinates rounded to 1e-4° (~11 m) to keep the
+      bundled text compact — 1:50m is already Natural Earth's own generalization, so no further
+      simplification pass was added. **Verified live**: 1,420 land shapefile records → 1,421
+      polygon features (one record held two disjoint outer rings), 1,428 coastline records →
+      1,429 line features; both files structurally checked (feature/geometry-type counts, point
+      totals, lon/lat extents sane at ±180°/±90°) without ever printing a coordinate into this
+      session (docs/06). ~1.2 MB each, ~2.5 MB combined — well inside the render-asset memory
+      budget. 10 new offline unit tests (host gate, coordinate rounding, the outer/inner
+      grouping heuristic including the two-disjoint-outer-rings case, polyline part splitting);
+      `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace`
+      green. `crates/render/assets/basemap/README.md` documents provenance, format, and the
+      regeneration command. DECISION_LOG 2.2a. Next: **2.2b**, tessellation + pipelines.)*
+- [ ] 2.2b Base map render: tessellate the bundled GeoJSON from 2.2a once at startup (`lyon`)
+      into static vertex buffers; line + fill pipelines; desaturated dark palette per docs/01.
 - [ ] 2.3 Camera (regional): Web Mercator, pan (drag) + zoom (wheel, cursor-anchored) with
       inertia; viewport→bbox exposed to the poller (M1 poller re-targets on camera settle,
       debounced 2 s).
