@@ -78,8 +78,32 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace`
       green. `crates/render/assets/basemap/README.md` documents provenance, format, and the
       regeneration command. DECISION_LOG 2.2a. Next: **2.2b**, tessellation + pipelines.)*
-- [ ] 2.2b Base map render: tessellate the bundled GeoJSON from 2.2a once at startup (`lyon`)
+- [x] 2.2b Base map render: tessellate the bundled GeoJSON from 2.2a once at startup (`lyon`)
       into static vertex buffers; line + fill pipelines; desaturated dark palette per docs/01.
+      *(2026-07-18: implemented — new `crates/render/src/basemap.rs` embeds both `GeoJSON`
+      files via `include_str!`, parses with `serde_json`, projects `[lon,lat]` → Web Mercator
+      via `core::geo::web_mercator_forward` (reused, not reimplemented), normalizes to a
+      `[-1,1]`-ish plane, and tessellates land polygons (`lyon::FillTessellator`,
+      `FillRule::NonZero` — matches RFC 7946's outer-CCW/hole-CW winding) and coastlines
+      (`StrokeTessellator`) into one static vertex/index buffer per layer, uploaded once in
+      `Renderer::new` and never rebuilt. New `crates/render/src/shaders/basemap.wgsl`: one
+      shared vertex stage (a `view_proj` uniform — a placeholder aspect-correcting
+      fit-to-window matrix for now, no camera until 2.3), one fragment stage reading a
+      per-pass `@group(1)` color uniform sourced from new `color.rs` constants (`#12161D`
+      land, `#2E3742` coastline, picked the same "ours to fix" way the `#0A0E14` background
+      was). Draw order: background clear → land fill → coastline stroke, all in one render
+      pass per docs/01. Delegated to the renderer-agent (a mid-session connection error
+      interrupted the first attempt; resumed the same agent from its transcript rather than
+      restarting cold), independently re-verified by this session: `cargo fmt --check`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run fresh
+      (**349 passed, 5 ignored, 0 failed**, matching the agent's own count), every changed/new
+      file read in full, `lyon`/`bytemuck` moved from ad-hoc inline deps into
+      `[workspace.dependencies]` to match repo convention (the one deviation found), and a
+      live `cargo run -p look-above` driven independently rather than trusting the agent's own
+      screenshots — which surfaced a real DPI-awareness pitfall in the verification tooling
+      itself (see DECISION_LOG 2.2b) before confirming a correct, symmetric, aspect-preserving
+      world map across three window sizes and a clean `WM_CLOSE` exit. DECISION_LOG 2.2b.
+      Next: **2.3**, the regional camera.)*
 - [ ] 2.3 Camera (regional): Web Mercator, pan (drag) + zoom (wheel, cursor-anchored) with
       inertia; viewport→bbox exposed to the poller (M1 poller re-targets on camera settle,
       debounced 2 s).

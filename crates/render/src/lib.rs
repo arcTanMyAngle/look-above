@@ -3,6 +3,7 @@
 //! Kept minimal in M0 (surface + clear only); the real pipeline is M2.
 //! No network and no DB access from this crate.
 
+mod basemap;
 mod color;
 mod error;
 mod renderer;

@@ -9,7 +9,10 @@ license.workspace = true
 [dependencies]
 look-above-core.workspace = true
 
+bytemuck.workspace = true
+lyon.workspace = true
 pollster.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

@@ -1333,3 +1333,76 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `crates/render/assets/basemap/README.md` records provenance, format, sizes, and the
   regeneration command. Next: **2.2b**, `lyon` tessellation + line/fill WGSL pipelines
   consuming this bundle.
+
+## 2026-07-18 — M2 item 2.2b (base map render: tessellation + fill/line pipelines)
+
+- **Reused `core::geo::web_mercator_forward` instead of a shader-side projection.**
+  Tessellation runs once, on the CPU, at startup — so lon/lat → Web Mercator metres uses the
+  same tested function `core::sim`/future camera code will (0.4's goldens already pin it),
+  rather than duplicating the formula in WGSL, where a transcription slip would be invisible
+  until the map looked subtly wrong. The result is further divided by
+  `WEB_MERCATOR_EXTENT_M` to land in a normalized `[-1, 1]`-ish plane baked into the static
+  vertex buffers; this normalization is fixed forever (it is a coordinate-system choice, not a
+  camera), unlike the view-proj uniform below.
+- **No camera exists yet (2.3), so `Renderer` carries a placeholder aspect-correcting
+  fit-to-window matrix** in the same uniform-buffer/bind-group seam `msaa_view` already uses —
+  rewritten in `reconfigure` on every resize, never rebuilt from scratch. 2.3 replaces what
+  gets written into that buffer (a real pan/zoom transform); the buffer, bind group, and pipeline
+  layout do not change. Keeping this seam explicit means 2.3 has nothing to restructure in
+  `basemap.rs` or the pipelines, only in what feeds the one matrix.
+- **`FillRule::NonZero`, not `EvenOdd` (lyon's default).** RFC 7946 and `import-basemap`'s own
+  writer (2.2a) both use outer-CCW/hole-CW winding; `NonZero` is the fill rule that rule
+  actually implies, and unlike `EvenOdd` it keeps working if two holes in one feature ever
+  overlap. Verified, not assumed: a synthetic square-with-hole test asserts no output
+  triangle's centroid falls inside the hole.
+- **Coastline stroke width (`0.0015`, in the same normalized unit space) is a judgement call,
+  not a physical one** — there is no camera/zoom yet to make "screen-space constant width"
+  meaningful, so a fixed world-space width was picked by eye against the placeholder
+  fit-to-window view and documented as revisit-worthy once 2.3 introduces zoom (a constant
+  world-space width will look wrong at high zoom; screen-space width is the eventual answer).
+- **Land/coastline palette (`#12161D` land, `#2E3742` coastline) is ours to pick**, the same
+  position `clear_color`'s `#0A0E14` background was in at M0 0.6 — docs/01/docs/13 fix the
+  *character* ("desaturated", "aircraft brightest") but not exact shades. Land sits barely
+  above the background so the coastline stroke does the real land/ocean separation, not a
+  strong fill contrast; both colors run through the same sRGB-linearize-if-needed path
+  `clear_color` established, refactored into a shared `linearize_for_format` helper.
+  `color.rs` gained a test asserting the brightness ordering background < land < coastline and
+  that the palette stays dark throughout (docs/01's "aircraft are the brightest things on
+  screen" only holds if the map itself never gets close).
+- **One shared WGSL fragment entry point reading a per-pass `@group(1)` color uniform**, rather
+  than two entry points with colors baked into the shader source — keeps `color.rs` the single
+  source of truth for the palette; two `wgpu::RenderPipeline` objects are still built (one per
+  layer) so either can diverge in blend/primitive state later without disturbing the other.
+  Both are `TriangleList`: `lyon`'s stroke tessellator already emits triangles for the
+  coastline, not a `LineList` primitive, so "line pipeline" means a pipeline for the stroked
+  line geometry, not a `PrimitiveTopology::LineList` draw.
+- **New dependency `lyon` (default features only — no `debugger`/`serialization`/`extra`) and
+  `bytemuck` (`derive`, for the vertex/uniform buffer casts), both pinned in
+  `[workspace.dependencies]`** rather than inline in `crates/render/Cargo.toml`, matching how
+  every other dependency in this workspace is declared (root Cargo.toml's own header: pins
+  live in one place, crates reference `.workspace = true`) — an inconsistency introduced mid-session
+  by the delegated implementation and corrected before this item was called done.
+  `serde_json` (already a workspace dependency) parses the bundled `GeoJSON` directly; a
+  dedicated `geojson` crate was considered and rejected as an unneeded second JSON-modeling
+  dependency for a shape this simple.
+- **Delegated to the renderer-agent** (mid-session connection error interrupted the first
+  attempt after only the `Cargo.toml` dependency additions had landed; resumed from the same
+  agent transcript rather than restarting cold, per the SendMessage-resume pattern). This
+  session independently re-verified rather than trusting the report: re-ran
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` fresh
+  (**349 passed, 5 ignored, 0 failed** — matches the agent's own count exactly this time,
+  unlike 2.1's), read every changed/new file in full, and independently drove a live
+  `cargo run -p look-above` rather than accepting the agent's own screenshots. **That live
+  check caught a real tooling pitfall worth recording**: `GetWindowRect` from a DPI-unaware
+  PowerShell process reports logical pixels, not the physical pixels the renderer actually
+  configures its surface at (winit is DPI-aware) — sizing a `PrintWindow` capture bitmap off
+  the logical rect (1295×837) against a 1920×1200 physical surface produced a capture that
+  looked like an asymmetric, cropped map, which briefly read as a possible aspect-correction
+  bug in the new matrix math. Calling `SetThreadDpiAwarenessContext(-4)` (per-monitor-v2) in
+  the capture script before any `GetWindowRect`/`MoveWindow`/`PrintWindow` call fixed it;
+  re-captured at the true physical size and every resize (1920×1200, 1600×600 wide,
+  500×1000 tall) showed correct symmetric letterboxing, no stretching, all continents
+  recognizable, coastlines crisp, clean `WM_CLOSE` exit. Worth remembering alongside M0 0.8's
+  own `FindWindow`/`MainWindowHandle` breadcrumb for any future scripted visual QA on this
+  machine. Render crate: 5 → 12 tests. Next: **2.3**, the regional camera (pan/zoom, the real
+  view-proj matrix this item's placeholder hands off to).

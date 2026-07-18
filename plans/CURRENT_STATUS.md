@@ -6,10 +6,24 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1 and 2.2a done. Plan:
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b done. Plan:
   [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.2b** — tessellate the bundled base-map `GeoJSON` (`lyon`) into
-  static vertex buffers; line + fill pipelines; desaturated dark palette per docs/01.
+- **Next action:** **M2 item 2.3** — the regional camera: Web Mercator pan (drag) + zoom
+  (wheel, cursor-anchored) with inertia; viewport→bbox exposed to the poller. Replaces 2.2b's
+  placeholder fit-to-window matrix with a real view-proj transform.
+- **2.2b landed:** the base map now actually draws — `crates/render/src/basemap.rs` tessellates
+  2.2a's bundled `GeoJSON` (`lyon`: `FillTessellator`/`NonZero` for land, `StrokeTessellator`
+  for coastlines) into static GPU buffers once at startup, reusing `core::geo::web_mercator_forward`
+  for the projection rather than duplicating it in WGSL. New `basemap.wgsl` shader, a
+  placeholder aspect-correcting view-proj uniform (2.3 replaces its contents with the real
+  camera), and a land/coastline palette in `color.rs` (`#12161D`/`#2E3742`). Delegated to the
+  renderer-agent (a connection error interrupted the first attempt mid-task; resumed the same
+  agent from its transcript), independently re-verified: fmt/clippy/test all green (349
+  passed, 5 ignored — matches the agent's count), full diff read, `lyon`/`bytemuck` moved into
+  `[workspace.dependencies]` to fix a convention deviation, and a live run confirmed a correct
+  symmetric world map across three window sizes — after a DPI-awareness bug in the
+  verification screenshot script itself briefly looked like a renderer bug (see DECISION_LOG
+  2.2b). Render crate: 5 → 12 tests. DECISION_LOG 2.2b.
 - **2.2a landed:** the base map's real Natural Earth 1:50m land + coastline data, fetched once
   and bundled as `GeoJSON` in `crates/render/assets/basemap/` (1,421 polygon / 1,429 line
   features, ~2.5 MB combined) — `render` itself never touches the network. New workspace crate
@@ -77,6 +91,52 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.2b: base map render. New `crates/render/src/basemap.rs`: embeds
+  2.2a's bundled `land.geojson`/`coastline.geojson` via `include_str!` (render stays
+  network/filesystem-free at runtime, ADR-002), parses with `serde_json` (no new `geojson`
+  dependency needed for a shape this simple), projects each `[lon, lat]` through
+  `core::geo::web_mercator_forward` — **reused from 0.4, not reimplemented in WGSL** — then
+  normalizes by `WEB_MERCATOR_EXTENT_M` into a fixed `[-1,1]`-ish plane baked into the static
+  buffers once and for all. Land polygons tessellate via `lyon::FillTessellator` with
+  `FillRule::NonZero` (matches RFC 7946's outer-CCW/hole-CW winding, unlike `EvenOdd`'s default,
+  which stops working the moment two holes in one feature overlap — proven with a synthetic
+  square-with-hole test asserting no triangle centroid lands inside the hole); coastlines via
+  `StrokeTessellator`, width `0.0015` in the same normalized space, picked by eye since there is
+  no camera/zoom yet to make a screen-space width meaningful (2.3's problem to revisit). New
+  `crates/render/src/shaders/basemap.wgsl`: one shared vertex stage reading a `view_proj`
+  uniform, one fragment stage reading a per-pass `@group(1)` color uniform — **the view-proj
+  matrix is a placeholder aspect-correcting fit-to-window transform** (no pan/zoom exists until
+  2.3), rewritten in `Renderer::reconfigure` the same way `msaa_view` already is; 2.3 replaces
+  only its *contents*, not the buffer/bind-group plumbing. New land (`#12161D`)/coastline
+  (`#2E3742`) constants in `color.rs`, picked the same "ours to fix" way `#0A0E14`'s background
+  was at M0 0.6, run through a shared `linearize_for_format` helper. Draw order per docs/01:
+  background clear → land fill → coastline stroke, one render pass. **Delegated to the
+  renderer-agent; a connection error interrupted the first attempt right after only the
+  `Cargo.toml` dependency additions had landed** — resumed the same agent via `SendMessage`
+  from its own transcript rather than restarting cold, and it completed the rest correctly.
+  This session independently re-verified rather than trusting the report (established
+  practice since 2.1): re-ran `cargo fmt --check`/`clippy --workspace --all-targets -D
+  warnings`/`test --workspace` fresh — **349 passed, 5 ignored, 0 failed**, matching the
+  agent's own reported count exactly this time — read every changed/new file in full, and
+  found one real deviation to fix: `lyon`/`bytemuck` had been added as inline-versioned deps
+  directly in `crates/render/Cargo.toml` rather than through `[workspace.dependencies]` like
+  every other dependency in this repo; moved them, re-verified green. **Independently drove a
+  live `cargo run -p look-above` rather than trusting the agent's own screenshots — and this
+  caught a real pitfall, just in the verification tooling, not the renderer**: a `PrintWindow`
+  capture sized off `GetWindowRect` from a DPI-unaware PowerShell process (1295×837 logical)
+  against the renderer's actual 1920×1200 *physical* surface produced an apparently
+  asymmetric, cropped map that briefly read as a possible bug in the new aspect-correction
+  matrix. `SetThreadDpiAwarenessContext(-4)` in the capture script before any window-geometry
+  call fixed it; re-captured at the true physical size and at two more resizes (1600×600 wide,
+  500×1000 tall) — every one showed correct symmetric letterboxing, a fully recognizable dark,
+  desaturated world map (all continents legible, Mercator's Greenland-exaggeration correctly
+  present, confirming the real projection math is running, not a naive linear one), crisp
+  coastlines, and a clean `WM_CLOSE` exit each time. Worth remembering alongside M0 0.8's own
+  `FindWindow`/`MainWindowHandle` scripting breadcrumb — logged in DECISION_LOG 2.2b for the
+  next session that scripts a visual check on this machine. Render crate: 5 → 12 tests; 349
+  total. DECISION_LOG 2.2b. Next: **2.3**, the regional camera (real pan/zoom view-proj,
+  replacing this item's placeholder).
 
 - **2026-07-18** — M2 item 2.2a: base map data. Split 2.2 into 2.2a (this item — fetch and
   bundle) and 2.2b (tessellate and render), the same shape 2.1/2.1b was split, because

@@ -56,6 +56,12 @@ winit = "=0.30.13"
 # wgpu's setup calls are async; ADR-005 bars async from `render`. This drives those two
 # futures to completion on the calling thread and pulls in nothing else. See DECISION_LOG.
 pollster = "1.0.1"
+# render: base-map polygon/line tessellation (M2 item 2.2b). Default features only — no
+# debugger/serialization/profiling, none of which this crate needs.
+lyon = "1.0.19"
+# render: casts basemap/uniform data to the byte slices wgpu's buffer-upload calls want.
+# `derive` for the `Pod`/`Zeroable` impls on this crate's own vertex/uniform structs.
+bytemuck = { version = "1.25.1", features = ["derive"] }
 
 # app only.
 anyhow = "1.0.103"
