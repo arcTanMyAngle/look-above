@@ -3,15 +3,30 @@
 > The single source of truth for "where are we". Every session reads this first and updates
 > it last. Keep the Now section ≤ 10 lines; move history to the log below.
 
-## Now (updated 2026-07-17)
+## Now (updated 2026-07-18)
 
-- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.10
-  done; 313 tests green (5 live tests `#[ignore]`d). Plan:
+- **Phase:** **M1 open** (owner call, with the M0 gate at 6/7 — see below). Items 1.1–1.11
+  done; 329 tests green (5 live tests `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.11** — `store`: migrations 0001 (aircraft, source_status) +
-  writer-thread skeleton; the poller updates `source_status` (last_success/error,
-  credits_used_today). This is the first `store` crate code and what rehydrates 1.7's
-  `CreditLedger` via `CreditLedger::restored`; watch the single-writer-thread seam (docs/08).
+- **Next action:** **M1 item 1.12** — headless mode: `look-above --headless` logs per-cycle
+  counts (new/updated/stale, credits spent) — the M1 gate evidence tool. This is the first
+  item that wires the poller's `PollBatch` channel into a running consumer in `app`, and the
+  natural point to also drive 1.11's `Writer` from a live poll loop (source_status updates)
+  and rehydrate `CreditLedger` via `CreditLedger::restored` at startup — neither is wired yet.
+- **1.11 store landed:** `crates/store`'s first real code — `migrations::apply` (numbered,
+  embedded, `user_version`-tracked, idempotent-by-version) + migration 0001 (`aircraft`,
+  `source_status` only — docs/08's other tables land at their own M3/M5 migrations) +
+  `writer::Writer`, the single-writer-thread skeleton: one `Command` enum behind one
+  `crossbeam` channel, a dedicated thread owning the one connection. **`core::contracts::Store`
+  is deliberately not implemented yet** — its other methods need tables (`positions`,
+  `airports`) that don't exist until later milestones; `Writer`'s inherent API (`record_success`/
+  `record_error`/`source_status`) is scoped to exactly what 0001 backs. Dependency direction
+  verified from `Cargo.toml` (store → core only, no `ingest` edge), so the API takes plain
+  `SourceId`/`UnixSeconds`/`u32`/`String` rather than `ingest::poller::PollBatch` or
+  `ingest::budget::CreditLedger` — the `credits_used_today` readback is exactly the value
+  `CreditLedger::restored` will take once something calls it (that wiring is 1.12+, not this
+  item). 16 new tests incl. an on-disk WAL smoke test (`:memory:` can't prove WAL; on-disk can).
+  329 tests, fmt/clippy/test green — re-verified independently this session. DECISION_LOG 1.11.
 - **1.10 recorder landed:** `scripts/record_fixture.rs` — a `[[bin]]` of `ingest` (out-of-package
   `path`), the one sanctioned live fetch besides the app. Fetches through the real
   `HttpClient`/OpenSky auth/endpoint constants (a recording goes out exactly as a poll would),
@@ -63,7 +78,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.10 done | — |
+| M1 | in progress — 1.1–1.11 done | — |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -82,6 +97,50 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M1 item 1.11: `store` migrations + writer-thread skeleton. New
+  `crates/store` code (the crate's first): `migrations::apply` (numbered, `include_str!`-embedded
+  SQL, `PRAGMA user_version`-tracked, idempotent-by-version — each migration's DDL and version
+  bump commit together in one `BEGIN IMMEDIATE … COMMIT`) plus migration 0001, which creates
+  **only** `aircraft` and `source_status` — verbatim from docs/08, whose other tables
+  (`positions`/`flights`/`airports`/`runways`/`airlines`/`metars`) are each tagged with a later
+  milestone there and land as their own append-only migrations when needed, not ahead of time.
+  `writer::Writer` is the single-writer-thread skeleton docs/08 calls for: a cheap-to-clone
+  channel handle over one `Command` enum (`RecordSuccess`/`RecordError`/`SourceStatus`, each with
+  its own one-shot reply channel) behind one `crossbeam` `Sender`, with a dedicated OS thread
+  owning the sole `rusqlite::Connection` and draining commands until every `Writer` clone is
+  dropped. `Writer::open` runs migrations synchronously before spawning the thread, so a broken
+  database surfaces as an `Err` to the caller instead of silently killing an unwatched thread.
+  **`core::contracts::Store` is deliberately not implemented yet**: its `insert_positions`/
+  `airports_in_bbox`/`prune` each need a table (`positions`/`airports`) that doesn't exist until
+  M3/M5 migrations land, so implementing the trait now would mean methods that can't work —
+  `Writer`'s inherent API is scoped to exactly what 0001 backs, and wiring `Store` for real is a
+  future item, noted so it isn't mistaken for an oversight. **Dependency direction verified from
+  `Cargo.toml` directly** (not `cargo tree`, per CLAUDE.md): `store` depends on `core` only, so
+  `record_success`/`record_error` take plain `SourceId`/`UnixSeconds`/`u32`/`String` — never
+  `ingest::poller::PollBatch` — and `source_status` returns a `store`-local `SourceStatus`, never
+  `ingest::budget::CreditLedger`. That readback's `credits_used_today` is exactly the `spent`
+  argument `CreditLedger::restored(spent, now)` (item 1.7) takes; `restored` already discards a
+  stale persisted day on its own, so `store` carries no UTC-day-rollover logic at all — the actual
+  restore call is `ingest`/`app` wiring, still to come. **Each verb owns exactly its own
+  columns**: `record_success` upserts only `last_success`/`credits_used_today`, `record_error`
+  only `last_error`/`last_error_msg`, so a success after a prior error (or vice versa) never
+  erases the other — proven both directions. `source` is the table's primary key, so a repeat
+  write for one source overwrites rather than duplicating (tested). **Wiring an actual running
+  `Writer` from the poller's channel inside `app` is out of scope here** — `app` doesn't consume
+  `PollBatch` yet; that starts at 1.12. **The on-disk WAL smoke test is the one place WAL is
+  actually checked**: `SQLite`'s `:memory:` can't use WAL at all, so `open_connection` requests it
+  unconditionally without asserting it took in the in-memory tests; a dedicated on-disk test
+  (temp file, `Drop`-guard cleanup that also removes `-wal`/`-shm`/`-journal` siblings) confirms
+  `journal_mode` reads back `wal` for real. Work was delegated to the `storage-agent`; this
+  session independently re-ran `cargo fmt --check`/`clippy --workspace --all-targets -D
+  warnings`/`test --workspace` rather than taking the agent's word, and read every new file.
+  16 new tests (4 on the migration runner + 1 trust-`user_version`-not-a-table-probe edge case, 6
+  on the upsert semantics against a raw connection, 5 through the real channel/thread, 1 on-disk
+  WAL smoke test). 329 tests total (43 app, 71 core, 180 ingest, 9 `record_fixture` bin, 5
+  render, 16 store), 5 live ignored; fmt/clippy/test green. DECISION_LOG 1.11. Next: **1.12**,
+  headless mode (`--headless` per-cycle counts — the M1 gate evidence tool, and the first item
+  that actually wires a running poller loop to a live `Writer`).
 
 - **2026-07-17** — M1 item 1.10: the fixture recorder. New `scripts/record_fixture.rs`, wired
   as a `[[bin]]` of `ingest` from the repo-root `scripts/` the docs name (out-of-package

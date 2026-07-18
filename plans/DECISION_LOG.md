@@ -989,3 +989,79 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   16 real aircraft over Switzerland, wrote a valid trimmed `{ac, now, …}` file, printed only the
   count — checked structurally (never by printing values) and deleted. 313 tests total (the 9 in
   the new bin target), fmt/clippy/test green. Next: **1.11**, `store` migrations + writer thread.
+
+## 2026-07-18 — M1 item 1.11 (`store`: migrations + writer-thread skeleton)
+
+- **`crates/store`'s first real code.** `migrations::apply` — numbered SQL, `include_str!`-embedded
+  (so the compiled binary is self-contained; no `migrations/` directory ships alongside it),
+  progress tracked in `SQLite`'s own `PRAGMA user_version`. Each migration's DDL and its version
+  bump commit together inside one `BEGIN IMMEDIATE … COMMIT`, so a crash mid-migration can never
+  leave `user_version` ahead of the schema it claims, and `BEGIN IMMEDIATE` claims the write lock
+  up front rather than on the first statement, so a concurrent reader can never observe a
+  half-applied migration. A migration whose version is `<=` the connection's current
+  `user_version` is skipped, which is what makes re-running `apply` against an already-migrated
+  database a no-op rather than a "table already exists" error (docs/10 §3's "idempotent-by-version"
+  requirement) — and it trusts `user_version`, not a live `sqlite_master` probe, so a connection
+  that already *claims* the latest version has nothing re-run even if (hypothetically) its tables
+  were missing.
+- **Migration 0001 creates only `aircraft` and `source_status` — verbatim from docs/08, comments
+  included.** docs/08 tags every other table in its eventual schema (`positions`, `flights`,
+  `airports`, `runways`, `airlines`, `metars`) with its own later milestone (M3/M5), and migrations
+  are append-only ("never edit a shipped migration"), so creating them now would mean a table with
+  nothing to populate until a future item anyway. The doc and the migration file must never drift —
+  a schema change updates both in the same commit, same as any other doc-is-contract rule here.
+- **`core::contracts::Store` is deliberately not implemented yet.** Its four methods
+  (`insert_positions`, `upsert_aircraft_meta`, `airports_in_bbox`, `prune`) each need a table
+  (`positions`, `airports`) migration 0001 doesn't create — implementing the trait now would mean
+  methods that can't work against the schema that exists. Instead `writer::Writer` is a concrete,
+  non-trait handle scoped to exactly what 0001 backs: recording a poll cycle's outcome against
+  `source_status`, and reading it back. Wiring `Store` for real is a future item once
+  `positions`/`airports` land — recorded here so it isn't mistaken for an oversight.
+- **The writer-thread skeleton is one `Command` enum behind one channel, not a channel per
+  operation.** `Writer` is a cheap-to-clone handle (`Sender<Command>`); a dedicated OS thread owns
+  the one `rusqlite::Connection` and drains the channel until every clone is dropped. Each command
+  carries its own one-shot `bounded(1)` reply channel, which is what keeps every public `Writer`
+  method synchronous (docs/09: "Sync API; called from the writer thread only" — the *callers* are
+  sync, the thread is the one place `SQLite` is touched) while still letting the command set grow
+  later (`positions`/`airports` commands, once those tables exist) without changing `Writer`'s
+  public shape. `Writer::open` runs migrations synchronously on the caller's thread *before*
+  spawning the writer thread, so a broken/corrupt database is reported to the caller as an `Err`
+  rather than silently killing a detached thread nobody is watching.
+- **Dependency direction verified, not assumed**: `crates/store/Cargo.toml` depends on
+  `look-above-core` only (plus `crossbeam-channel`/`rusqlite`/`thiserror`/`tracing`, none of them
+  workspace crates) — checked by reading the manifest directly per CLAUDE.md's "don't use `cargo
+  tree`" rule, not inferred. That is what forces `Writer`'s API shape: `record_success`/
+  `record_error` take plain `SourceId`/`UnixSeconds`/`u32`/`String`, never
+  `ingest::poller::PollBatch`, and `source_status` returns a `store`-local `SourceStatus`, never
+  `ingest::budget::CreditLedger`. The actual `CreditLedger::restored(spent, now)` call (1.7) happens
+  in `ingest`/`app` wiring, a later item — `store` only stores and returns the raw counter it's
+  given. `restored` already tolerates a stale persisted value (it compares day index against `now`
+  and treats an earlier day as zero), so `store` carries no notion of UTC-day rollover at all.
+- **Each verb owns exactly its own columns.** `record_success` upserts only
+  `last_success`/`credits_used_today`; `record_error` upserts only
+  `last_error`/`last_error_msg`. A success after a prior error doesn't erase the error record (or
+  vice versa) — each write only touches the columns that verb is responsible for, proven by
+  round-trip tests in both orders. `source` is `source_status`'s primary key, so a repeat write for
+  the same source overwrites the row rather than duplicating it (also tested).
+- **App/poller wiring is explicitly out of scope here.** `crates/app` doesn't consume `PollBatch`
+  yet, so there is no running loop to feed a live `Writer` from; that lands at 1.12 (headless mode)
+  or later. This item's deliverable is the `store`-crate capability alone, exercised by its own
+  tests.
+- **The on-disk WAL smoke test is the one place WAL is actually checked**: `SQLite`'s `:memory:`
+  connections cannot use WAL (there is no shared file to write one against), so `open_connection`
+  requests `journal_mode = WAL` unconditionally without asserting it took — the in-memory tests
+  never could prove it. A dedicated on-disk test (temp file, cleaned up via a `Drop` guard that
+  also removes the `-wal`/`-shm`/`-journal` side files even on a failed assertion) opens a real
+  connection and reads `journal_mode` back, confirming it is genuinely `wal`.
+- **Verification.** 16 new tests: 4 on the migration runner (fresh DB starts at version 0; apply
+  reaches the latest version; apply creates exactly the two tables 0001 owns and no others;
+  re-applying is a no-op) plus one edge case proving `apply` trusts `user_version` over a live
+  table probe; 6 directly against a migrated connection for the upsert semantics (unrecorded source
+  reads `None`; success round-trips; error round-trips without touching `credits_used_today`; a
+  later success doesn't erase an earlier error; a second success overwrites rather than duplicating;
+  independent sources get independent rows); 5 through the real `Writer` channel/thread (open +
+  immediately usable, success end-to-end, error end-to-end, cloned handles share one thread and
+  database); 1 on-disk WAL smoke test. 329 tests total (43 app, 71 core, 180 ingest, 9
+  `record_fixture` bin, 5 render, 16 store), 5 live ignored; fmt/clippy/test green — independently
+  re-run, not just taken on the implementing agent's word. Next: **1.12**, headless mode (the
+  `--headless` per-cycle counts readout — the M1 gate evidence tool).

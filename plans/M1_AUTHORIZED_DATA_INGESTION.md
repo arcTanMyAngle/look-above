@@ -172,8 +172,36 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       → 16 real aircraft, valid trimmed file, count-only output, checked structurally and deleted).
       313 tests, fmt/clippy/test green. `Box<dyn Error>` not `anyhow` (that stays in `app`). READMEs
       (root + three fixture) updated with the command and the re-record caveat. DECISION_LOG 1.10.)*
-- [ ] 1.11 `store`: migrations 0001 (aircraft, source_status) + writer thread skeleton;
+- [x] 1.11 `store`: migrations 0001 (aircraft, source_status) + writer thread skeleton;
       poller updates source_status (last_success/error, credits_used_today).
+      *(2026-07-18: done — `crates/store`'s first real code. `migrations::apply` (numbered,
+      `include_str!`-embedded SQL, `PRAGMA user_version`-tracked, idempotent-by-version) plus
+      migration 0001, which creates **only** `aircraft` and `source_status` — the rest of
+      docs/08's schema (`positions`/`flights`/`airports`/`runways`/`airlines`/`metars`) is each
+      tagged with its own later milestone there, and migrations are append-only, so nothing
+      landed ahead of the point it's used. `writer::Writer` is the single-writer-thread skeleton
+      (docs/08): a cheap-to-clone channel handle over one `Command` enum
+      (`RecordSuccess`/`RecordError`/`SourceStatus`) behind one `crossbeam` `Sender`, so a later
+      item can add `positions`/`airports` commands without changing `Writer`'s shape. `Writer::open`
+      runs migrations synchronously before spawning the thread, so a broken DB surfaces to the
+      caller instead of silently killing an unwatched thread. **`core::contracts::Store` is
+      deliberately not implemented yet** — `insert_positions`/`airports_in_bbox`/`prune` need
+      tables that don't exist until M3/M5; `Writer`'s inherent API is scoped to exactly what
+      migration 0001 backs. **Dependency direction held**: `store` depends on `core` only (verified
+      against `Cargo.toml`, not `cargo tree` per CLAUDE.md) — no `look-above-ingest` edge, so
+      `record_success`/`record_error` take plain `SourceId`/`UnixSeconds`/`u32`/`String`, never
+      `ingest::poller::PollBatch`. `record_success` upserts only `last_success`/`credits_used_today`;
+      `record_error` only `last_error`/`last_error_msg` — each verb owns its own columns, so an
+      error after a success (or vice versa) never erases the other. `source_status`'s
+      `credits_used_today` readback is exactly the `spent` argument `ingest::budget::CreditLedger::
+      restored` takes; `store` carries no notion of UTC-day rollover itself since `restored`
+      already discards a stale persisted day. Actually wiring the poller's channel into a running
+      `Writer` inside `app` is out of scope here (no `PollBatch` consumer exists yet) — that's
+      1.12 or later. 16 new tests (9 migrations + writer upsert/readback logic directly against a
+      connection, 7 through the real channel/thread, one on-disk WAL smoke test confirming
+      `journal_mode` is actually `wal` — `:memory:` can't be, so that's the one place it's
+      checked). 329 tests (43 app, 71 core, 180 ingest, 9 `record_fixture` bin, 5 render, 16
+      store), 5 live ignored; fmt/clippy/test green. Rationale in DECISION_LOG.)*
 - [ ] 1.12 Headless mode: `look-above --headless` logs per-cycle counts (new/updated/stale,
       credits spent) — the M1 gate evidence tool.
 - [ ] 1.13 Gate: 10-min supervised live run per acceptance §M1; record numbers; human review.

@@ -1377,6 +1377,7 @@ dependencies = [
 name = "look-above-store"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "look-above-core",
  "rusqlite",
  "thiserror 2.0.18",
