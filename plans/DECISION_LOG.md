@@ -1133,3 +1133,49 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   `look_above.db` created by the live runs was deleted afterward (gitignored; not evidence
   worth keeping past the session). Next: **1.13**, the M1 gate — a 10-min supervised live run
   per acceptance §M1, numbers recorded, human review.
+
+## 2026-07-18 — M1 item 1.13: the gate (run, not fully closed)
+
+- **A real conflict surfaced before the run started, and was put to the owner rather than
+  guessed at.** This item's own checklist line (M1 plan) scopes the run to 10 minutes;
+  acceptance §M1's first line requires the OAuth2 token auto-refresh be "observed across a
+  > 30 min run" — and checking 1.3's live test (`live_opensky_issues_a_usable_bearer_token`)
+  confirmed it only ever fetched *one* token and asserted the refresh-schedule *arithmetic*
+  against its real TTL; it never stayed connected long enough to watch an actual second fetch
+  happen. So no prior work covers that acceptance line, and a literal 10-minute run cannot
+  either. Asked the owner directly (CLAUDE.md: stop and ask rather than guess at a
+  plan/acceptance-doc conflict); **the owner chose the checklist's literal 10-min scope**,
+  accepting that the token-refresh line stays open. This is the same shape as M0's gate: a
+  gate can be *run* and recorded honestly short of a full pass.
+- **Result: 6 of 7 acceptance §M1 lines met.** Full per-line evidence lives in the M1 plan's
+  1.13 entry; the open line is the token-refresh one above, carried forward exactly as M0
+  carried its badge line.
+- **The run's aggressive cadence (~5.8 s/cycle, the floor) is explained, not a bug.** The
+  ledger started fresh (no `source_status` row existed — the prior session's scratch DB had
+  been deleted) at 21:35 UTC, so `prorated_target` spread a full 3,200-credit budget over the
+  ~2.4 h left in the UTC day and landed near the 5 s floor. This is the cadence controller
+  working as designed (1.7): the **hard `can_afford` cap**, not the cadence, is what actually
+  bounds the 80% line, and 196/3,200 credits spent (6.1%) over the run shows it never needed
+  to engage. Worth flagging for whoever reads this later: unchanged, this cadence would hit
+  the 3,200 cap roughly 2.8 h into a day started this way, then legitimately idle — expected,
+  not a failure mode.
+- **Corrected count for the record: the tests total is 329, not "334" as 1.12's own entry
+  computed.** 1.12 stated "334 tests total (46 app, 71 core, 182 ingest, 9 record_fixture bin,
+  5 render, 16 store)" — those six figures sum to 329; `cargo test --workspace`, re-run for
+  this gate, independently confirms **329 passed, 5 ignored, 0 failed**. Recorded here rather
+  than silently editing 1.12's entry (append-only log) or repeating the arithmetic slip.
+- **The three live "transient source failure" WARNs mid-run were treated as evidence, not
+  noise.** Real network hiccups (streak 1 → recovered, streak 1 → streak 2 → recovered) never
+  reached `TRANSIENT_FAILOVER_THRESHOLD` (3), so retry/backoff was observed live end-to-end
+  without a full failover — the failover-and-recovery path itself stays evidenced by 1.8's own
+  dedicated live test (OpenSky forcibly disabled → real fallback batch), combined here rather
+  than re-proven, since forcing a failover in this run would have meant deliberately disabling
+  the credentials mid-gate, which the checklist doesn't ask for.
+- **Scratch artifacts deleted after recording, following 1.12's precedent.** `look_above.db`
+  (gitignored) and the raw `qa/gate_1.13/run.log` (gitignored) are not evidence worth keeping
+  past the session — the numbers they proved are in this entry and the M1 plan instead.
+- **Verification:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
+  `cargo test --workspace` all green (329 passed, 5 ignored, 0 failed) — run fresh for this
+  gate, not assumed from 1.12. No code changed by this item. Next: **human review** of the
+  open token-refresh line; M2 does not start until the owner closes or explicitly carries it,
+  per CLAUDE.md's milestone-gate rule.

@@ -242,7 +242,40 @@ and the [authorized-aviation-sources skill](../.claude/skills/authorized-aviatio
       credentials()` was `#[allow(dead_code)]` since 1.3 with a comment saying the poller
       would reach it "in item 1.4" — it never did until now; the attribute and the stale
       comment are gone. DECISION_LOG 1.12.)*
-- [ ] 1.13 Gate: 10-min supervised live run per acceptance §M1; record numbers; human review.
+- [x] 1.13 Gate: 10-min supervised live run per acceptance §M1; record numbers; human review.
+      *(2026-07-18: run, not fully passed — **6 of 7 acceptance §M1 lines met**, evidence
+      below; recorded as gate-run per CURRENT_STATUS's convention (the same "run, not passed"
+      framing M0's 0.8 used), not closed. Live `look-above --headless` against the owner's real
+      `credentials.json`, 2026-07-18T21:35:35Z–21:45:55Z (**620 s = 10 min 20 s continuous**,
+      exceeding the 10-min floor), killed by a supervising `timeout` wrapper, not a crash. **98
+      poll cycles**, all `source=opensky` (2 credits each, the bbox's documented middle tier).
+      **Credit budgeting: pass** — `spent_today` climbed 2→196 over the run, 196/3200 = 6.1%,
+      well inside the 80% line; `source_status` write never warned failure (no "could not
+      record source_status" line). Cadence sat near the 5 s floor throughout (~5.8 s/cycle) —
+      expected, not a bug: the ledger started fresh this run and the UTC day had only ~2.4 h
+      left, so `prorated_target`'s even-spread of a full 3200-credit budget over a short
+      remaining window computes near the floor; the **hard `can_afford` cap**, not the cadence,
+      is what actually protects the 80% line, and did not need to engage this run. **Dedup:
+      pass** — `SessionTable` structurally forbids duplicate `icao24` (unit-tested at 1.9) and
+      this run's own new/updated/dropped counts move together plausibly cycle to cycle,
+      including a few clustered-drop cycles where a whole batch wasn't newer than what was
+      held — dedup visibly exercised on real timestamps, not just fixtures. **Fallback/failover:
+      pass by combined evidence** — this run never triggered a full failover (three transient
+      network-send WARNs occurred, at streak 1–2, each self-healed before the 3-in-a-row
+      threshold), which is retry/backoff working correctly on a real hiccup rather than a gap;
+      the full failover-and-recovery path was already live-verified independently at 1.8
+      (OpenSky disabled → real fallback batch). **Fixture tests: pass** — `cargo test
+      --workspace`: 329 passed, 5 ignored (the live/credentialed tests, by design), 0 failed;
+      `fmt --check` and `clippy --workspace --all-targets -D warnings` both clean. **Anonymity
+      sticky: pass** — via the existing 1.9 regression test; headless doesn't log per-cycle
+      anonymity so this run adds no new live evidence for that line, doesn't need to. **10 min
+      / zero panics / zero rate-limit: pass** — 620 s continuous, 0 panics, 0 "429"/RateLimited
+      anywhere in the log. **Open: the OAuth2 token-refresh line** ("observed across a > 30 min
+      run") — the owner chose the checklist's literal 10-min scope over extending the run to
+      cover it (asked directly; a genuine conflict between this item's own wording and
+      acceptance §M1's first line, since 1.3's live test only validated the refresh *schedule*
+      arithmetic on a single fetched token, never an actual second live fetch happening 24 min
+      later). Carried forward, same shape as M0's badge-line gap. DECISION_LOG 1.13.)*
 
 ## Design notes
 

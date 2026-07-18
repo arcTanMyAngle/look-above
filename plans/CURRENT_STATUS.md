@@ -5,22 +5,30 @@
 
 ## Now (updated 2026-07-18)
 
-- **Phase:** **M1 open** (owner call, M0 gate at 6/7 — see below). Items 1.1–1.12 done; 334
+- **Phase:** **M1 checklist complete (1.1–1.13); gate run, not fully closed — 6/7.** 329
   tests green (5 live `#[ignore]`d). Plan:
   [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md)
-- **Next action:** **M1 item 1.13**, the gate — a 10-min supervised live run of
-  `look-above --headless` (1.12) per acceptance §M1; record the numbers; human review. Last
-  M1 checklist item.
+- **Next action:** **human review** of 1.13's open gate line (OAuth2 token-refresh, needs a
+  > 30 min observed run — see below), then owner decides whether to close M1 as-is or extend
+  the run. M2 does not start until that call is made (CLAUDE.md milestone-gate rule).
+- **1.13 gate run (2026-07-18):** 10 min 20 s live `look-above --headless` against the
+  owner's real `credentials.json`, 98 poll cycles, 0 panics, 0 429s/rate-limit hits, 196/3,200
+  credits spent (6.1%, well under the 80% line), dedup and retry/backoff both observed live on
+  real data. **6 of 7 acceptance §M1 lines pass**; the seventh (token auto-refresh "observed
+  across a > 30 min run") stays **open** — the owner was asked and chose the checklist's
+  literal 10-min scope over extending the run to cover it. Full per-line evidence: M1 plan
+  1.13, DECISION_LOG 1.13. Same shape as M0's gate: recorded honestly short of a full pass,
+  not silently marked done.
 - **1.12 headless mode landed:** `app::headless` + `--headless` run the poller, merge, and
   store writer together as one process for the first time, closing 1.7's ledger-restore seam
-  and 1.11's writer-wiring gap. Verified live against real OpenSky auth: dedup and credit
-  spend both carried correctly across a restart. `record_error` stays unwired (the poller's
-  channel never carries a failure) — carried forward, not an oversight. DECISION_LOG 1.12.
+  and 1.11's writer-wiring gap. `record_error` stays unwired (the poller's channel never
+  carries a failure) — carried forward, not an oversight. DECISION_LOG 1.12.
 - **Blockers:** the owner must rename the repo `look_above` → `look-above`, then push (no SSH
   key on this machine) — CI has never run; M0's one unmet gate line.
   [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1.
-- **Credit spend to date: 7 of 4,000/day** (1 from 1.4's live test, 6 from verifying 1.12's
-  headless pipeline live). Every automatic test stays a mock; only these two items have spent.
+- **Credit spend to date: 203 of 4,000/day** (1 from 1.4's live test, 6 from 1.12's headless
+  verification, 196 from 1.13's gate run — all on 2026-07-18; the ledger resets daily, so this
+  is today's running total, not cumulative across days).
 - **⚠ Carried to M3:** `anonymous` catches only the no-callsign half of privacy rule 2.2 — a
   PIA hex broadcasting a callsign needs FAA range data not yet available. DECISION_LOG 1.4.
 
@@ -29,7 +37,7 @@
 | Milestone | Status | Evidence |
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
-| M1 | in progress — 1.1–1.12 done | — |
+| M1 | **gate run 2026-07-18 — 6/7; token-refresh line open, owner-accepted** | M1 plan 1.13 |
 | M2 | not started | — |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
@@ -48,6 +56,31 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M1 item 1.13: the gate, run but not fully closed. Found a real conflict
+  before running anything: this item's own checklist line says "10-min supervised live run",
+  but acceptance §M1's first line needs the OAuth2 token auto-refresh "observed across a
+  > 30 min run" — and 1.3's live test never actually watched a second token fetch happen, only
+  the refresh-schedule math on one fetched token, so nothing prior covers that line. Asked the
+  owner rather than guessing; **owner chose the literal 10-min scope**, accepting that line
+  stays open. Ran `look-above --headless` live against the owner's real `credentials.json` for
+  10 min 20 s (98 poll cycles, all `source=opensky`): **0 panics, 0 429s/rate-limit hits,
+  196/3,200 credits spent (6.1%, well under the 80% cap)**, dedup visibly active in the
+  new/updated/dropped counts across cycles, and three real transient network WARNs that
+  self-healed via retry/backoff without ever reaching the 3-in-a-row failover threshold — full
+  failover-and-recovery itself stays evidenced by 1.8's own dedicated live test rather than
+  re-forced here. The aggressive ~5.8 s/cycle cadence (the floor) is the cadence controller
+  working as designed: the ledger started fresh late in the UTC day, so `prorated_target`
+  spread the whole 3,200-credit budget over a short remaining window — the **hard `can_afford`
+  cap**, not the cadence, is what actually protects the 80% line, and didn't need to engage.
+  `cargo fmt --check`/`clippy --all-targets -D warnings`/`test --workspace` all green, re-run
+  fresh for this gate: **329 passed, 5 ignored, 0 failed** (corrected from 1.12's own entry,
+  which stated "334" but whose six per-crate figures actually summed to 329 — noted rather
+  than silently fixed, the log is append-only). **Result: 6 of 7 acceptance §M1 lines pass**;
+  the token-refresh line is the one open item, carried forward the same way M0 carried its
+  badge line. Scratch `look_above.db` and the raw run log were deleted after the numbers were
+  recorded here, following 1.12's precedent. DECISION_LOG 1.13. Next: **human review** of the
+  open line; M2 waits on that call.
 
 - **2026-07-18** — M1 item 1.12: headless mode. New `app::headless` (`headless::run`) plus a
   `--headless` CLI switch in `main.rs` (`parse_args`/`parse_args_from`; any other argument is a
