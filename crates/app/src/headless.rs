@@ -21,15 +21,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use crossbeam_channel::unbounded;
 use look_above_core::contracts::RegionQuery;
-use look_above_core::merge::{STALE_AFTER_S, SessionTable};
+use look_above_core::merge::SessionTable;
 use look_above_core::types::{BBox, SourceId};
 use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::opensky::OpenSkyAuth;
-use look_above_ingest::poller::{PRIMARY, PollBatch, Poller, SystemWallClock, WallClock};
+use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
 use look_above_store::Writer;
+use tokio::sync::watch;
 
 use crate::config::Config;
+use crate::pipeline::record_cycle;
 
 /// M1's fixed poll region, since regions are not yet camera-driven (M2/M4): a ~530×555 km box
 /// centered on the Alps, big enough to match acceptance §M1's "~500×500 km bbox" credit-budget
@@ -54,8 +56,13 @@ pub fn run(config: &Config) -> Result<()> {
     let query = RegionQuery::region(bbox);
     let clock: Arc<dyn WallClock> = Arc::new(SystemWallClock);
 
+    // Headless mode's region never changes, so the retarget sender is dropped immediately —
+    // per `ingest::poller`'s own doc, a closed channel just falls back to a fixed cadence,
+    // which is exactly headless mode's fixed-region behavior anyway.
+    let (_retarget_tx, retarget_rx) = watch::channel(query);
     let (sender, receiver) = unbounded();
-    let mut poller = Poller::with_default_chain(client, auth, query, sender, Arc::clone(&clock));
+    let mut poller =
+        Poller::with_default_chain(client, auth, retarget_rx, sender, Arc::clone(&clock));
 
     // Item 1.7's seam, closed here: seed the primary's ledger from what was already spent
     // today, so a restart does not get a full budget back for free. A read failure is not
@@ -97,31 +104,4 @@ pub fn run(config: &Config) -> Result<()> {
 
     tracing::warn!("poll loop stopped unexpectedly (channel closed); headless mode exiting");
     Ok(())
-}
-
-/// Merges one [`PollBatch`] into the session's live picture, logs the cycle's counts, and
-/// persists the source's success against `source_status`.
-///
-/// A write failure is logged, not propagated — the pipeline itself is healthy (a batch just
-/// arrived), and stopping the whole loop over one persistence hiccup would lose every cycle
-/// after it, not just this one.
-fn record_cycle(writer: &Writer, table: &mut SessionTable, batch: &PollBatch) {
-    let stats = table.merge(&batch.states);
-    let stale = table.stale_count(batch.fetched_at, STALE_AFTER_S);
-
-    tracing::info!(
-        source = %batch.source,
-        new = stats.new,
-        updated = stats.updated,
-        dropped = stats.dropped,
-        stale,
-        tracked = table.len(),
-        credits_spent = batch.credits_spent,
-        spent_today = batch.spent_today,
-        "poll cycle"
-    );
-
-    if let Err(error) = writer.record_success(batch.source, batch.fetched_at, batch.spent_today) {
-        tracing::warn!(%error, source = %batch.source, "could not record source_status");
-    }
 }

@@ -152,10 +152,29 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       both axes, no seams/cracks/missing polygons at any point (docs/13's L2-core pan/zoom-
       inertia line), and the resize reflowed without distortion. DECISION_LOG 2.3a. Next:
       **2.3b**, viewport→bbox exposed to the poller.)*
-- [ ] 2.3b Viewport→bbox exposed to the poller: `ingest::poller` gains a way to retarget its
+- [x] 2.3b Viewport→bbox exposed to the poller: `ingest::poller` gains a way to retarget its
       `RegionQuery` while running; window mode (currently render-only, no ingest pipeline at
       all) starts the poller against the camera's current viewport bbox and retargets on
       camera settle, debounced 2 s. Depends on 2.3a.
+      *(2026-07-18: implemented — new `core::camera::Camera::viewport_bbox() -> BBox`
+      (clamped into the valid Mercator/lat-lon domain so an overflowing or off-world viewport
+      still yields a constructible, non-inverted `BBox`); `ingest::poller::Poller::new`/
+      `with_default_chain` now take a `tokio::sync::watch::Receiver<RegionQuery>` instead of a
+      fixed `RegionQuery`, and `run()` races its cadence sleep against the channel so a retarget
+      takes effect on the very next cycle, not after waiting out up to `MAX_INTERVAL`; window
+      mode (`app::window`) now opens the same `store::Writer`/`HttpClient`/`OpenSkyAuth`/
+      `Poller`/ledger-restore pipeline headless mode does (merge+log+persist extracted to shared
+      `app::pipeline::record_cycle`), seeded from the camera's initial `viewport_bbox()` and
+      retargeted once the camera has sat still for 2 s on a bbox that differs from whichever was
+      last sent — including on a plain window resize with no pan/zoom, closing a gap this
+      session's own re-verification found and fixed after the delegated implementation. Three
+      lane-scoped pieces (this session for `core::camera`, data-source-agent for `ingest`,
+      renderer-agent for `app`, sequential since each needed the previous one's finished
+      signature); independently re-verified rather than trusted (full diffs read, fresh
+      `fmt`/`clippy --all-targets -D warnings`/`test --workspace` — **375 passed, 5 ignored, 0
+      failed**) and live-driven against the owner's real OpenSky credentials, confirming both
+      the initial fetch and five real mid-run retargets with distinct bboxes. DECISION_LOG
+      2.3b. Next: **2.4**, `core::sim`.)*
 - [ ] 2.4 `core::sim`: interpolation/dead-reckoning worker — rayon over the live aircraft
       table at render cadence; destination-point advance from last fix (speed/track/vert
       rate); ease-out correction blend (≤ 2 s) on new fix; stale fade (60 s + 5 s); writes

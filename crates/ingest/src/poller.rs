@@ -33,6 +33,17 @@
 //! deliberately not a failover: the fallbacks are for *failures*, and a primary that is merely
 //! rationing its budget is not one (see the module note in `budget`).
 //!
+//! **Retargeting.** The region is not fixed for the run: [`Poller::new`] and
+//! [`Poller::with_default_chain`] take a [`watch::Receiver<RegionQuery>`](tokio::sync::watch),
+//! and a caller keeps the paired [`watch::Sender`](tokio::sync::watch::Sender) to `.send` a new
+//! region at any point while [`run`](Poller::run) is looping — the app's window mode driving it
+//! from the camera viewport. [`run`](Poller::run)'s loop races that channel against its own
+//! cadence sleep so a retarget takes effect on the very next cycle, not after waiting out up to
+//! [`MAX_INTERVAL`] (a real 60 s at `OpenSky`'s slowest, which would make a camera pan feel
+//! broken). A closed channel (every `Sender` dropped) is not an error — the loop falls back to
+//! plain interval sleeps and keeps polling whatever region it last had, rather than either
+//! crashing or busy-spinning against a channel that is now always-ready-with-an-error.
+//!
 //! Two clocks appear, for the two reasons `budget` already draws the distinction: the ledger
 //! reads a wall-clock [`WallClock`] because the day boundary is a calendar fact, while the
 //! cadence sleeps and the probe timer use tokio's monotonic clock because "wait 27 s" and
@@ -46,6 +57,7 @@ use crossbeam_channel::Sender;
 use look_above_core::contracts::{LiveSource, RegionQuery};
 use look_above_core::error::SourceError;
 use look_above_core::types::{SourceId, StateVector, UnixSeconds};
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
 use crate::adsb_lol::AdsbLolSource;
@@ -123,9 +135,16 @@ pub struct Poller {
     /// One ledger per source, aligned by index. Only metered sources (`OpenSky`) ever
     /// accumulate; an unmetered source's ledger stays at zero and never vetoes a cycle.
     ledgers: Vec<CreditLedger>,
-    /// The region every cycle asks for. Fixed for M1 (bboxes ≤ ~1,000 km across); the camera
-    /// will drive it in M2/M4.
+    /// The region every cycle asks for. Seeded from `retarget`'s value at construction and
+    /// updated whenever [`run`](Self::run) observes a change on it — `run_cycle` always reads
+    /// this field, never `retarget` directly, so a cycle in flight is never retargeted
+    /// mid-fetch.
     query: RegionQuery,
+    /// The live channel a caller uses to retarget `query` while [`run`](Self::run) is looping
+    /// (item 2.3b) — the app's window mode drives it from the camera viewport. A closed channel
+    /// (every paired `Sender` dropped) is handled explicitly in `run`, not here: this field just
+    /// holds the receiving half.
+    retarget: watch::Receiver<RegionQuery>,
     /// Where finished batches go. A dropped receiver is the shutdown signal.
     sender: Sender<PollBatch>,
     clock: Arc<dyn WallClock>,
@@ -153,19 +172,25 @@ impl fmt::Debug for Poller {
 }
 
 impl Poller {
-    /// A poller over `sources` (priority order, `sources[0]` primary) for `query`, delivering
-    /// to `sender`.
+    /// A poller over `sources` (priority order, `sources[0]` primary), delivering to `sender`.
+    ///
+    /// `retarget`'s current value seeds the query for the first cycle; the caller keeps the
+    /// paired [`watch::Sender`](tokio::sync::watch::Sender) to retarget the region at any point
+    /// while [`run`](Self::run) is looping (`watch::channel(initial_query)` is the usual way to
+    /// build the pair).
     pub fn new(
         sources: Vec<Box<dyn LiveSource>>,
-        query: RegionQuery,
+        retarget: watch::Receiver<RegionQuery>,
         sender: Sender<PollBatch>,
         clock: Arc<dyn WallClock>,
     ) -> Self {
         let ledgers = vec![CreditLedger::new(); sources.len()];
+        let query = *retarget.borrow();
         Self {
             sources,
             ledgers,
             query,
+            retarget,
             sender,
             clock,
             active: PRIMARY,
@@ -179,7 +204,7 @@ impl Poller {
     pub fn with_default_chain(
         client: HttpClient,
         auth: OpenSkyAuth,
-        query: RegionQuery,
+        retarget: watch::Receiver<RegionQuery>,
         sender: Sender<PollBatch>,
         clock: Arc<dyn WallClock>,
     ) -> Self {
@@ -188,7 +213,7 @@ impl Poller {
             Box::new(AirplanesLiveSource::new(client.clone())),
             Box::new(AdsbLolSource::new(client)),
         ];
-        Self::new(sources, query, sender, clock)
+        Self::new(sources, retarget, sender, clock)
     }
 
     /// Which source is currently being polled — for the headless readout (item 1.12) and logs.
@@ -216,10 +241,11 @@ impl Poller {
     /// Runs until the pipeline receiver is dropped.
     ///
     /// Each iteration either re-probes the primary (if we have failed over and the probe is
-    /// due) or polls the active source, then sleeps for the interval that cycle asked for. The
-    /// loop never returns on a *source* failure — a fully dead chain just idles and retries
-    /// (the plan's "the app idles and retries; it never crashes"); only a gone receiver stops
-    /// it.
+    /// due) or polls the active source, then waits out the interval that cycle asked for —
+    /// unless a retarget arrives first, in which case the wait is cut short and the next cycle
+    /// runs against the new region immediately. The loop never returns on a *source* failure —
+    /// a fully dead chain just idles and retries (the plan's "the app idles and retries; it
+    /// never crashes"); only a gone receiver stops it.
     pub async fn run(mut self) {
         if self.sources.is_empty() {
             tracing::error!("poller started with no sources; nothing to do");
@@ -227,6 +253,13 @@ impl Poller {
         }
 
         let mut last_probe = Instant::now();
+        // Whether `self.retarget` is still worth racing against the cadence sleep. Once every
+        // paired `Sender` is dropped, `changed()` resolves `Err` *immediately, and forever
+        // after* — not just the once — so leaving it in the `select!` past that point would win
+        // the race on every iteration and busy-spin the loop with no delay between cycles at
+        // all. The first `Err` is handled like a normal boundary (it still waits out the
+        // interval below); every iteration after that skips the channel entirely.
+        let mut retarget_live = true;
         loop {
             let tick = if probe_due(self.active, last_probe.elapsed()) {
                 last_probe = Instant::now();
@@ -239,7 +272,26 @@ impl Poller {
                 tracing::info!("pipeline receiver dropped; poller shutting down");
                 return;
             }
-            sleep(tick.interval).await;
+
+            if retarget_live {
+                tokio::select! {
+                    () = sleep(tick.interval) => {}
+                    changed = self.retarget.changed() => {
+                        if let Ok(()) = changed {
+                            self.query = *self.retarget.borrow_and_update();
+                            tracing::info!(
+                                query = ?self.query,
+                                "retargeted mid-run; polling the new region next cycle"
+                            );
+                        } else {
+                            retarget_live = false;
+                            sleep(tick.interval).await;
+                        }
+                    }
+                }
+            } else {
+                sleep(tick.interval).await;
+            }
         }
     }
 
@@ -490,8 +542,9 @@ mod tests {
     }
 
     /// A test double `LiveSource`: each `fetch` pops the next scripted result; an exhausted
-    /// queue repeats `default`. It counts calls so a test can prove a *skipped* cycle sent
-    /// nothing.
+    /// queue repeats `default`. It counts calls, and records the query it was last called with,
+    /// so a test can prove a *skipped* cycle sent nothing and — for retargeting — which region a
+    /// given cycle actually asked for.
     #[derive(Debug)]
     struct ScriptedSource {
         id: SourceId,
@@ -499,6 +552,7 @@ mod tests {
         queue: Mutex<VecDeque<Result<Vec<StateVector>, SourceError>>>,
         default: Result<Vec<StateVector>, SourceError>,
         calls: AtomicUsize,
+        last_query: Mutex<Option<RegionQuery>>,
     }
 
     impl ScriptedSource {
@@ -514,6 +568,7 @@ mod tests {
                 queue: Mutex::new(queued.into()),
                 default,
                 calls: AtomicUsize::new(0),
+                last_query: Mutex::new(None),
             }
         }
 
@@ -534,6 +589,12 @@ mod tests {
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
+
+        /// The `RegionQuery` the most recent `fetch` was called with, or `None` before the
+        /// first call.
+        fn last_query(&self) -> Option<RegionQuery> {
+            *self.last_query.lock().expect("last-query lock")
+        }
     }
 
     #[async_trait]
@@ -546,8 +607,9 @@ mod tests {
             self.cost
         }
 
-        async fn fetch(&self, _query: &RegionQuery) -> Result<Vec<StateVector>, SourceError> {
+        async fn fetch(&self, query: &RegionQuery) -> Result<Vec<StateVector>, SourceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_query.lock().expect("last-query lock") = Some(*query);
             let mut queue = self.queue.lock().expect("scripted queue lock");
             queue.pop_front().unwrap_or_else(|| self.default.clone())
         }
@@ -595,9 +657,18 @@ mod tests {
         RegionQuery::region(BBox::new(46.0, 7.0, 48.0, 9.0).expect("valid bbox in test"))
     }
 
+    /// A second, distinct region from [`a_region`], for the retargeting tests.
+    fn other_region() -> RegionQuery {
+        RegionQuery::region(BBox::new(30.0, -10.0, 32.0, -8.0).expect("valid bbox in test"))
+    }
+
+    /// None of the tests that use this drive `run()` (they call `poll_active`/
+    /// `attempt_recovery` directly), so the retarget channel is never read — the paired sender
+    /// is dropped immediately, which is harmless here.
     fn make_poller(sources: Vec<Box<dyn LiveSource>>) -> (Poller, Receiver<PollBatch>) {
         let (tx, rx) = unbounded();
-        let poller = Poller::new(sources, a_region(), tx, Arc::new(FixedClock(NOON)));
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
+        let poller = Poller::new(sources, retarget_rx, tx, Arc::new(FixedClock(NOON)));
         (poller, rx)
     }
 
@@ -725,9 +796,10 @@ mod tests {
         // the poller as a trait object.
         let source = Arc::new(ScriptedSource::always_ok(SourceId::OpenSky, 1));
         let (tx, rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let mut poller = Poller::new(
             vec![Box::new(SharedSource(Arc::clone(&source)))],
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(FixedClock(NOON)),
         );
@@ -763,9 +835,10 @@ mod tests {
         // into the private `ledgers` field directly.
         let source = Arc::new(ScriptedSource::always_ok(SourceId::OpenSky, 2));
         let (tx, rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let mut poller = Poller::new(
             vec![Box::new(SharedSource(Arc::clone(&source)))],
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(FixedClock(NOON)),
         );
@@ -801,9 +874,10 @@ mod tests {
     #[test]
     fn restore_ledger_on_an_out_of_range_index_is_a_harmless_no_op() {
         let (tx, _rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let mut poller = Poller::new(
             vec![ScriptedSource::always_ok(SourceId::OpenSky, 1).boxed()],
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(FixedClock(NOON)),
         );
@@ -975,9 +1049,10 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_receiver_reports_a_disconnected_pipeline() {
         let (tx, rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let mut poller = Poller::new(
             vec![ScriptedSource::always_ok(SourceId::OpenSky, 1).boxed()],
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(FixedClock(NOON)),
         );
@@ -990,15 +1065,130 @@ mod tests {
         );
     }
 
+    // ---- Retargeting mid-run (item 2.3b) ---------------------------------------------------------
+    //
+    // Both tests drive the real `run()` loop (the only tests in this file that do), spawned as a
+    // background task under a paused clock: `tokio::task::yield_now` lets it run without letting
+    // virtual time pass, and `tokio::time::advance` lets it run *with* time passing, so the
+    // interval-vs-retarget race can be asserted exactly rather than approximately.
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retarget_sent_while_running_changes_the_very_next_cycles_query() {
+        let source = Arc::new(ScriptedSource::always_ok(SourceId::AirplanesLive, 0));
+        let (tx, _rx) = unbounded();
+        let (retarget_tx, retarget_rx) = watch::channel(a_region());
+        let poller = Poller::new(
+            vec![Box::new(SharedSource(Arc::clone(&source)))],
+            retarget_rx,
+            tx,
+            Arc::new(FixedClock(NOON)),
+        );
+
+        let handle = tokio::spawn(poller.run());
+
+        // Let the first cycle run against the initial region and settle into its sleep/select.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            source.call_count(),
+            1,
+            "the first cycle ran against the initial region"
+        );
+        assert_eq!(source.last_query(), Some(a_region()));
+
+        // Retarget: no virtual time passes at all, and the very next cycle already sees the new
+        // region — proving the `select!` won the race against the (up to 60 s) cadence sleep,
+        // not that the test simply waited it out.
+        retarget_tx
+            .send(other_region())
+            .expect("the run() task still holds the receiver");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            source.call_count(),
+            2,
+            "the retarget produced an immediate second cycle, with no sleep in between"
+        );
+        assert_eq!(
+            source.last_query(),
+            Some(other_region()),
+            "the second cycle asked for the retargeted region"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_every_retarget_sender_falls_back_to_a_plain_paced_loop_not_a_busy_spin() {
+        let source = Arc::new(ScriptedSource::always_ok(SourceId::AirplanesLive, 0));
+        let (tx, _rx) = unbounded();
+        let (retarget_tx, retarget_rx) = watch::channel(a_region());
+        drop(retarget_tx); // no caller can ever retarget this poller again
+
+        let poller = Poller::new(
+            vec![Box::new(SharedSource(Arc::clone(&source)))],
+            retarget_rx,
+            tx,
+            Arc::new(FixedClock(NOON)),
+        );
+
+        let handle = tokio::spawn(poller.run());
+
+        // The first cycle runs immediately; the closed channel is discovered on the very next
+        // `select!`, and — per the design — that discovery still waits out one full interval
+        // rather than firing an unpaced cycle right there.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.call_count(), 1);
+
+        // From here on the loop must be a plain `sleep(interval)` every cycle. If it were
+        // instead busy-spinning on an always-`Err` `changed()`, the call count would run far
+        // past what these three paced intervals produce.
+        tokio::time::advance(MIN_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            source.call_count(),
+            2,
+            "one paced cycle per interval, not more"
+        );
+
+        tokio::time::advance(MIN_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            source.call_count(),
+            3,
+            "still exactly paced, two intervals in"
+        );
+
+        tokio::time::advance(
+            MIN_INTERVAL
+                .checked_sub(Duration::from_millis(1))
+                .expect("the interval is over a millisecond"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            source.call_count(),
+            3,
+            "just under a full interval must not yet produce a fourth cycle"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // ---- Construction ---------------------------------------------------------------------------
 
     #[test]
     fn the_default_chain_is_the_documented_failover_order() {
         let (tx, _rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let poller = Poller::with_default_chain(
             HttpClient::new().expect("client builds"),
             OpenSkyAuth::disabled(),
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(SystemWallClock),
         );
@@ -1025,11 +1215,12 @@ mod tests {
     #[ignore = "hits real airplanes.live via the failover chain; keyless and free"]
     async fn live_poller_fails_over_to_a_keyless_fallback_and_emits_a_batch() {
         let (tx, rx) = unbounded();
+        let (_retarget_tx, retarget_rx) = watch::channel(a_region());
         let mut poller = Poller::with_default_chain(
             HttpClient::new().expect("client builds"),
             // Disabled primary → Auth → immediate failover to the first keyless fallback.
             OpenSkyAuth::disabled(),
-            a_region(),
+            retarget_rx,
             tx,
             Arc::new(SystemWallClock),
         );

@@ -8,6 +8,7 @@ mod config;
 mod frame_stats;
 mod headless;
 mod logging;
+mod pipeline;
 mod window;
 
 use anyhow::{Result, bail};
@@ -50,7 +51,7 @@ fn main() -> Result<()> {
     log_startup(&config);
 
     match parse_args()? {
-        Mode::Window => window::run(),
+        Mode::Window => window::run(&config),
         Mode::Headless => headless::run(&config),
     }
 }

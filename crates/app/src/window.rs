@@ -1,11 +1,26 @@
 //! The application window and its event loop.
+//!
+//! From M2 item 2.3b this also drives the live ingest pipeline (the same [`Poller`]/
+//! [`SessionTable`]/[`Writer`] pieces [`crate::headless`] runs), sourced from the camera's own
+//! viewport instead of a fixed bbox and retargeted live as the user pans/zooms — see
+//! [`App::start`] for construction and [`App::maybe_retarget`] for the retarget policy.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, unbounded};
 use look_above_core::camera::Camera;
+use look_above_core::contracts::RegionQuery;
+use look_above_core::merge::SessionTable;
+use look_above_core::types::SourceId;
+use look_above_ingest::budget::CreditLedger;
+use look_above_ingest::http::HttpClient;
+use look_above_ingest::opensky::OpenSkyAuth;
+use look_above_ingest::poller::{PRIMARY, PollBatch, Poller, SystemWallClock, WallClock};
 use look_above_render::{FrameOutcome, Renderer, camera_view_proj};
+use look_above_store::Writer;
+use tokio::sync::watch;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -13,6 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::config::Config;
 use crate::frame_stats::FrameStats;
 
 const WINDOW_TITLE: &str = "Look Above";
@@ -25,15 +41,24 @@ const INITIAL_SIZE: LogicalSize<u32> = LogicalSize::new(1280, 800);
 /// of [`Camera::zoom_by_notches`]. A judgement call, not a platform constant.
 const SCROLL_PIXELS_PER_NOTCH: f64 = 100.0;
 
+/// How long the camera must sit still (no real pan/zoom change frame-to-frame) before its
+/// viewport is sent to the poller as a new region — see [`App::maybe_retarget`]. Debounced so a
+/// continuous drag or zoom-ease does not retarget (and re-fetch) on every single frame.
+const CAMERA_SETTLE_DEBOUNCE: Duration = Duration::from_secs(2);
+
 /// Open the window and pump events until the user closes it.
-pub fn run() -> Result<()> {
+pub fn run(config: &Config) -> Result<()> {
     let event_loop = EventLoop::new().context("create the event loop")?;
 
     // Poll rather than Wait: from M2 the map animates between polls (dead reckoning), so
     // frames are driven by the clock, not by input.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    // Kept alive for the whole function: the ingest pipeline `App::start` spawns onto this
+    // runtime runs alongside winit's own (blocking) event loop below, not instead of it.
+    let runtime = tokio::runtime::Runtime::new().context("start the window mode async runtime")?;
+
+    let mut app = App::new(config.clone(), runtime.handle().clone());
     event_loop.run_app(&mut app).context("run the event loop")?;
 
     // A callback cannot return an error, so it parks one here and stops the loop.
@@ -43,7 +68,7 @@ pub fn run() -> Result<()> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct App {
     /// `Arc` because the renderer's surface holds the window for as long as it draws to it.
     window: Option<Arc<Window>>,
@@ -70,9 +95,62 @@ struct App {
     /// glyph atlas in 2.5/2.7).
     stats_visible: bool,
     error: Option<anyhow::Error>,
+
+    /// Needed in [`App::start`] to open the same `store::Writer` (same `db_path`) and build the
+    /// same `HttpClient`/`OpenSkyAuth` headless mode does.
+    config: Config,
+    /// A handle onto the runtime `window::run` built and is keeping alive, so the poller can be
+    /// spawned from inside a winit callback (`App::start`), which is not itself async.
+    runtime_handle: tokio::runtime::Handle,
+    /// Finished poll cycles, drained non-blockingly once per frame in [`App::draw`]. `None`
+    /// until [`App::start`] has built the poller.
+    batch_rx: Option<Receiver<PollBatch>>,
+    /// The live handle used to retarget the running poller's region (see
+    /// [`App::maybe_retarget`]). Must stay alive for as long as the poller should remain
+    /// retargetable — every `Sender` dropping falls the poller back to a fixed cadence forever
+    /// (see `ingest::poller`'s module doc).
+    retarget_tx: Option<watch::Sender<RegionQuery>>,
+    /// A handle to the same store the headless pipeline writes to — cheap to hold (a channel
+    /// handle, not a connection). `None` until [`App::start`] has opened it.
+    writer: Option<Writer>,
+    /// The session's live, deduplicated picture, merged from every batch the poller delivers.
+    /// Nothing renders from this yet (M2 items 2.4/2.5); it exists so the ledger-persisting
+    /// merge path this item wires through has somewhere real to merge into.
+    table: SessionTable,
+    /// When the camera's state (`center_m`/`meters_per_pixel`) was last observed to actually
+    /// change frame-to-frame. `None` until the camera has moved for the first time — see
+    /// [`App::maybe_retarget`].
+    last_camera_change_instant: Option<Instant>,
+    /// The region most recently sent to the poller (or, before the camera has ever moved, the
+    /// initial region it was constructed with) — so a settled camera is not resent every frame.
+    last_sent_region: RegionQuery,
 }
 
 impl App {
+    /// `Config` and the runtime handle have no meaningful `Default`, so this replaces what
+    /// `#[derive(Default)]` used to give `App` — everything else starts the same way it did.
+    fn new(config: Config, runtime_handle: tokio::runtime::Handle) -> Self {
+        Self {
+            window: None,
+            renderer: None,
+            camera: None,
+            last_cursor_pos: None,
+            last_drag_instant: None,
+            last_frame_instant: None,
+            stats: FrameStats::default(),
+            stats_visible: false,
+            error: None,
+            config,
+            runtime_handle,
+            batch_rx: None,
+            retarget_tx: None,
+            writer: None,
+            table: SessionTable::new(),
+            last_camera_change_instant: None,
+            last_sent_region: RegionQuery::default(),
+        }
+    }
+
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
@@ -105,9 +183,75 @@ impl App {
         let camera = Camera::new(size.width, size.height);
         renderer.set_view_proj(camera_view_proj(&camera));
 
+        // The same three ingest pieces `headless::run` builds — see that module's doc comment
+        // for why each is required, not just the poller. A failure here is fatal, the same way
+        // a renderer-init failure above is: a broken DB or client cannot degrade gracefully into
+        // a render-only mode without silently losing the ledger-restore guarantee (see this
+        // item's own notes on why that guarantee matters).
+        let writer = Writer::open(&self.config.storage.db_path).with_context(|| {
+            format!(
+                "open the store at {}",
+                self.config.storage.db_path.display()
+            )
+        })?;
+
+        let client = HttpClient::new().context("build the shared HTTP client")?;
+        let auth =
+            OpenSkyAuth::from_optional(client.clone(), self.config.sources.opensky.credentials());
+
+        // The initial region comes from the camera, not a fixed bbox — this is the seam that
+        // makes window mode's ingest camera-driven rather than headless's fixed one.
+        let initial_bbox = camera.viewport_bbox();
+        let initial_query = RegionQuery::region(initial_bbox);
+        let (retarget_tx, retarget_rx) = watch::channel(initial_query);
+
+        let clock: Arc<dyn WallClock> = Arc::new(SystemWallClock);
+        let (sender, receiver) = unbounded();
+        let mut poller =
+            Poller::with_default_chain(client, auth, retarget_rx, sender, Arc::clone(&clock));
+
+        // Item 1.7's ledger seam, closed here exactly as it is in headless mode: seed the
+        // primary's ledger from what was already spent today (privacy rule 1.3's daily cap is
+        // a real-world quota, not a per-process one — see this item's own notes).
+        match writer.source_status(SourceId::OpenSky) {
+            Ok(Some(status)) => {
+                let now = clock.now();
+                poller.restore_ledger(
+                    PRIMARY,
+                    CreditLedger::restored(status.credits_used_today, now),
+                );
+                tracing::info!(
+                    credits_used_today = status.credits_used_today,
+                    "restored the OpenSky credit ledger from source_status"
+                );
+            }
+            Ok(None) => {
+                tracing::info!("no persisted OpenSky source_status; starting the ledger fresh");
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not read OpenSky's source_status; starting the ledger fresh"
+            ),
+        }
+
+        tracing::info!(
+            bbox = ?initial_bbox,
+            opensky_credentials = if self.config.sources.opensky.is_configured() {
+                "configured"
+            } else {
+                "absent"
+            },
+            "window mode: starting the poll loop"
+        );
+        self.runtime_handle.spawn(poller.run());
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.camera = Some(camera);
+        self.batch_rx = Some(receiver);
+        self.retarget_tx = Some(retarget_tx);
+        self.writer = Some(writer);
+        self.last_sent_region = initial_query;
         Ok(())
     }
 
@@ -124,8 +268,24 @@ impl App {
                 now.saturating_duration_since(previous).as_secs_f64()
             });
 
+        let before = (camera.center_m(), camera.meters_per_pixel());
         camera.update(dt_s);
+        let changed = before != (camera.center_m(), camera.meters_per_pixel());
         renderer.set_view_proj(camera_view_proj(camera));
+
+        Self::maybe_retarget(
+            camera,
+            now,
+            changed,
+            &mut self.last_camera_change_instant,
+            &mut self.last_sent_region,
+            self.retarget_tx.as_ref(),
+        );
+        Self::drain_batches(
+            self.batch_rx.as_ref(),
+            self.writer.as_ref(),
+            &mut self.table,
+        );
 
         match renderer.render() {
             Ok(FrameOutcome::Presented) => {
@@ -160,6 +320,65 @@ impl App {
                 event_loop,
                 anyhow::Error::new(error).context("draw a frame"),
             ),
+        }
+    }
+
+    /// Merges any batches the poller has produced since the last frame into `table`, logging
+    /// and persisting each one through [`crate::pipeline::record_cycle`] — the same path
+    /// `headless::run` drives its own receiver loop through.
+    ///
+    /// A free-standing function, not a `&mut self` method: [`App::draw`] calls this while
+    /// `renderer`/`camera` (borrowed from other `self` fields) are still in scope, and a
+    /// `&mut self` method call there would conflict with those borrows even though the fields
+    /// touched here are disjoint from them.
+    fn drain_batches(
+        batch_rx: Option<&Receiver<PollBatch>>,
+        writer: Option<&Writer>,
+        table: &mut SessionTable,
+    ) {
+        let (Some(batch_rx), Some(writer)) = (batch_rx, writer) else {
+            return;
+        };
+        for batch in batch_rx.try_iter() {
+            crate::pipeline::record_cycle(writer, table, &batch);
+        }
+    }
+
+    /// Retargets the running poller once the camera has settled on a viewport whose bbox
+    /// differs from whichever region was last sent — see [`CAMERA_SETTLE_DEBOUNCE`].
+    ///
+    /// `changed` is whether the camera's state (`center_m`/`meters_per_pixel`) actually moved
+    /// this frame; only a real change (re-)arms `last_change`, so the debounce clock never
+    /// starts — and nothing is ever sent — before the user has interacted with the camera for
+    /// the first time. A free-standing function for the same borrow-shape reason as
+    /// [`App::drain_batches`].
+    fn maybe_retarget(
+        camera: &Camera,
+        now: Instant,
+        changed: bool,
+        last_change: &mut Option<Instant>,
+        last_sent_region: &mut RegionQuery,
+        retarget_tx: Option<&watch::Sender<RegionQuery>>,
+    ) {
+        if changed {
+            *last_change = Some(now);
+        }
+        let Some(changed_at) = *last_change else {
+            return;
+        };
+        if now.saturating_duration_since(changed_at) < CAMERA_SETTLE_DEBOUNCE {
+            return;
+        }
+        let Some(retarget_tx) = retarget_tx else {
+            return;
+        };
+
+        let query = RegionQuery::region(camera.viewport_bbox());
+        if query != *last_sent_region {
+            // A closed channel means the poller task itself has ended; there is nothing more
+            // this side can do about it, so a failed send only stops retargeting, not the app.
+            let _ = retarget_tx.send(query);
+            *last_sent_region = query;
         }
     }
 
@@ -203,6 +422,13 @@ impl ApplicationHandler for App {
                 {
                     camera.resize(size.width, size.height);
                     renderer.set_view_proj(camera_view_proj(camera));
+                    // `maybe_retarget`'s `changed` signal only ever sees `center_m`/
+                    // `meters_per_pixel` deltas taken around `camera.update` inside `draw` — a
+                    // resize lands here, strictly before the next `draw`, so that comparison
+                    // never observes it even though `viewport_bbox` genuinely changes with the
+                    // window's aspect ratio. Arming the settle clock directly here is what lets
+                    // a resize (with no accompanying pan/zoom) still eventually retarget.
+                    self.last_camera_change_instant = Some(Instant::now());
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

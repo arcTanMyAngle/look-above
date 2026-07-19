@@ -15,7 +15,8 @@
 //! letterboxed" scale — doubles as both the initial framing and the zoom-out ceiling; zooming
 //! out further would show empty space with nothing to fill it.
 
-use crate::geo::{MercatorXy, WEB_MERCATOR_EXTENT_M};
+use crate::geo::{MercatorXy, WEB_MERCATOR_EXTENT_M, web_mercator_inverse};
+use crate::types::BBox;
 
 /// An arbitrary conservative close-zoom floor. There is no aircraft content to zoom in on yet
 /// (M2 item 2.5+), so this only guards against a degenerate/zero scale. Revisit once glyphs
@@ -246,6 +247,38 @@ impl Camera {
     pub fn height_px(&self) -> f64 {
         self.height_px
     }
+
+    /// The geographic area currently on screen, for M2 item 2.3b's poller retarget.
+    ///
+    /// Whichever pixel dimension is *not* the letterbox-constraining one (see
+    /// [`max_meters_per_pixel`]) spans more than the projected world at maximum zoom-out, and
+    /// nothing stops `center_m` drifting past the projected world's edge on a long pan either
+    /// (there is no antimeridian wrap — see [`BBox`]'s own doc). Both would otherwise hand
+    /// `BBox::new` an out-of-range or inverted span, so every corner is clamped into the valid
+    /// Mercator/lat-lon domain first; clamping both endpoints of an already-ordered interval to
+    /// the same range preserves the ordering, so the result is always constructible.
+    pub fn viewport_bbox(&self) -> BBox {
+        let half_width_m = self.width_px / 2.0 * self.meters_per_pixel;
+        let half_height_m = self.height_px / 2.0 * self.meters_per_pixel;
+
+        let clamp_extent = |m: f64| m.clamp(-WEB_MERCATOR_EXTENT_M, WEB_MERCATOR_EXTENT_M);
+        let sw = web_mercator_inverse(MercatorXy::new(
+            clamp_extent(self.center_m.x_m - half_width_m),
+            clamp_extent(self.center_m.y_m - half_height_m),
+        ));
+        let ne = web_mercator_inverse(MercatorXy::new(
+            clamp_extent(self.center_m.x_m + half_width_m),
+            clamp_extent(self.center_m.y_m + half_height_m),
+        ));
+
+        BBox::new(
+            sw.lat_deg.clamp(-90.0, 90.0),
+            sw.lon_deg.clamp(-180.0, 180.0),
+            ne.lat_deg.clamp(-90.0, 90.0),
+            ne.lon_deg.clamp(-180.0, 180.0),
+        )
+        .expect("clamped, order-preserved corners always form a valid, non-inverted bbox")
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +506,70 @@ mod tests {
             }
         }
         assert!(snapped_to_zero, "velocity never snapped to exactly zero");
+    }
+
+    // --- viewport_bbox: M2 item 2.3b's poller retarget input ---------------------
+
+    #[test]
+    fn a_freshly_constructed_camera_sees_nearly_the_whole_world() {
+        // The default framing is the "whole world visible, letterboxed" fit, so the
+        // constraining axis should read (almost) the full ±180°/±MAX_MERCATOR_LAT range; the
+        // wider axis reads clamped to the same bound (see the method's doc comment).
+        let cam = Camera::new(1000, 800);
+        let bbox = cam.viewport_bbox();
+        assert!(bbox.lon_min() < -179.0, "lon_min = {}", bbox.lon_min());
+        assert!(bbox.lon_max() > 179.0, "lon_max = {}", bbox.lon_max());
+        assert!(bbox.lat_min() < -80.0, "lat_min = {}", bbox.lat_min());
+        assert!(bbox.lat_max() > 80.0, "lat_max = {}", bbox.lat_max());
+    }
+
+    #[test]
+    fn viewport_bbox_never_panics_or_inverts_even_panned_far_past_the_projected_world() {
+        // Nothing in `Camera` clamps `center_m` itself (no antimeridian wrap yet); a very long
+        // pan must still yield a constructible, non-inverted bbox rather than panicking.
+        let mut cam = Camera::new(1000, 800);
+        cam.pan_by_pixels(-1.0e9, 0.0);
+        let bbox = cam.viewport_bbox();
+        assert!(bbox.lon_min() <= bbox.lon_max());
+        assert!(bbox.lat_min() <= bbox.lat_max());
+
+        let mut cam = Camera::new(1000, 800);
+        cam.pan_by_pixels(0.0, 1.0e9);
+        let bbox = cam.viewport_bbox();
+        assert!(bbox.lon_min() <= bbox.lon_max());
+        assert!(bbox.lat_min() <= bbox.lat_max());
+    }
+
+    #[test]
+    fn viewport_bbox_shrinks_as_the_camera_zooms_in() {
+        let mut cam = Camera::new(1000, 800);
+        let wide = cam.viewport_bbox();
+
+        cam.zoom_by_notches(20.0, 500.0, 400.0);
+        for _ in 0..500 {
+            cam.update(1.0 / 60.0);
+        }
+        let narrow = cam.viewport_bbox();
+
+        assert!(narrow.lon_max() - narrow.lon_min() < wide.lon_max() - wide.lon_min());
+        assert!(narrow.lat_max() - narrow.lat_min() < wide.lat_max() - wide.lat_min());
+    }
+
+    #[test]
+    fn viewport_bbox_is_centered_on_the_camera_center_after_a_pan() {
+        let mut cam = Camera::new(1000, 800);
+        // Zoom in first so the viewport is far short of the projected world's edge in both
+        // axes — otherwise, at the default "contain" framing, the wider (non-constraining)
+        // axis already overflows ±EXTENT at zero pan, and clamping would break the symmetry
+        // this test checks.
+        cam.zoom_by_notches(20.0, 500.0, 400.0);
+        for _ in 0..500 {
+            cam.update(1.0 / 60.0);
+        }
+        cam.pan_by_pixels(-200.0, 0.0);
+        let bbox = cam.viewport_bbox();
+        let center = web_mercator_inverse(cam.center_m());
+        let mid_lon = f64::midpoint(bbox.lon_min(), bbox.lon_max());
+        assert_close(mid_lon, center.lon_deg, 1e-6);
     }
 }

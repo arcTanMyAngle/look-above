@@ -6,12 +6,27 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a done. Plan:
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b done. Plan:
   [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.3b** — viewport→bbox exposed to the poller: a retarget API on
-  `ingest::poller` (today's `Poller` takes one fixed `RegionQuery` at construction and has no
-  way to change it while running) and wiring window mode to run the live ingest pipeline for
-  the first time (today only `--headless` does), retargeting on camera settle debounced 2 s.
+- **Next action:** **M2 item 2.4** — `core::sim`, the interpolation/dead-reckoning worker:
+  rayon over the live aircraft table (the `SessionTable` both `--headless` and window mode now
+  maintain) at render cadence, destination-point advance, ease-out correction blend, stale
+  fade, writing `RenderFeed` into the double buffer.
+- **2.3b landed:** viewport→bbox exposed to the poller, and window mode runs the live ingest
+  pipeline for the first time. New `core::camera::Camera::viewport_bbox() -> BBox` (clamped so
+  an off-world/overflowing viewport still yields a valid bbox — no antimeridian wrap yet, same
+  scoping as 2.3a); `ingest::poller`'s constructors now take a `watch::Receiver<RegionQuery>`
+  and `run()` races its cadence sleep against a retarget so a new region takes effect on the
+  very next cycle, not after waiting out up to 60 s; `app::window` opens the same
+  `Writer`/`HttpClient`/`Poller`/ledger-restore pipeline `--headless` does (merge/log/persist
+  now shared via `app::pipeline::record_cycle`), seeded from the camera's initial viewport and
+  retargeted once the camera settles 2 s on a changed bbox — including on a plain resize, a gap
+  this session found in the delegated implementation and fixed directly. Three lane-scoped
+  pieces (this session / data-source-agent / renderer-agent, sequential), independently
+  re-verified (diffs read in full, fresh fmt/clippy/test — **375 passed, 5 ignored, 0 failed**)
+  and live-driven against the owner's real OpenSky credentials: initial whole-world fetch (4
+  credits) then five real mid-run retargets with distinct bboxes, source never failed over,
+  clean `WM_CLOSE` exit. DECISION_LOG 2.3b.
 - **2.3a landed:** the regional camera — new `core::camera::Camera` (pure pan/drag/cursor-
   anchored-zoom/inertia math, no wgpu/winit) plus `render::camera_view_proj` and `app::window`
   wiring (mouse drag/wheel → camera, `camera.update(dt)` once per frame) replace 2.2b's
@@ -73,9 +88,18 @@
 - **Blockers:** the owner must rename the repo `look_above` → `look-above`, then push (no SSH
   key on this machine) — CI has never run; M0's one unmet gate line.
   [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1.
-- **Credit spend to date: 203 of 4,000/day** (1 from 1.4's live test, 6 from 1.12's headless
-  verification, 196 from 1.13's gate run — all on 2026-07-18; the ledger resets daily, so this
-  is today's running total, not cumulative across days).
+- **Credit spend to date: ~300+ of 4,000/day** (203 carried from M1's 1.4/1.12/1.13 above, plus
+  2.3b's two live-verification runs today: the renderer-agent's own window-mode drive spent at
+  least 12 (its report showed 3 cycles before the snippet it quoted cut off, not necessarily its
+  final total) and this session's independent re-verification spent 84 more — both against the
+  owner's real credentials, all 2026-07-18. Each run's local ledger started fresh because the
+  prior run's scratch `look_above.db` had already been deleted per 1.12/1.13's own cleanup
+  convention — expected, not a sign the ledger-restore mechanism is broken (it did restore
+  correctly within each single run; there was just nothing left to restore *from*). Still well
+  under the 3,200 (80%) self-imposed cap either way; flagged here because two independently-
+  fresh-started local ledgers on the same real day is exactly the scenario that *could* matter
+  once combined runs get large — worth remembering if a future session sees an unexplained gap
+  between the local ledger and OpenSky's own account usage.
 - **⚠ Carried to M3:** `anonymous` catches only the no-callsign half of privacy rule 2.2 — a
   PIA hex broadcasting a callsign needs FAA range data not yet available. DECISION_LOG 1.4.
 

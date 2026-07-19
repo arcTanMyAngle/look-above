@@ -1478,3 +1478,101 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   or missing polygons at any step — docs/13's L2-core pan/zoom-inertia line. Next: **2.3b**,
   viewport→bbox exposed to the poller (retarget API + wiring window mode to the live pipeline
   for the first time).
+
+## 2026-07-18 — M2 item 2.3b (viewport→bbox exposed to the poller; window mode runs the live pipeline)
+
+- **Three pieces, in a fixed dependency order**: `core::camera::Camera::viewport_bbox() -> BBox`
+  (the math), `ingest::poller`'s mid-run retarget API (the mechanism), then `app::window`'s
+  wiring (the caller of both) — each genuinely needed the previous one's *finished* signature,
+  same shape as 2.3a's two-piece split. `viewport_bbox` was small and self-contained enough
+  (~20 lines, in a file already fully read this session) to write directly rather than delegate,
+  per the token-managed-implementation skill's own threshold; the other two were delegated,
+  lane-scoped and sequential (data-source-agent for `ingest`, renderer-agent for `app`, the
+  second briefed with the first's real signatures).
+- **`viewport_bbox` must clamp, not just project**: nothing in `Camera` constrains `center_m` to
+  the projected world (no antimeridian wrap yet, per `BBox`'s own doc), and whichever pixel
+  dimension is *not* the letterbox-constraining one already overflows past
+  `±WEB_MERCATOR_EXTENT_M` at the default "whole world" framing — a landscape window overflows
+  in x, a portrait one in y. Both corners of the viewport are clamped into the valid Mercator/
+  lat-lon domain before `BBox::new`, which is provably always then constructible (clamping both
+  endpoints of an already-ordered interval to the same range preserves the ordering) — proven by
+  a dedicated test that pans a camera `1e9` px past the world's edge and asserts no panic and a
+  non-inverted result, plus a test on the default (near-whole-world) framing and one confirming
+  the bbox shrinks correctly as the camera zooms in.
+- **The poller's retarget is a `tokio::sync::watch` channel, not a queue**: a retarget is "the
+  latest desired region," and `watch::Sender::send` needs no `.await`, so it can be called
+  directly from the winit thread. `run()`'s loop now races `sleep(tick.interval)` against
+  `retarget.changed()` so a new region takes effect on the very next cycle instead of waiting
+  out up to `MAX_INTERVAL` (a real 60 s at `OpenSky`'s slowest, which would make a camera pan
+  feel broken for a milestone whose whole goal is "watchable"). **The footgun this required
+  defending against explicitly**: once every paired `Sender` is dropped, `changed()` resolves
+  `Err` *immediately, and forever after* — a `select!` that keeps racing it would busy-spin with
+  zero delay between cycles, hammering the active source. `run()` tracks a `retarget_live` bool:
+  the first `Err` still waits out one interval and disarms the channel from the `select!`
+  permanently; both headless mode (which never retargets) and window mode keep their `Sender`
+  alive for the process's life so this path is a defensive backstop, not the expected route.
+  Proven under `#[tokio::test(start_paused = true)]` (the pacer's own established pattern):
+  one test confirms a retarget sent mid-run changes the *very next* cycle's query with zero
+  virtual time elapsed (proving the `select!` actually won the race, not that the test waited
+  it out), another confirms a fully-dropped `Sender` degrades to exactly-paced cycles rather
+  than a spin.
+- **Window mode restores and persists the credit ledger exactly like headless mode does — not a
+  stripped-down version.** The ledger is a real-world daily-quota safety cap (privacy rule 1.3),
+  not a per-process bookkeeping nicety: without reading `source_status.credits_used_today` at
+  startup and writing it back after every cycle, running headless and window mode on the same
+  day (or window mode across two sessions in one day) would each track spend independently from
+  zero, risking the *actual* OpenSky quota even with each process's own ledger looking fine. The
+  merge/log/persist step itself was extracted out of `headless::record_cycle` into a new shared
+  `app::pipeline::record_cycle`, so window mode doesn't duplicate it — `headless.rs` now calls
+  the same function.
+- **A real cross-crate compile break, caught by the second delegated agent, not by me**: the
+  renderer-agent doing the `app::window` wiring found that `headless.rs` still called
+  `Poller::with_default_chain` with a bare `RegionQuery` — the already-landed `ingest::poller`
+  signature change (a `watch::Receiver<RegionQuery>`) meant the `app` crate did not compile at
+  all until that call site was fixed too, even though `headless.rs` itself was explicitly listed
+  as out-of-scope for the *first* agent (whose job was `ingest` only). Fixed in the same session
+  by building an immediately-dropped `watch::channel` there — headless never retargets, and per
+  the poller's own documented behavior a closed channel just falls back to the fixed cadence,
+  which is headless's fixed-region behavior anyway. Worth remembering: splitting a signature
+  change and its call sites across two delegated, sequentially-briefed agents leaves a real
+  window where the crate doesn't compile in between — this time the second agent's own build
+  caught it before it reached this session's independent verification, but the brief for the
+  first agent should probably have said "and confirm `cargo build --workspace` still succeeds"
+  rather than scoping verification to the `ingest` crate alone.
+- **A real gap found in this session's own independent re-verification, not by either agent**:
+  the brief specified detecting "camera changed" by comparing `(center_m, meters_per_pixel)`
+  immediately before/after `camera.update(dt_s)` inside `draw()` — which the renderer-agent
+  implemented exactly as specified and then correctly flagged, rather than silently patching,
+  that a `WindowEvent::Resized` with no accompanying pan/zoom would never be observed by that
+  comparison (a resize is fully applied by its own event handler *before* the next `draw()`
+  runs, so `draw()`'s before/after snapshot never sees a delta even though `viewport_bbox()`
+  genuinely changed with the new aspect ratio). Since aircraft don't render yet (M2 2.4/2.5),
+  this had zero visible effect today but would matter the moment they do. Fixed directly in this
+  session (small, ~6 lines, in a file already fully read): the `Resized` handler now also arms
+  `last_camera_change_instant` itself, letting the existing settle-and-send path in `draw()`
+  pick it up on its own. **Live-verified by accident, and more convincingly than a scripted
+  resize would have been**: a real multi-minute gap in this session (an unrelated tool outage)
+  left the running app alone for over an hour, during which something external resized its
+  window several times with no pan/zoom input at all — the log shows five separate "retargeted
+  mid-run" lines with five genuinely *different* bboxes (proving each was a real size change,
+  not a no-op resize storm re-arming the same value), confirming the fix end-to-end rather than
+  in isolation.
+- **Live-verified end to end against the owner's real credentials** (`cargo run -p look-above`,
+  `LOOK_ABOVE_LOG_FILTER=look_above=info,look_above_ingest=info,warn` to see both crates' info
+  lines): window mode's first cycle fetched the whole-world default viewport (6,229 aircraft, 4
+  credits — `OpenSky` bills a bbox query by area tier regardless of how large the bbox actually
+  is, not the separate ~400-credit global-query tier, so this is an expected one-time cost, not
+  a budget concern at 4 of 3,200/day), settled into the same budget-driven ~60 s cadence headless
+  mode already produces, and — across the accidental long run above — correctly retargeted five
+  times with shrinking/shifting bboxes as the window's real size changed, each followed by a
+  poll cycle against the *new* region. Source stayed `opensky` the entire run (never failed
+  over). Closed with `WM_CLOSE` → "close requested" → "window closed", no panic, exit clean.
+  Scratch `look_above.db` deleted afterward, following 1.12/1.13's precedent.
+- **Independently re-verified rather than trusted, both delegated pieces**: full diffs of
+  `crates/ingest/src/poller.rs`, `crates/app/src/window.rs`, `crates/app/src/headless.rs`,
+  `crates/app/src/main.rs`, and the new `crates/app/src/pipeline.rs` read in full (not
+  skimmed); `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/
+  `test --workspace` re-run fresh after the resize fix — **375 passed, 5 ignored, 0 failed**
+  (+6 over 2.3a's 369: 4 new `core::camera::viewport_bbox` tests, 2 new `ingest::poller`
+  retarget tests). Next: **2.4**, `core::sim` — the interpolation/dead-reckoning worker that
+  finally gives the `SessionTable` both pipelines now maintain somewhere to render from.
