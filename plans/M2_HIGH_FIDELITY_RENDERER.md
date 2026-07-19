@@ -248,9 +248,66 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       `fmt`/`clippy --all-targets -D warnings`/`test --workspace` green — **402 passed, 5
       ignored, 0 failed** (+8: 4 `double_buffer`, 4 `simulation`). DECISION_LOG 2.4b. Next:
       **2.5**, aircraft glyphs.)*
-- [ ] 2.5 Aircraft glyphs: SDF atlas (6 categories per docs/01), instanced quad pipeline,
+- [x] 2.5 Aircraft glyphs: SDF atlas (6 categories per docs/01), instanced quad pipeline,
       per-instance rotation from heading, altitude-bucket tint attribute (final ramp colors
       may land in M4; buckets wired now).
+      *(2026-07-19: implemented — the first item that actually draws a live aircraft. New
+      `crates/render/src/glyph_atlas.rs`: docs/01 asks for an "SDF glyph atlas" but there is no
+      image/font/asset-loading crate anywhere in this workspace and `render` must stay
+      self-contained (no bundled artwork, no network — ADR-002), so the atlas is **generated
+      procedurally at startup** rather than fetched or rasterized from an external asset — a
+      genuine deviation from the literal word "atlas" implying pre-made art, recorded as a
+      judgement call, not re-litigated. Six hand-authored 2D silhouettes (plain point lists,
+      evocative not literal: jet swept/delta, turboprop/piston straight-winged with piston's
+      wing set forward for a "high wing" read, glider the widest span/thinnest fuselage,
+      helicopter a rotor disc unioned with a tail-boom stub via signed-distance `max`, unknown a
+      plain dart) are rasterized via ray-casting point-in-polygon + point-to-segment distance
+      into a 64×64 `R8Unorm` tile apiece, packed into one static `384×64` strip, uploaded once.
+      New `crates/render/src/aircraft.rs`: the CPU-side instance packing (`InstanceRaw`) —
+      Mercator-metres position divided by `WEB_MERCATOR_EXTENT_M` (the same pre-normalized plane
+      `camera_view_proj`/`basemap::project_point` already operate on), heading in radians,
+      category → atlas-tile index, altitude-bucket tint with the stale-fade `alpha` folded into
+      `tint.a`. Glyph size is a **constant 20 on-screen pixels** (docs/01's L2 16–24px range),
+      derived each frame from the camera's `meters_per_pixel` so it never grows/shrinks with
+      zoom. New `crates/render/src/shaders/aircraft.wgsl`: instanced-quad vertex shader
+      (clockwise-from-north rotation of the local quad corners — Mercator `+y` and clip-space
+      `+y` both point "up/north" with no axis flip between them, so one rotation formula serves
+      both geography and screen), fragment shader `smoothstep`s a `fwidth`-derived band around
+      the SDF's `0.5` edge value for antialiasing (docs/01's "SDF-derived AA" quality-bar line),
+      alpha-blended (unlike the opaque base-map pipelines — both the SDF edge and the stale-fade
+      alpha need it). `color.rs` gained `altitude_bucket_tint`/`_table` — the skill's six flat
+      hex stops run through the existing `linearize_for_format` helper; per the checklist's own
+      parenthetical, these are flat placeholder colors, not the Oklab-interpolated ramp (M4).
+      `Renderer::render` signature changed to `render(&mut self, feed: &RenderFeed,
+      meters_per_pixel: f64)` (previously a dead parameterless call since 2.4b had nothing to
+      draw); `Renderer::new` now builds one shared view-proj `BindGroupLayout` object passed to
+      both `build_basemap_resources` and the new `build_aircraft_resources`, so one bind group
+      serves every pass's `@group(0)`. `app::window`'s call site updated to pass
+      `&self.current_feed`/`camera.meters_per_pixel()`; the existing `instances=` frame-stats
+      field is unchanged. **LOD tiers are explicitly out of scope**: docs/01 specifies L0/L1/L2
+      zoom tiers with cross-fade, but no M2 checklist item (2.1–2.10) actually implements tier
+      switching, and 2.3a already scoped the camera to regional-only — every aircraft in the
+      feed draws as one fixed-size L2-style glyph regardless of zoom, with no density-dot or
+      small-glyph representation at any distance. This is a real gap the M2 gate (2.10) will
+      hit at its L0/L1 visual-QA lines (docs/13 §L2-core's zoom-out-to-globe check) and needs
+      its own future milestone item before that gate can honestly pass — flagged here rather
+      than silently discovered at the gate. Delegated to the renderer-agent (interrupted mid-task
+      by a session API/rate-limit error right after the design was settled and before any file
+      was written; resumed the same agent from its transcript via `SendMessage` rather than
+      restarting cold, per 2.2b's established precedent), independently re-verified by this
+      session rather than trusted: every new/changed file read in full, `cargo fmt --check`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run fresh — **420
+      passed, 5 ignored, 0 failed** (+18 over 2.4b's 402, matching the agent's own count exactly)
+      — and a live `cargo run -p look-above` driven independently against the owner's real
+      `credentials.json` (Intel Arc/DX12): a whole-world OpenSky cycle (`tracked=13,307`, 4
+      credits) rendered distinct, differently-rotated dart glyphs (category is always `Unknown`
+      pre-M3 enrichment, as expected) tinted by altitude bucket (cyan/green/amber/violet visible
+      across busy regions) over the dark desaturated map, aircraft clearly the brightest things
+      on screen; clean `WM_CLOSE` exit (`close requested → window closed`, ~70 ms). Two stray
+      extra window instances from this session's own screenshot-scripting attempts (not an app
+      bug) were found still running afterward and closed the same way before the scratch
+      `look_above.db` was deleted per 1.12/1.13's convention. DECISION_LOG 2.5. Next: **2.6**,
+      trails.)*
 - [ ] 2.6 Trails (in-memory, last 5 min): per-aircraft ring buffer → triangle-strip ribbons,
       taper width/alpha, altitude-ramp coloring.
 - [ ] 2.7 Labels: glyph-atlas text (callsign + FL + kt), CPU collision culling with priority

@@ -1,5 +1,7 @@
 //! The map background and base-map palette, and the sRGB conversion they share.
 
+use look_above_core::sim::AltitudeBucket;
+
 /// Background of the map view, authored as nonlinear sRGB (`#0A0E14`).
 ///
 /// docs/01 asks for a dark, desaturated field so aircraft stay the brightest thing on
@@ -76,6 +78,66 @@ fn layer_color(srgb: [u8; 3], format: wgpu::TextureFormat) -> [f32; 4] {
     #[allow(clippy::cast_possible_truncation)]
     let narrow = |channel: f64| channel as f32;
     [narrow(r), narrow(g), narrow(b), 1.0]
+}
+
+/// The altitude ramp's six stops (M2 item 2.5), authored as flat nonlinear-sRGB hex per the
+/// high-fidelity-flight-visualization skill's table. docs/01's checklist parenthetical is
+/// explicit that the *perceptual* ramp (Oklab-interpolated between stops) lands in M4 — this
+/// wires the six discrete altitude-bucket tints the glyph attribute carries now, one flat color
+/// per bucket, no interpolation between them yet.
+const ALT_GROUND_SRGB: [u8; 3] = [0x6E, 0x70, 0x76];
+const ALT_BELOW_2000FT_SRGB: [u8; 3] = [0xC9, 0x7B, 0x3D];
+const ALT_TO_10000FT_SRGB: [u8; 3] = [0xA8, 0xB8, 0x4B];
+const ALT_TO_28000FT_SRGB: [u8; 3] = [0x4D, 0xBE, 0x8F];
+const ALT_TO_40000FT_SRGB: [u8; 3] = [0x3F, 0xA9, 0xD0];
+const ALT_ABOVE_40000FT_SRGB: [u8; 3] = [0x8B, 0x7B, 0xD8];
+
+/// [`AltitudeBucket`]'s stop index in the skill's ramp order (ground up to FL400+) — the single
+/// place that ordering is encoded; both [`altitude_bucket_tint_table`] (which builds an ordered
+/// array) and `aircraft::pack_instance` (which indexes into it) go through this function so
+/// there is exactly one place that could disagree with itself.
+pub(crate) fn altitude_bucket_index(bucket: AltitudeBucket) -> usize {
+    match bucket {
+        AltitudeBucket::Ground => 0,
+        AltitudeBucket::Below2000Ft => 1,
+        AltitudeBucket::To10000Ft => 2,
+        AltitudeBucket::To28000Ft => 3,
+        AltitudeBucket::To40000Ft => 4,
+        AltitudeBucket::Above40000Ft => 5,
+    }
+}
+
+/// The altitude-bucket tint for `bucket`, opaque, in shader-ready linear RGBA (same
+/// linearize-if-`srgb` reasoning as [`land_fill_color`]/[`coastline_stroke_color`]).
+pub fn altitude_bucket_tint(bucket: AltitudeBucket, format: wgpu::TextureFormat) -> [f32; 4] {
+    let srgb = match bucket {
+        AltitudeBucket::Ground => ALT_GROUND_SRGB,
+        AltitudeBucket::Below2000Ft => ALT_BELOW_2000FT_SRGB,
+        AltitudeBucket::To10000Ft => ALT_TO_10000FT_SRGB,
+        AltitudeBucket::To28000Ft => ALT_TO_28000FT_SRGB,
+        AltitudeBucket::To40000Ft => ALT_TO_40000FT_SRGB,
+        AltitudeBucket::Above40000Ft => ALT_ABOVE_40000FT_SRGB,
+    };
+    layer_color(srgb, format)
+}
+
+/// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
+/// `renderer.rs` (the colors never change frame to frame, only which bucket applies), so the
+/// per-instance packing path (`aircraft::pack_instance`) is a plain array lookup rather than
+/// re-running the sRGB transfer function for every aircraft, every frame.
+pub fn altitude_bucket_tint_table(format: wgpu::TextureFormat) -> [[f32; 4]; 6] {
+    let mut table = [[0.0_f32; 4]; 6];
+    for bucket in [
+        AltitudeBucket::Ground,
+        AltitudeBucket::Below2000Ft,
+        AltitudeBucket::To10000Ft,
+        AltitudeBucket::To28000Ft,
+        AltitudeBucket::To40000Ft,
+        AltitudeBucket::Above40000Ft,
+    ] {
+        table[altitude_bucket_index(bucket)] = altitude_bucket_tint(bucket, format);
+    }
+    table
 }
 
 #[cfg(test)]
@@ -189,5 +251,77 @@ mod tests {
         assert!(land_srgb[0] < land_plain[0]);
         assert!(land_srgb[1] < land_plain[1]);
         assert!(land_srgb[2] < land_plain[2]);
+    }
+
+    // ---- Altitude-bucket tint (M2 item 2.5) --------------------------------------------------
+
+    const ALL_BUCKETS: [AltitudeBucket; 6] = [
+        AltitudeBucket::Ground,
+        AltitudeBucket::Below2000Ft,
+        AltitudeBucket::To10000Ft,
+        AltitudeBucket::To28000Ft,
+        AltitudeBucket::To40000Ft,
+        AltitudeBucket::Above40000Ft,
+    ];
+
+    #[test]
+    fn altitude_bucket_tint_covers_all_six_buckets_with_distinct_opaque_colors() {
+        let mut seen = Vec::new();
+        for bucket in ALL_BUCKETS {
+            let color = altitude_bucket_tint(bucket, wgpu::TextureFormat::Bgra8UnormSrgb);
+            assert!(
+                (color[3] - 1.0).abs() < 1e-6,
+                "{bucket:?} tint must be opaque"
+            );
+            for channel in &color[..3] {
+                assert!(
+                    (0.0..=1.0).contains(channel),
+                    "{bucket:?} channel {channel} out of range"
+                );
+            }
+            seen.push(color);
+        }
+        for i in 0..seen.len() {
+            for j in (i + 1)..seen.len() {
+                assert_ne!(
+                    seen[i], seen[j],
+                    "buckets {:?} and {:?} share a tint",
+                    ALL_BUCKETS[i], ALL_BUCKETS[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn altitude_bucket_index_is_a_bijection_onto_zero_through_five() {
+        let mut indices: Vec<usize> = ALL_BUCKETS
+            .iter()
+            .map(|&b| altitude_bucket_index(b))
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn altitude_bucket_tint_table_matches_the_per_bucket_lookup() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let table = altitude_bucket_tint_table(format);
+        for bucket in ALL_BUCKETS {
+            assert_eq!(
+                table[altitude_bucket_index(bucket)],
+                altitude_bucket_tint(bucket, format)
+            );
+        }
+    }
+
+    #[test]
+    fn altitude_bucket_tint_darkens_on_an_srgb_surface_too() {
+        let srgb = altitude_bucket_tint(
+            AltitudeBucket::To28000Ft,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        );
+        let plain =
+            altitude_bucket_tint(AltitudeBucket::To28000Ft, wgpu::TextureFormat::Bgra8Unorm);
+        assert!(srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2]);
     }
 }

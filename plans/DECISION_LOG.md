@@ -1742,3 +1742,84 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   (+8 over 2.4a's 394: 4 `double_buffer`, 4 `simulation`). Scratch `look_above.db` deleted after,
   per 1.12/1.13's convention. Next: **2.5**, the aircraft glyph pipeline (SDF atlas, instanced
   quads) — the first item to actually draw the feed 2.4b now delivers.
+
+## 2026-07-19 — M2 item 2.5 (aircraft glyphs)
+
+- **The SDF atlas is generated procedurally at startup, not loaded from a bundled/fetched
+  asset.** docs/01 says "SDF glyph atlas", which reads as pre-made art, but no image/font/SVG
+  crate exists anywhere in this workspace and `render` must stay self-contained (no network, no
+  filesystem assets beyond the basemap GeoJSON already bundled — ADR-002). Reaching for a new
+  crate (an SVG rasterizer, a font-SDF baker) to draw six simple category silhouettes would be
+  the premature-abstraction/dependency-weight the token-management rules warn against for a v1
+  "distinguishable at a glance" bar. Instead `crates/render/src/glyph_atlas.rs` hand-authors six
+  simple polygon silhouettes (plain `(f32, f32)` point lists) and rasterizes each into a 64×64
+  `R8Unorm` tile via ray-casting point-in-polygon + point-to-segment distance (standard SDF
+  convention: `0.5` at the edge), packed into one static `384×64` strip uploaded once. A genuine
+  deviation from the doc's literal wording, made and recorded rather than silently substituted.
+- **Six silhouettes, evocative not literal**: jet swept/delta, turboprop and piston/light both
+  straight-winged (piston's wing set further forward and narrower for a "high wing" read),
+  glider the widest span with the thinnest fuselage, helicopter a circular rotor disc unioned
+  with a small tail-boom rectangle (signed-distance union via `max`, the mirror of the usual
+  negative-inside SDF union's `min`), unknown a plain 4-point dart. "Distinguishable, not
+  pretty" is the explicit v1 bar (docs/01/skill) — these are not meant to be revisited as an
+  embarrassment once real artwork exists, only once a real asset pipeline is worth building.
+- **Every aircraft draws as one fixed-size L2-style glyph; LOD tiers are out of scope for this
+  item.** docs/01 specifies three zoom tiers (L0 density dots > 3,000 km, L1 small glyphs
+  300–3,000 km, L2 full glyphs < 300 km) with hysteresis and cross-fade, but no M2 checklist
+  item (2.1 through 2.10) actually implements tier switching — 2.3a already scoped the camera
+  itself to regional-only, no L0 globe view. `aircraft::AIRCRAFT_GLYPH_PX` (20 px, docs/01's
+  16–24 px L2 range) is converted to a world-space scale from the camera's `meters_per_pixel`
+  every frame, so the glyph stays a constant screen size at any zoom — but there is no
+  density-dot or small-glyph representation at any distance. **This is a real gap, not a
+  deferred nice-to-have**: docs/13 §L2-core's zoom-out-to-globe check is part of the M2 gate
+  (2.10), and nothing in 2.1–2.9 will produce the L0/L1 behavior it tests. A future milestone
+  item (LOD tier switching + cross-fade) needs to exist before 2.10 can honestly run that line —
+  flagged here at 2.5 rather than discovered cold at the gate.
+- **Rotation is "clockwise from geographic north" and "clockwise on screen" via one formula,
+  because no axis flip sits between them.** Web Mercator's `+y` (north) and clip space's `+y`
+  (up) point the same way (`camera_view_proj` never flips an axis), so
+  `aircraft::rotate_clockwise_from_north` — mirrored exactly in `aircraft.wgsl`'s vertex shader,
+  since WGSL isn't unit-testable from `cargo test` — serves both without a sign correction. Pinned
+  by four cardinal-point tests (0°/90°/180°/270° → north/east/south/west).
+- **Instance packing (Mercator metres → normalized plane, `f64` → `f32`, altitude bucket → tint,
+  stale-fade alpha folded into `tint.a`) happens on the render thread inside `Renderer::render`,
+  not in `core::sim`.** `core::sim`'s own module doc already said this narrowing was deferred to
+  2.5; per ADR-002 the render thread's job is "swap buffer, upload instances, ... nothing else",
+  and packing an already-computed feed into GPU-ready bytes is upload prep, not simulation —
+  `core` stays render-convention-free (`f64`/`Copy` throughout, as 2.4a left it).
+- **`Renderer::render` gained a signature** (`feed: &RenderFeed, meters_per_pixel: f64`) after
+  2.4b deliberately left it parameterless (nothing to draw yet). `Renderer::new` now builds one
+  shared view-proj `BindGroupLayout` object handed to both the base-map and aircraft pipeline
+  builders, so the one `basemap_view_proj_bind_group` can be passed into every pass's draw call
+  — wgpu rejects a bind group against a pipeline built from a merely structurally-identical but
+  distinct layout object, so this had to be one shared object, not two equivalent ones.
+- **Altitude-bucket tints are flat placeholder colors, not the skill's Oklab-interpolated ramp**
+  — `color::altitude_bucket_tint` wires the skill's six hex stops directly (through the existing
+  `linearize_for_format` helper), per the checklist's own parenthetical that the perceptual ramp
+  lands at M4. Buckets are wired now so the attribute exists and is visibly distinguishable
+  (verified live: cyan/green/amber/violet visible across busy regions), not because this is the
+  final palette.
+- **Delegated to the renderer-agent** (glyph/SDF atlases and instanced pipelines are named
+  exactly in its remit) with the atlas-generation and LOD-out-of-scope calls above already made,
+  so the agent implemented rather than re-decided them. **Interrupted mid-task by a session
+  API/rate-limit error** right after the design was settled and before any file had been
+  written; resumed the same agent via `SendMessage` from its own transcript rather than
+  restarting cold — the same recovery path 2.2b used for its own mid-session connection error.
+- **Independently re-verified rather than trusted**: every new/changed file
+  (`glyph_atlas.rs`, `aircraft.rs`, `aircraft.wgsl`, `color.rs`, `renderer.rs`, `lib.rs`,
+  `app::window.rs`) read in full by this session, `cargo fmt --check`/`clippy --workspace
+  --all-targets -D warnings`/`test --workspace` re-run fresh — **420 passed, 5 ignored, 0
+  failed** (+18 over 2.4b's 402: 9 `aircraft.rs`, 5 `glyph_atlas.rs`, 4 new in `color.rs`),
+  matching the agent's own reported count exactly. **Live-verified independently**, not just via
+  the agent's own screenshot: `cargo run -p look-above` against the owner's real
+  `credentials.json` (Intel Arc/DX12, 1920×1200) — a whole-world OpenSky cycle
+  (`tracked=13,307`, 4 credits, ledger already at 16/3,200 before this run) rendered distinct,
+  differently-rotated dart glyphs (category is always `Unknown` pre-M3 enrichment, as expected)
+  tinted by altitude bucket over the dark desaturated map, aircraft clearly the brightest things
+  on screen; a scripted zoom-in attempt did not visibly change the view (a cursor-focus
+  scripting quirk in this session's own screenshot tooling, not exercised further — the
+  world-view screenshot already showed everything 2.5 needed to prove) and was not chased
+  further. Clean `WM_CLOSE` exit (`close requested → window closed`, ~70 ms). Two extra stray
+  window instances turned up afterward from this session's own earlier failed screenshot-script
+  launch attempts (not an app bug); closed the same way before the scratch `look_above.db` was
+  deleted per 1.12/1.13's convention. Next: **2.6**, trails.

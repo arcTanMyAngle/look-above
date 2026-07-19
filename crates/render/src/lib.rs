@@ -3,9 +3,11 @@
 //! Kept minimal in M0 (surface + clear only); the real pipeline is M2.
 //! No network and no DB access from this crate.
 
+mod aircraft;
 mod basemap;
 mod color;
 mod error;
+mod glyph_atlas;
 mod renderer;
 
 pub use error::RenderError;

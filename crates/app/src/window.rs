@@ -325,7 +325,7 @@ impl App {
             self.current_feed = feed;
         }
 
-        match renderer.render() {
+        match renderer.render(&self.current_feed, camera.meters_per_pixel()) {
             Ok(FrameOutcome::Presented) => {
                 if let Some(summary) = self.stats.record(now) {
                     if self.stats_visible {

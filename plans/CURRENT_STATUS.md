@@ -3,15 +3,40 @@
 > The single source of truth for "where are we". Every session reads this first and updates
 > it last. Keep the Now section ≤ 10 lines; move history to the log below.
 
-## Now (updated 2026-07-18)
+## Now (updated 2026-07-19)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b done.
-  Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.5** — the aircraft glyph pipeline: SDF atlas (6 categories per
-  docs/01), instanced quad pipeline, per-instance rotation from heading, altitude-bucket tint.
-  This is the first item to actually *draw* the `RenderFeed` 2.4b now delivers to the render
-  thread (and the point at which `&RenderFeed` finally gets plumbed into `Renderer::render`).
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5
+  done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.6** — trails (in-memory, last 5 min): per-aircraft ring buffer →
+  triangle-strip ribbons, taper width/alpha, altitude-ramp coloring.
+- **⚠ Flagged, not yet its own item: LOD tiers.** 2.5 draws every aircraft as one fixed-size
+  L2-style glyph at any zoom; no M2 checklist item (2.1–2.10) implements L0/L1 tier switching,
+  and docs/13 §L2-core's zoom-out-to-globe check is part of the M2 gate (2.10) — a future
+  milestone item for LOD cross-fade needs to exist before that gate can honestly pass. DECISION_LOG 2.5.
+- **2.5 landed:** the aircraft glyph pipeline — the first item to actually draw a live aircraft.
+  New `render::glyph_atlas` (a procedurally-generated SDF atlas, 6 categories, 64×64 tiles in one
+  static `384×64` strip — no image/font/asset crate exists in this workspace, so the silhouettes
+  are hand-authored polygons rasterized via ray-casting, not fetched/loaded art) and
+  `render::aircraft` (CPU-side instance packing: Mercator metres → the same pre-normalized plane
+  `camera_view_proj`/basemap already use, heading → rotation radians, altitude bucket → tint
+  with stale-fade alpha folded in). New `aircraft.wgsl`: instanced quads, per-instance
+  clockwise-from-north rotation, `smoothstep`-around-0.5 SDF antialiasing, alpha blended.
+  `color.rs` gained flat placeholder altitude-bucket tints (real Oklab ramp is M4, per the
+  checklist's own parenthetical). `Renderer::render` gained a real signature
+  (`feed: &RenderFeed, meters_per_pixel: f64`) after 2.4b left it a dead parameterless call.
+  Glyph size is a constant 20 on-screen px regardless of zoom (LOD tiers are explicitly out of
+  scope — see the flagged item above). Delegated to the renderer-agent (interrupted mid-task by
+  a session API/rate-limit error before any file was written; resumed via `SendMessage` from its
+  transcript, same recovery path as 2.2b's connection-error interruption), independently
+  re-verified by this session: every changed/new file read in full, `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run fresh — **420 passed,
+  5 ignored, 0 failed** (+18 over 2.4b's 402), matching the agent's own count. **Live-verified**
+  independently against the owner's real `credentials.json` (Intel Arc/DX12): a whole-world
+  OpenSky cycle (`tracked=13,307`, 4 credits) rendered distinct, differently-rotated dart glyphs
+  (category always `Unknown` pre-M3, as expected) tinted by altitude bucket over the dark map,
+  aircraft clearly the brightest things on screen; clean `WM_CLOSE` exit (~70 ms). DECISION_LOG
+  2.5.
 - **2.4b landed:** the `core::sim` wiring. New `app::simulation` (a dedicated worker thread) +
   `app::double_buffer` (a latest-wins SPSC mailbox). Per ADR-002 the whole merge/interpolate/
   persist side moved *off* the render thread onto the worker: it owns the `SessionTable`/
@@ -115,9 +140,17 @@
 - **Blockers:** the owner must rename the repo `look_above` → `look-above`, then push (no SSH
   key on this machine) — CI has never run; M0's one unmet gate line.
   [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1.
-- **Credit spend to date: ~325+ of 4,000/day** (the ~300+ below, plus 2.4b's two live window-mode
-  verification runs today spending ~24 more — 4 credits/cycle × ~6 whole-world OpenSky cycles,
-  2026-07-18, against the owner's real credentials; still far under the 3,200/80% cap). Detail:
+- **Credit spend to date: ~325+ of 4,000/day on 2026-07-18; a fresh day's ledger on 2026-07-19**
+  (UTC-day reset, per `CreditLedger`'s own design) **spent roughly 20–30 more** today: the
+  renderer-agent's own live-verification pass before this session's independent re-verification
+  (ledger read back `credits_used_today=16` at the start of this session's own run), plus this
+  session's run (one whole-world cycle, 4 credits, then failed over to the free `airplaneslive`
+  fallback) and two stray extra window instances left running from this session's own
+  screenshot-scripting attempts (found and closed, see DECISION_LOG 2.5) that would have polled
+  independently for the few minutes they were up — not tallied exactly, but nowhere close to the
+  3,200/80% cap either way. 2026-07-18's detail: the ~300+ below, plus 2.4b's two live
+  window-mode verification runs that day spending ~24 more — 4 credits/cycle × ~6 whole-world
+  OpenSky cycles, against the owner's real credentials. Further detail:
   203 carried from M1's 1.4/1.12/1.13 above, plus
   2.3b's two live-verification runs today: the renderer-agent's own window-mode drive spent at
   least 12 (its report showed 3 cycles before the snippet it quoted cut off, not necessarily its
@@ -157,6 +190,55 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.5: the aircraft glyph pipeline — the first item to actually draw a
+  live aircraft. New `render::glyph_atlas`: docs/01 asks for an "SDF glyph atlas" but no
+  image/font/asset-loading crate exists anywhere in this workspace and `render` must stay
+  self-contained (ADR-002), so the atlas is **procedurally generated at startup** rather than
+  loaded — six hand-authored 2D silhouettes (evocative, not literal: jet swept/delta,
+  turboprop/piston straight-winged, glider widest-span/thinnest-fuselage, helicopter a rotor
+  disc unioned with a tail-boom stub, unknown a plain dart), each rasterized via ray-casting
+  point-in-polygon + point-to-segment distance into a 64×64 `R8Unorm` tile, packed into one
+  static `384×64` strip uploaded once — a genuine deviation from the doc's literal wording,
+  recorded rather than silently substituted. New `render::aircraft`: CPU-side instance packing
+  (Mercator metres ÷ `WEB_MERCATOR_EXTENT_M` — the same pre-normalized plane `camera_view_proj`/
+  `basemap::project_point` already use — heading → rotation radians, category → atlas-tile
+  index, altitude bucket → tint with the stale-fade `alpha` folded into `tint.a`), the
+  clockwise-from-north rotation formula (mirrored exactly in the new `aircraft.wgsl`, since WGSL
+  isn't unit-testable), and the constant-20px on-screen glyph scale derived each frame from the
+  camera's `meters_per_pixel` (LOD tiers are explicitly out of scope — see below). `aircraft.wgsl`:
+  instanced quads, per-instance rotation applied to the local corners, `smoothstep`-around-0.5
+  SDF antialiasing, alpha blended (unlike the opaque base-map pipelines). `color.rs` gained
+  `altitude_bucket_tint`/`_table` — the skill's six flat hex stops, not the Oklab-interpolated
+  ramp (M4, per the checklist's own parenthetical). `Renderer::render` gained a real signature
+  (`feed: &RenderFeed, meters_per_pixel: f64`) after 2.4b left it parameterless; `Renderer::new`
+  now builds one shared view-proj `BindGroupLayout` handed to both the base-map and aircraft
+  pipeline builders so one bind group serves every pass. **LOD tiers are explicitly out of
+  scope**: no M2 checklist item (2.1–2.10) implements L0/L1 zoom-tier switching, and docs/13
+  §L2-core's zoom-out-to-globe check is part of the M2 gate (2.10) — a future milestone item is
+  needed before that gate can honestly pass; flagged now rather than discovered cold at the
+  gate. Delegated to the renderer-agent (glyph/SDF atlases are named in its remit), with the
+  atlas-generation and LOD-scope calls already made so the agent implemented rather than
+  re-decided them; **interrupted mid-task by a session API/rate-limit error** right after the
+  design was settled and before any file was written — resumed the same agent via `SendMessage`
+  from its own transcript rather than restarting cold, the same recovery path 2.2b used for its
+  connection error. **Independently re-verified rather than trusted**: every new/changed file
+  read in full by this session, `cargo fmt --check`/`clippy --workspace --all-targets -D
+  warnings`/`test --workspace` re-run fresh — **420 passed, 5 ignored, 0 failed** (+18 over
+  2.4b's 402: 9 `aircraft.rs`, 5 `glyph_atlas.rs`, 4 new in `color.rs`), matching the agent's own
+  count exactly. **Live-verified independently** (not just the agent's own screenshot): a fresh
+  `cargo run -p look-above` against the owner's real `credentials.json` (Intel Arc/DX12,
+  1920×1200) — a whole-world OpenSky cycle (`tracked=13,307`, 4 credits) rendered distinct,
+  differently-rotated dart glyphs (category always `Unknown` pre-M3 enrichment, as expected)
+  tinted by altitude bucket (cyan/green/amber/violet visible across busy regions) over the dark
+  desaturated map, aircraft clearly the brightest things on screen; a scripted zoom-in attempt
+  didn't visibly change the view (a cursor-focus scripting quirk in this session's own
+  screenshot tooling, not chased further since the world-view screenshot already proved what 2.5
+  needed) and a clean `WM_CLOSE` exit (`close requested → window closed`, ~70 ms). Two stray
+  extra window instances turned up afterward from this session's own earlier failed
+  screenshot-script launch attempts (not an app bug); closed the same way, then the scratch
+  `look_above.db` was deleted per 1.12/1.13's convention. DECISION_LOG 2.5. Next: **2.6**,
+  trails (in-memory ring buffer → triangle-strip ribbons).
 
 - **2026-07-18** — M2 item 2.4b: the `core::sim` wiring (double buffer + simulation worker).
   Two new `app` modules: `double_buffer` (a latest-wins single-producer/single-consumer mailbox
