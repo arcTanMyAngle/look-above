@@ -1964,3 +1964,57 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   whole-world viewport with accumulated trails. Both resolve with the same future LOD item that
   2.5 already flagged (draw trails only at L2); noted here so the trail cost is on record for that
   item rather than discovered at the gate. Next: **2.7**, labels.
+
+## 2026-07-19 — M2 item 2.7a (label content on `AircraftInstance`)
+
+- **Split 2.7 → 2.7a/2.7b before writing anything**, same shape as every prior M2 item. Two
+  independent reasons, not one: (1) label *content* (callsign/FL/kt) is plain per-fix data with no
+  camera dependency, while *placement and collision culling* are inherently screen-space and need
+  the camera `core` deliberately doesn't have (2.3a's boundary — the same reason 2.6a/2.6b split
+  trail sampling from ribbon widening); (2) `AircraftInstance` didn't carry callsign, raw altitude,
+  or ground speed at all before this item — only the coarse `altitude_bucket` — so nothing on the
+  render side could be honestly written yet regardless.
+- **Deviated from docs/09's literal `RenderFeed.labels: Vec<Label>` field, deliberately.** That
+  contract types labels as "pre-collision-culled" and "built by the interpolation stage" — i.e.
+  in `core`. But collision culling and placement need pixel-space viewport geometry, which only
+  `render`/`app` have; folding that into `core::sim` would mean teaching `core` about the camera,
+  which ADR-002/2.3a already ruled out. Chose instead: `core` carries label *content* as new
+  fields directly on `AircraftInstance` (no new `Label`/`RenderFeed.labels` type), `render` (2.7b)
+  owns everything screen-space. Recorded here rather than silently diverging from the typed
+  contract in docs/09 — same category of call as 2.5's atlas-generation deviation and 2.6a/2.6b's
+  own split.
+- **`callsign` is sticky across fixes that omit it.** Identification messages and position reports
+  arrive on separate cadences in the real feeds (`docs/09`'s adapters already tolerate nulls
+  per-field); if a later fix's blank callsign cleared a previously known one, the label would
+  flicker to "no callsign" and back on every other poll cycle. A fix's callsign only *replaces*
+  the held one when it actually carries one — verified by a dedicated test distinguishing "blank
+  doesn't clear" from "a real new value does replace."
+- **`altitude_ft` is `Some(0.0)` on the ground, not `None`.** "0 ft while on the ground" is real
+  data, not an unknown field — gating it away in `core` would be a formatting decision (2.7b's
+  job: should a taxiing aircraft's label show `FL000`? probably not), not a data-availability one.
+  `core` only reports `None` when the fix genuinely never carried an altitude.
+- **`ground_speed_kt` uses the raw fix's speed, not a blended value.** Position/heading/altitude
+  all blend over the 2 s correction window because a *visible jump* would look wrong; a label's
+  *text* updating immediately when a new, more current speed arrives is correct, not a bug — text
+  has no "motion" to smooth.
+- **Dropped `AircraftInstance`'s `Copy` derive** (kept `Clone`), same reasoning and same
+  precedent as `Track` at 2.6a: `callsign: Option<CallSign>` owns a heap allocation. Grepped every
+  call site first (`aircraft.rs`, `renderer.rs`) rather than assuming — both already took
+  `&AircraftInstance` or consumed owned values out of a `Vec`, so the blast radius was exactly the
+  two test fixtures that constructed the struct literal directly (both updated).
+- **Priority's "selected" component is explicitly deferred to 2.8**, not implemented as a
+  placeholder. There's no selection state anywhere yet (2.8 hasn't landed); 2.7b's collision
+  priority will treat it as always-false and this gap is flagged in the 2.7b checklist line
+  itself, not discovered cold at that item's own implementation time.
+- **Done directly, not delegated.** `sim.rs` was already read in full this session to make the
+  split call above; a cold subagent would only re-derive it (2.4a/2.6a's own precedent for the
+  same reasoning).
+- 5 new unit tests in `core::sim` (content carried onto a first sighting with the exact
+  `KT_PER_MS`/`FT_PER_M` conversions pinned; missing callsign/altitude/speed each leave their
+  field `None`; a later blank-callsign fix does not clear a previously known one; a later fix with
+  an actual new callsign does replace it; altitude is still reported while on the ground).
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green
+  — **441 passed, 5 ignored, 0 failed** (+5 over 2.6b's 436, all in `core`). No live run: pure
+  data plumbing with no renderable surface until 2.7b consumes the new fields (2.4a/2.6a's own
+  precedent for the same reason). Next: **2.7b**, the render-side text glyph atlas + placement +
+  collision culling + leader lines.

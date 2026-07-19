@@ -35,7 +35,7 @@ use crate::geo::{
     normalize_bearing_deg, web_mercator_forward,
 };
 use crate::merge::{DROP_AFTER_S, STALE_AFTER_S};
-use crate::types::{Icao24, StateVector};
+use crate::types::{CallSign, Icao24, StateVector};
 
 /// The correction-blend window, in seconds — the skill's `min(2 s, …)` cap. We do not know the
 /// exact time to the next fix (it depends on the budget-driven poll cadence), so the cap is used
@@ -69,6 +69,12 @@ pub const TRAIL_SAMPLE_INTERVAL_S: f64 = 1.0;
 
 /// Feet per metre, for the altitude-bucket thresholds (which the skill states in feet).
 const FT_PER_M: f64 = 3.280_839_895;
+
+/// Knots per m/s — exact, from the definition of a knot (1 nmi/h = 1,852 m / 3,600 s). Used to
+/// convert [`Fix::speed_ms`] into [`AircraftInstance::ground_speed_kt`] for the label text (M2
+/// item 2.7a: `core` carries the unit conversion once, the same way it already does for
+/// [`AltitudeBucket`], rather than teaching every consumer feet/knots arithmetic).
+const KT_PER_MS: f64 = 3600.0 / 1852.0;
 
 /// Seconds-since-epoch (and the small staleness horizons) as `f64`.
 ///
@@ -120,13 +126,18 @@ impl AltitudeBucket {
     }
 }
 
-/// One aircraft's drawable state for a single frame — flat, `Copy`, ready for the renderer.
+/// One aircraft's drawable state for a single frame, ready for the renderer.
 ///
 /// The position is already projected to Web Mercator metres (the projection is batched on the
 /// same worker pass as the interpolation, per the skill's performance recipe). Fields kept as
 /// `f64` here; the renderer narrows to `f32` when it packs the GPU instance buffer (2.5), so
 /// `core` carries no render-specific numeric convention.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Not `Copy` (M2 item 2.7a, same reason [`Track`] itself dropped it at 2.6a): `callsign` owns a
+/// heap allocation. Nothing in this crate or `render` ever needed to duplicate a whole instance
+/// by value, only pass it by reference (`aircraft::pack_instance`) or move it out of the
+/// `rayon` collection in [`Simulator::advance_all`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct AircraftInstance {
     pub icao24: Icao24,
     /// Displayed position, projected to Web Mercator (`EPSG:3857`) metres.
@@ -142,6 +153,19 @@ pub struct AircraftInstance {
     pub on_ground: bool,
     /// PIA/blocked target (privacy rule 2.2): the renderer draws it but never labels it.
     pub anonymous: bool,
+    /// Last known callsign (M2 item 2.7a — label content). Sticky: a fix that omits it (a
+    /// protocol framing gap, not a real loss of identity) does not clear a previously known one.
+    /// `None` before any fix has carried one — the label's "omit unknowns" case.
+    pub callsign: Option<CallSign>,
+    /// Displayed altitude in feet, for the label's `FLnnn` text — the same value
+    /// [`AltitudeBucket::classify`] buckets, just carried at full precision. `None` when the fix
+    /// has never reported an altitude (mirrors `altitude_bucket`'s `alt_known` gate); still
+    /// `Some` while on the ground, since "0 ft" is real data, not an unknown — the label's own
+    /// formatting (2.7b) decides whether to show it while `on_ground`.
+    pub altitude_ft: Option<f64>,
+    /// Ground speed in knots, for the label's `nnnkt` text. `None` when the fix has never
+    /// reported a velocity (the skill's missing-field rule) — the label's "omit unknowns" case.
+    pub ground_speed_kt: Option<f64>,
 }
 
 /// One point along an aircraft's trail (M2 item 2.6a) — a flat centerline sample, not yet
@@ -172,8 +196,14 @@ pub struct TrailVertex {
 /// What the CPU pipeline hands the renderer each frame (docs/09).
 ///
 /// Flat and pre-sorted; the render thread swaps to it and never blocks on production (the
-/// double-buffering itself is 2.4b's job). Labels (docs/09's full shape) are the remaining gap,
-/// appended by their own milestone item (2.7) rather than defined empty ahead of need.
+/// double-buffering itself is 2.4b's job). docs/09 types a `labels: Vec<Label>` field here,
+/// "pre-collision-culled" — but collision culling and placement (right-of-glyph, flip near the
+/// viewport edge, leader lines) are inherently screen-space and need the camera, which `core`
+/// deliberately doesn't have (2.3a), the same reason 2.6a kept trail ribbon-widening out of this
+/// struct. M2 item 2.7a instead carries the label *content* (callsign/altitude/speed) as new
+/// fields directly on [`AircraftInstance`] — no new interpolation or blending needed, it's static
+/// per-fix data — and leaves layout/culling entirely to `render` (2.7b), a documented deviation
+/// from docs/09's literal shape rather than a silent one.
 #[derive(Debug, Clone, Default)]
 pub struct RenderFeed {
     /// Frame time, wall-clock seconds — the `now_s` the feed was advanced to.
@@ -282,6 +312,9 @@ struct Track {
     last_fix_ts: f64,
     /// PIA/blocked (privacy rule 2.2), carried from the fix onto the instance.
     anonymous: bool,
+    /// Last known callsign (M2 item 2.7a). Sticky across fixes that omit it — see
+    /// [`Track::apply_fix`].
+    callsign: Option<CallSign>,
     /// Ring buffer of displayed positions sampled at ≥ 1 Hz over the last [`TRAIL_DURATION_S`]
     /// (M2 item 2.6a) — the skill's "last 5 min of displayed positions" trail. Oldest first.
     trail: VecDeque<TrailSample>,
@@ -306,6 +339,7 @@ impl Track {
             blend: None,
             last_fix_ts: fix.t0,
             anonymous: state.anonymous,
+            callsign: state.callsign.clone(),
             trail: VecDeque::new(),
             last_trail_sample_s: None,
         }
@@ -321,6 +355,12 @@ impl Track {
         self.fix = new_fix;
         self.last_fix_ts = new_fix.t0;
         self.anonymous = state.anonymous;
+        // Sticky: a fix that omits the callsign (a protocol framing gap — identification
+        // messages arrive separately from position ones) must not blank out a previously known
+        // one, or the label would flicker in and out with every other poll cycle.
+        if let Some(cs) = &state.callsign {
+            self.callsign = Some(cs.clone());
+        }
 
         let mode = if error_m > TELEPORT_M {
             BlendMode::Teleport
@@ -421,6 +461,9 @@ impl Track {
             alpha,
             on_ground: self.fix.on_ground,
             anonymous: self.anonymous,
+            callsign: self.callsign.clone(),
+            altitude_ft: alt_known.then_some(self.display.alt_m * FT_PER_M),
+            ground_speed_kt: self.fix.speed_ms.map(|v| v * KT_PER_MS),
         };
 
         // Only recorded while the instance is actually visible this frame — an aircraft that
@@ -953,6 +996,99 @@ mod tests {
         s.anonymous = true;
         sim.ingest(&[s], 1_000.0);
         assert!(sim.advance_all(1_000.0).aircraft[0].anonymous);
+    }
+
+    // ---- Label content (M2 item 2.7a) ------------------------------------------------------------
+
+    #[test]
+    fn a_first_sighting_carries_its_callsign_altitude_and_speed_onto_the_instance() {
+        let mut sim = Simulator::new();
+        let mut s = state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST); // 200 m/s, 3,000 m
+        s.callsign = CallSign::new("DLH9LF");
+        sim.ingest(&[s], 1_000.0);
+
+        let instance = &sim.advance_all(1_000.0).aircraft[0];
+        assert_eq!(
+            instance.callsign.as_ref().map(CallSign::as_str),
+            Some("DLH9LF")
+        );
+        assert!((instance.altitude_ft.expect("altitude known") - 3_000.0 * FT_PER_M).abs() < 1e-6);
+        assert!((instance.ground_speed_kt.expect("speed known") - 200.0 * KT_PER_MS).abs() < 1e-6);
+    }
+
+    #[test]
+    fn missing_callsign_altitude_or_speed_leaves_the_field_none() {
+        let mut sim = Simulator::new();
+        let mut s = state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST);
+        s.callsign = None;
+        s.baro_alt_m = None;
+        s.velocity_ms = None;
+        sim.ingest(&[s], 1_000.0);
+
+        let instance = &sim.advance_all(1_000.0).aircraft[0];
+        assert_eq!(instance.callsign, None);
+        assert_eq!(instance.altitude_ft, None);
+        assert_eq!(instance.ground_speed_kt, None);
+    }
+
+    #[test]
+    fn a_later_fix_omitting_the_callsign_does_not_clear_a_previously_known_one() {
+        let mut sim = Simulator::new();
+        let mut first = state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST);
+        first.callsign = CallSign::new("UAL123");
+        sim.ingest(&[first], 1_000.0);
+        assert_eq!(
+            sim.advance_all(1_000.0).aircraft[0]
+                .callsign
+                .as_ref()
+                .map(CallSign::as_str),
+            Some("UAL123")
+        );
+
+        // A later fix's own callsign field is blank (a protocol framing gap) — the label must
+        // keep showing the last known identity, not flicker to "no callsign".
+        let mut second = state("3c6444", 1_010, 0.0, 0.0, 200.0, EAST);
+        second.callsign = None;
+        sim.ingest(&[second], 1_010.0);
+        assert_eq!(
+            sim.advance_all(1_010.0).aircraft[0]
+                .callsign
+                .as_ref()
+                .map(CallSign::as_str),
+            Some("UAL123"),
+            "a blank callsign on a later fix must not clear the previously known one"
+        );
+    }
+
+    #[test]
+    fn a_later_fix_with_a_new_callsign_replaces_the_old_one() {
+        let mut sim = Simulator::new();
+        let mut first = state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST);
+        first.callsign = CallSign::new("UAL123");
+        sim.ingest(&[first], 1_000.0);
+
+        let mut second = state("3c6444", 1_010, 0.0, 0.0, 200.0, EAST);
+        second.callsign = CallSign::new("UAL456");
+        sim.ingest(&[second], 1_010.0);
+        assert_eq!(
+            sim.advance_all(1_010.0).aircraft[0]
+                .callsign
+                .as_ref()
+                .map(CallSign::as_str),
+            Some("UAL456")
+        );
+    }
+
+    #[test]
+    fn altitude_ft_is_still_reported_while_on_the_ground() {
+        // On-ground is real data ("0 ft"), not an unknown — the label's own formatting (2.7b)
+        // decides whether to actually show it, `core` doesn't gate it away here.
+        let mut sim = Simulator::new();
+        let mut s = state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST);
+        s.on_ground = true;
+        s.baro_alt_m = Some(0.0);
+        sim.ingest(&[s], 1_000.0);
+        assert_eq!(sim.advance_all(1_000.0).aircraft[0].altitude_ft, Some(0.0));
     }
 
     // ---- Trails (M2 item 2.6a) ------------------------------------------------------------------

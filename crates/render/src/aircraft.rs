@@ -356,6 +356,9 @@ mod tests {
             alpha: 0.5,
             on_ground: false,
             anonymous: false,
+            callsign: None,
+            altitude_ft: None,
+            ground_speed_kt: None,
         };
 
         let raw = pack_instance(&instance, &opaque_white_table);
@@ -401,6 +404,9 @@ mod tests {
             alpha: 1.0,
             on_ground: false,
             anonymous: false,
+            callsign: None,
+            altitude_ft: None,
+            ground_speed_kt: None,
         };
 
         let raw = pack_instance(&instance, &table);

@@ -7,10 +7,29 @@
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
   open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5,
-  2.6a, 2.6b done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.7** — labels: glyph-atlas text (callsign + FL + kt), CPU collision
-  culling with priority (docs/01), leader-line when displaced. (2.1b — the F3 stats overlay —
-  also depends on 2.7's glyph-atlas text and is still open; do 2.7 first.)
+  2.6a, 2.6b, 2.7a done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.7b** — the render-side half of labels: a procedurally generated
+  stroke-font SDF text atlas (same technique as 2.5's `glyph_atlas.rs`), content
+  `CALLSIGN  FLnnn  nnnkt` from 2.7a's new `AircraftInstance` fields, placement right of the glyph
+  (flip left near the viewport edge), CPU collision culling with priority (docs/01: selected >
+  speed > proximity to center — "selected" has no real signal until 2.8, treat as always-false and
+  flag it), leader-line when displaced, re-evaluated at ≤ 5 Hz with hysteresis. (2.1b — the F3
+  stats overlay — also depends on this glyph-atlas text and is still open; do 2.7b first.)
+- **2.7a landed:** `core::sim`'s `AircraftInstance` gained `callsign`/`altitude_ft`/
+  `ground_speed_kt` — the label *content* half, split from *placement/collision* (2.7b, screen-
+  space, needs the camera `core` doesn't have). `callsign` is sticky across fixes that omit it;
+  `altitude_ft` is `Some(0.0)` on the ground (real data, not unknown — 2.7b decides display);
+  `ground_speed_kt` uses the raw (unblended) fix, since label text doesn't need position's motion
+  smoothing. Dropped `AircraftInstance`'s `Copy` derive (kept `Clone`) for the new heap-owning
+  `callsign` field, same as `Track` at 2.6a. Documented deviation from docs/09's literal
+  `RenderFeed.labels: Vec<Label>` field — collision culling stays entirely in `render` (2.7b), not
+  `core`. Done directly, not delegated. 5 new tests, all green — **441 passed, 5 ignored, 0
+  failed** (+5 over 2.6b's 436). No live run (pure data plumbing, no renderable surface until
+  2.7b). DECISION_LOG 2.7a.
+- **Housekeeping:** 2.6b's implementation (trails render) had been completed and documented in a
+  prior session but never committed — found uncommitted at this session's start, independently
+  re-verified (fmt/clippy/test all green, 436 passed matching the documented count), and committed
+  before starting 2.7a.
 - **⚠ Flagged, not yet its own item: LOD tiers.** 2.5 draws every aircraft as one fixed-size
   L2-style glyph at any zoom, and 2.6b draws every aircraft's full trail as a constant-3px ribbon
   at any zoom (which piles into a colored blob at whole-world zoom, plus an unbounded per-frame
@@ -215,6 +234,43 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — Housekeeping + M2 item 2.7a: label content. Found 2.6b's work (trails render)
+  fully implemented and documented by a prior session but never committed — independently
+  re-verified (fmt/clippy/test fresh, 436 passed/5 ignored matching the documented count) and
+  committed first. Then split M2 item 2.7 into 2.7a/2.7b before writing anything (same shape as
+  every prior M2 item), for two reasons: label *content* (callsign/FL/kt) is plain per-fix data
+  needing no camera, while *placement and collision culling* are inherently screen-space and need
+  the camera `core` deliberately doesn't have (2.3a's own boundary — the same reason 2.6a/2.6b
+  split trail sampling from ribbon widening); and `AircraftInstance` didn't carry callsign, raw
+  altitude, or ground speed at all yet — only the coarse `altitude_bucket` — so nothing on the
+  render side could honestly be written regardless. Implemented 2.7a: `AircraftInstance` gained
+  `callsign: Option<CallSign>` (sticky across fixes that omit it — identification and position
+  reports arrive on separate cadences in the real feeds, so a blank field on one fix must not
+  clear a previously known identity), `altitude_ft: Option<f64>` (the same blended `display.alt_m`
+  `AltitudeBucket::classify` already uses, converted via the existing `FT_PER_M`; `Some(0.0)` on
+  the ground since that's real data, not unknown), and `ground_speed_kt: Option<f64>` (the raw,
+  unblended fix speed via a new exact `KT_PER_MS = 3600.0 / 1852.0` — a label's text doesn't need
+  position's motion-smoothing). Dropped `AircraftInstance`'s `Copy` derive (kept `Clone`) for the
+  new heap-owning `callsign` field, same precedent as `Track` at 2.6a — every call site grepped
+  first, not assumed; blast radius was exactly two `render::aircraft` test fixtures building the
+  struct literal directly, both updated. **Documented deviation from docs/09**: that contract
+  types a `labels: Vec<Label>` field directly on `RenderFeed`, "pre-collision-culled" and "built by
+  the interpolation stage" (i.e. `core`) — but culling/placement need pixel-space geometry only
+  `render` has, so `RenderFeed` gained no new field; `render` (2.7b) owns all of it, recorded
+  explicitly rather than silently diverging. Priority's "selected" component (docs/01: selected >
+  speed > proximity to center) is explicitly deferred to 2.8 in the 2.7b checklist line itself —
+  there's no selection state anywhere yet, so 2.7b will treat it as always-false rather than fake
+  a placeholder signal. Done directly, not delegated — `sim.rs` was already fully read this
+  session establishing the split call, so a cold subagent would only re-derive it (2.4a/2.6a's own
+  precedent). 5 new unit tests in `core::sim` (content carried onto a first sighting with exact
+  conversions pinned; missing callsign/altitude/speed each leave `None`; a later blank-callsign fix
+  doesn't clear a known one; a later fix with an actual new callsign does replace it; altitude
+  still reported on the ground). `cargo fmt --check`/`clippy --workspace --all-targets -D
+  warnings`/`test --workspace` all green — **441 passed, 5 ignored, 0 failed** (+5 over 2.6b's
+  436, all in `core`). No live run: pure data plumbing, no renderable surface until 2.7b consumes
+  the new fields (2.4a/2.6a's own precedent for the same reason). DECISION_LOG 2.7a. Next:
+  **2.7b**, the render-side text glyph atlas + placement + collision culling + leader lines.
 
 - **2026-07-19** — M2 item 2.6b: trails render — the render-side ribbon tessellation + WGSL
   trail pipeline that consumes 2.6a's `RenderFeed.trails`. New `crates/render/src/trail.rs` (pure,
