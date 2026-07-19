@@ -537,9 +537,75 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       Clean `WM_CLOSE` exit both live runs; scratch `look_above.db` deleted after per 1.12/1.13's
       convention. DECISION_LOG 2.7b. Next: **2.1b** (the F3 stats overlay text, unblocked now that
       a text atlas exists) or **2.8** (selection) — both open, neither started.)*
-- [ ] 2.8 Selection: cursor hit-test against glyph quads (CPU, spatial index), white outline,
-      minimal info card (callsign/alt/speed/source — enrichment fields arrive in M3;
-      anonymous → "Unidentified" already enforced here).
+- [x] 2.8a Selection state + hit-test: `AircraftInstance` gains a real `selected` signal (wiring
+      the hardcoded-`false` gap 2.7b's `label_priority` left explicitly); cursor click (vs. drag)
+      disambiguation in `app::window`; CPU hit-test against the current frame's projected glyph
+      positions; the selected `icao24` threaded to the simulation worker so `core::sim` marks the
+      right instance. No visuals — that's 2.8b (outline, info card).
+      *(Split 2026-07-19, self-approved same-session, same shape as every prior M2 item: the
+      checklist bundles *detecting* a selection (input handling, hit-test math, state threading —
+      testable with no GPU surface at all) with *drawing its consequences* (a white-outline GPU
+      pass, a new text-overlay pipeline) — two lanes, the same content/placement split every
+      other 2.x item used. `render::label`'s `label_priority` already left an explicit seam for
+      this: `selected` is hardcoded `false` there today with a doc comment pointing at 2.8.)*
+      *(2026-07-19: implemented — `core::sim::AircraftInstance` gained `pub selected: bool`;
+      `Simulator` gained a private `selected: Option<Icao24>` field and `set_selected(Option
+      <Icao24>)`, applied per-track inside `advance_all`'s existing `par_iter_mut` pass (compared
+      against each track's own address, no new allocation). New `render::selection` (pure,
+      testable): `hit_test(aircraft, cursor_px, camera_center_m, meters_per_pixel, viewport_w,
+      viewport_h) -> Option<Icao24>`, a **linear scan** (not the design notes' uniform grid — hit-
+      testing runs once per click, not once per frame the way the label pass's collision sweep
+      does, so a full scan over even a whole-world feed costs nothing worth optimizing ahead of a
+      real cost; recorded as a deliberate deviation) reusing `label::world_to_screen_px` so both
+      passes agree on glyph position, picking the nearest candidate within `AIRCRAFT_GLYPH_PX/2 +
+      4px` or `None` (a click on open map deselects). `render::label::label_priority` now takes a
+      real `selected: bool` parameter (`build_candidates` passes `instance.selected` through)
+      instead of the hardcoded `false` 2.7b left with a doc comment pointing here. `app::window`
+      gained click-vs-drag disambiguation (`CLICK_MAX_MOVEMENT_PX`=5px, `CLICK_MAX_DURATION`=
+      300ms, tracked via new `press_pos`/`press_instant` fields alongside the existing drag
+      fields) — on a qualifying release, `App::maybe_select` hit-tests the current feed and
+      updates `selected_icao24`, mirrored to the simulation worker over a new `watch::Sender<
+      Option<Icao24>>` (`select_tx`/`select_rx`, the same shape as 2.3b's `retarget_tx`); the
+      worker re-applies `simulator.set_selected(*select_rx.borrow())` every ~60 Hz iteration
+      (cheap `Copy`, simpler than edge-detecting the channel) before its own `advance_all`. Logs
+      `selection changed selected=?` on every click (a real diagnostic, not just for this
+      session's own verification, since 2.8b's visual feedback doesn't exist yet). Done directly,
+      not delegated — every touched file (`sim.rs`, `label.rs`, `window.rs`, `simulation.rs`) was
+      already read this session establishing the split, same precedent as every prior M2 item.
+      14 new tests (4 `core::sim` selection, 6 `render::selection` hit-test, 2 `render::label`
+      selected-priority integration, plus the 2 pre-existing `AircraftInstance`-literal fixtures
+      in `aircraft.rs`/`label.rs` updated for the new field) — `cargo fmt --check`/`clippy
+      --workspace --all-targets -D warnings`/`test --workspace` all green — **498 passed, 5
+      ignored, 0 failed** (+12 over 2.1b's 486). **Live-verified** against the owner's real
+      `credentials.json` (four separate window-mode runs, Intel Arc/DX12, whole-world OpenSky):
+      confirmed end to end that a real left-click (scripted via Win32 `SetCursorPos`/
+      `mouse_event`, window forced topmost to route input reliably regardless of focus) reaches
+      `App::maybe_select`, runs the hit-test, and logs a result — `selection changed selected=
+      None` on every attempted click at a live aircraft-cluster location, i.e. hit_test correctly
+      found nothing within radius at the moment of each click, not a wiring failure (a live
+      whole-world OpenSky feed churns heavily between poll cycles — several runs logged
+      `dropped≈8700` of `tracked≈9800` between one 8–10 s cycle and the next, so the exact
+      aircraft rendered in a screenshot is frequently gone or moved by the time a scripted click
+      lands a few seconds later; `hit_test`'s own correctness, including the "a click within
+      radius selects" case, is proven directly by its 6 unit tests instead). Also live-confirmed a
+      **drag is correctly never read as a click**: a real press→10-step-move→release produced no
+      `selection changed` log and did pan the camera (`ingest_poller`'s "retargeted mid-run" log
+      showed the bbox actually change), the regression this session's own restructuring of the
+      `MouseInput` handler most risked. Clean `WM_CLOSE` exit each run; scratch `look_above.db`
+      deleted after per 1.12/1.13's convention. **Found and flagged, not fixed (out of scope for
+      this item): a reproducible crash**, twice independently — after roughly 2–2.5 minutes of a
+      live whole-world-zoom window-mode run, `wgpu` panics (`Device::create_buffer` validation
+      error: the trail vertex buffer requests ~279 MiB, over this adapter's 256 MiB
+      `max_buffer_size`). This is the already-flagged 2.5/2.6b LOD gap made concrete: whole-world
+      zoom draws a full unbounded 5-minute trail for every one of ~9,800 aircraft with no LOD
+      cross-fade to cull it, and that trail geometry keeps growing every frame until the buffer
+      overflows — not a selection-path bug (2.8a touches none of `render::trail`/`renderer.rs`'s
+      buffer sizing), but real evidence the flagged gap is a crash risk, not just a performance
+      concern, and worth prioritizing before the M2 gate (2.10)'s live-run-over-a-busy-hub line.
+      DECISION_LOG 2.8a.)*
+- [ ] 2.8b Selection render: white outline on the selected aircraft's glyph (GPU), minimal info
+      card (callsign/alt/speed/source — enrichment fields arrive in M3; anonymous →
+      "Unidentified" already enforced here). Depends on 2.8a.
 - [ ] 2.9 Renderer smoke test (headless, per docs/10 §4) wired into CI (skip-if-no-adapter).
 - [ ] 2.10 Gate: live run over a busy hub; visual QA §L2-core; frame-stats evidence; human review.
 

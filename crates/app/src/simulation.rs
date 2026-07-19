@@ -16,7 +16,10 @@
 //!    than the one already held is ignored by [`Simulator::ingest`], so re-feeding the whole
 //!    table every cycle is safe: only the aircraft this cycle actually refreshed start a new
 //!    correction blend.
-//! 3. Advance every track to now and publish the resulting feed to the render thread through the
+//! 3. Apply `app::window`'s latest click selection ([`Simulator::set_selected`], M2 item 2.8a) —
+//!    read fresh off a `watch` channel every iteration rather than edge-detected, since re-setting
+//!    an unchanged `Option<Icao24>` is free and selection changes at click cadence.
+//! 4. Advance every track to now and publish the resulting feed to the render thread through the
 //!    [`crate::double_buffer`].
 //!
 //! Stale tracks are evicted from the table (at [`DROP_AFTER_S`], the same horizon the simulator
@@ -34,9 +37,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::Receiver;
 use look_above_core::merge::{DROP_AFTER_S, SessionTable};
 use look_above_core::sim::{RenderFeed, Simulator};
-use look_above_core::types::{StateVector, UnixSeconds};
+use look_above_core::types::{Icao24, StateVector, UnixSeconds};
 use look_above_ingest::poller::PollBatch;
 use look_above_store::Writer;
+use tokio::sync::watch;
 
 use crate::double_buffer::Producer;
 use crate::pipeline::record_cycle;
@@ -57,13 +61,18 @@ pub fn spawn(
     writer: Writer,
     batch_rx: Receiver<PollBatch>,
     producer: Producer<RenderFeed>,
+    select_rx: watch::Receiver<Option<Icao24>>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("look-above-sim".to_owned())
         // The closure owns `writer`, so the store's writer thread is torn down exactly when this
         // worker ends; `run` only needs to borrow it.
-        .spawn(move || run(simulator, table, &writer, &batch_rx, &producer, &shutdown))
+        .spawn(move || {
+            run(
+                simulator, table, &writer, &batch_rx, &producer, &select_rx, &shutdown,
+            );
+        })
 }
 
 /// The worker loop — see the module doc for the per-iteration steps. Returns when `shutdown` is
@@ -74,6 +83,7 @@ fn run(
     writer: &Writer,
     batch_rx: &Receiver<PollBatch>,
     producer: &Producer<RenderFeed>,
+    select_rx: &watch::Receiver<Option<Icao24>>,
     shutdown: &AtomicBool,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
@@ -83,6 +93,11 @@ fn run(
         if drain_and_merge(batch_rx, writer, &mut table) {
             sync_simulator(&mut simulator, &mut table, now_s, now_unix);
         }
+
+        // Cheap (an `Option<Icao24>` `Copy`) to re-apply every iteration rather than only on
+        // change — simpler than edge-detecting a watch channel, and selection changes at click
+        // cadence, nowhere near a cost worth avoiding at ~60 Hz (M2 item 2.8a).
+        simulator.set_selected(*select_rx.borrow());
 
         producer.publish(simulator.advance_all(now_s));
 

@@ -15,11 +15,9 @@
 //! `width_px`/`height_px`, not a `Camera` reference — this crate stays winit/camera-shape-free the
 //! same way `aircraft.rs`/`trail.rs` only ever take `meters_per_pixel`).
 //!
-//! **No selection state exists yet.** The skill's collision priority is "selected > speed >
-//! proximity to viewport center"; M2 item 2.8 (selection) has not landed, so there is no real
-//! selection signal anywhere in the codebase. [`label_priority`] hardcodes `selected = false`
-//! rather than fabricating a placeholder signal — see that function's doc comment. Wiring 2.8 in
-//! later means computing a real `bool` there instead.
+//! **Selection** (M2 item 2.8a): [`label_priority`] takes `AircraftInstance::selected` straight
+//! through, so a selected aircraft's label always wins a collision (the skill's "selected > speed
+//! > proximity to viewport center").
 //!
 //! **Re-evaluation cadence.** The skill requires collision/membership to be re-evaluated at
 //! `≤ 5 Hz` (not per frame) with hysteresis, so a label doesn't flicker as priorities jitter
@@ -85,8 +83,7 @@ const SPEED_PRIORITY_WEIGHT: f64 = 100_000.0;
 
 /// Priority weight for `selected` — larger than any plausible combined speed+proximity term, so
 /// a selected aircraft's label always wins a collision against an unselected one, matching the
-/// skill's "selected > speed > proximity" ordering. Unused today (see this module's doc comment)
-/// but sized correctly for when 2.8 wires a real signal through.
+/// skill's "selected > speed > proximity" ordering.
 const SELECTED_PRIORITY_WEIGHT: f64 = 1.0e12;
 
 // ---- Content (M2 item 2.7a → 2.7b) -----------------------------------------------------------
@@ -169,16 +166,15 @@ pub fn world_to_screen_px(
 /// [`SPEED_PRIORITY_WEIGHT`]/[`SELECTED_PRIORITY_WEIGHT`] for why the weights keep the ordering
 /// intent even as a sum. Higher is drawn in preference to lower.
 ///
-/// `selected` is always `false`: there is no selection state anywhere in the codebase yet (M2
-/// item 2.8 is what adds one). This is written so wiring 2.8 in later is a one-line change here
-/// (pass a real `bool` instead of the hardcoded one) rather than a redesign.
+/// `selected` comes straight from [`AircraftInstance::selected`] (M2 item 2.8a) — the real signal
+/// this function hardcoded to `false` until that field existed.
 pub fn label_priority(
+    selected: bool,
     ground_speed_kt: Option<f64>,
     glyph_px: ScreenPoint,
     viewport_width_px: f64,
     viewport_height_px: f64,
 ) -> f64 {
-    let selected = false; // No selection signal exists yet — see this function's doc comment.
     let selected_component = if selected {
         SELECTED_PRIORITY_WEIGHT
     } else {
@@ -251,6 +247,7 @@ pub fn build_candidates(
                 return None;
             }
             let priority = label_priority(
+                instance.selected,
                 instance.ground_speed_kt,
                 glyph_px,
                 viewport_width_px,
@@ -707,6 +704,7 @@ mod tests {
             callsign: look_above_core::types::CallSign::new("DLH9LF"),
             altitude_ft: Some(35_000.0),
             ground_speed_kt: Some(450.0),
+            selected: false,
         }
     }
 
@@ -798,8 +796,8 @@ mod tests {
     #[test]
     fn faster_aircraft_gets_higher_priority_at_the_same_position() {
         let px = (500.0, 400.0);
-        let slow = label_priority(Some(100.0), px, 1000.0, 800.0);
-        let fast = label_priority(Some(500.0), px, 1000.0, 800.0);
+        let slow = label_priority(false, Some(100.0), px, 1000.0, 800.0);
+        let fast = label_priority(false, Some(500.0), px, 1000.0, 800.0);
         assert!(fast > slow);
     }
 
@@ -807,9 +805,19 @@ mod tests {
     fn closer_to_center_gets_higher_priority_at_the_same_speed() {
         let center_px = (500.0, 400.0);
         let far_px = (0.0, 0.0);
-        let near = label_priority(Some(200.0), center_px, 1000.0, 800.0);
-        let far = label_priority(Some(200.0), far_px, 1000.0, 800.0);
+        let near = label_priority(false, Some(200.0), center_px, 1000.0, 800.0);
+        let far = label_priority(false, Some(200.0), far_px, 1000.0, 800.0);
         assert!(near > far);
+    }
+
+    #[test]
+    fn a_selected_aircraft_outranks_a_faster_closer_unselected_one() {
+        // The selected aircraft is slower and farther from center — speed/proximity alone would
+        // rank it lower, but selection must still win (the skill's "selected > speed >
+        // proximity").
+        let selected = label_priority(true, Some(50.0), (0.0, 0.0), 1000.0, 800.0);
+        let unselected = label_priority(false, Some(500.0), (500.0, 400.0), 1000.0, 800.0);
+        assert!(selected > unselected);
     }
 
     // ---- Candidates / visibility --------------------------------------------------------------
@@ -835,6 +843,35 @@ mod tests {
         let candidates =
             build_candidates(&[instance], MercatorXy::new(0.0, 0.0), 10.0, 1000.0, 800.0);
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn build_candidates_gives_a_selected_instance_the_higher_priority() {
+        let mut plain = full_instance();
+        plain.icao24 = icao("3c6444");
+        plain.position = MercatorXy::new(0.0, 0.0);
+
+        let mut selected = full_instance();
+        selected.icao24 = icao("4b1815");
+        selected.position = MercatorXy::new(0.0, 0.0);
+        selected.selected = true;
+
+        let candidates = build_candidates(
+            &[plain, selected],
+            MercatorXy::new(0.0, 0.0),
+            10.0,
+            1000.0,
+            800.0,
+        );
+        let selected_candidate = candidates
+            .iter()
+            .find(|c| c.icao24 == icao("4b1815"))
+            .expect("selected candidate present");
+        let plain_candidate = candidates
+            .iter()
+            .find(|c| c.icao24 == icao("3c6444"))
+            .expect("plain candidate present");
+        assert!(selected_candidate.priority > plain_candidate.priority);
     }
 
     #[test]

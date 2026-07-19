@@ -23,12 +23,12 @@ use look_above_core::camera::Camera;
 use look_above_core::contracts::RegionQuery;
 use look_above_core::merge::SessionTable;
 use look_above_core::sim::{RenderFeed, Simulator};
-use look_above_core::types::SourceId;
+use look_above_core::types::{Icao24, SourceId};
 use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::opensky::OpenSkyAuth;
 use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
-use look_above_render::{FrameOutcome, Renderer, StatsOverlay, camera_view_proj};
+use look_above_render::{FrameOutcome, Renderer, StatsOverlay, camera_view_proj, hit_test};
 use look_above_store::Writer;
 use tokio::sync::watch;
 use winit::application::ApplicationHandler;
@@ -57,6 +57,16 @@ const SCROLL_PIXELS_PER_NOTCH: f64 = 100.0;
 /// viewport is sent to the poller as a new region — see [`App::maybe_retarget`]. Debounced so a
 /// continuous drag or zoom-ease does not retarget (and re-fetch) on every single frame.
 const CAMERA_SETTLE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// A left-button press/release pair is a **click** (selection, M2 item 2.8a), not a drag, when
+/// the cursor moved no more than this many physical pixels between the two — see
+/// [`App::maybe_select`]. A few pixels of unavoidable hand tremor must not read as a drag.
+const CLICK_MAX_MOVEMENT_PX: f64 = 5.0;
+
+/// ... and the press/release pair spans no longer than this — see [`App::maybe_select`]. A slow
+/// drag that happens to end near its start point (e.g. a hesitant pan) must not be read as a
+/// click just because it didn't move far.
+const CLICK_MAX_DURATION: Duration = Duration::from_millis(300);
 
 /// Open the window and pump events until the user closes it.
 pub fn run(config: &Config) -> Result<()> {
@@ -98,6 +108,11 @@ struct App {
     /// separate `is_dragging` bool needed) and as the "since when" clock `drag_to`'s `dt_s`
     /// is computed against, updated on every drag-tick.
     last_drag_instant: Option<Instant>,
+    /// Cursor position and time at the most recent left-button press, kept until release — the
+    /// baseline [`App::maybe_select`] compares the release against to tell a click from a drag
+    /// (M2 item 2.8a). `None` whenever the button isn't currently held.
+    press_pos: Option<(f64, f64)>,
+    press_instant: Option<Instant>,
     /// When the previous frame was drawn, for computing `Camera::update`'s `dt_s`. `None` on
     /// the very first frame, which is guarded to a zero `dt_s` rather than a garbage-huge one.
     last_frame_instant: Option<Instant>,
@@ -140,6 +155,15 @@ struct App {
     /// so a frame in which the worker has published nothing new still draws the last picture
     /// instead of blanking. Its `aircraft.len()` is the instance count 2.4b logs (2.5 draws it).
     current_feed: RenderFeed,
+    /// The aircraft the user last clicked on, or `None` (M2 item 2.8a) — set by
+    /// [`App::maybe_select`], mirrored to the simulation worker via `select_tx` so
+    /// `core::sim::Simulator` marks the matching instance's `selected` field. Not yet read by
+    /// anything on the render side (no outline/info card until 2.8b); kept here so `app` has a
+    /// single source of truth for "what's selected" rather than only living inside the worker.
+    selected_icao24: Option<Icao24>,
+    /// The live handle used to push a new selection to the simulation worker — mirrors
+    /// `retarget_tx`'s shape exactly. `None` until [`App::start`] has spawned the worker.
+    select_tx: Option<watch::Sender<Option<Icao24>>>,
     /// Set on exit to stop the simulation worker; it checks this once per iteration.
     sim_shutdown: Option<Arc<AtomicBool>>,
     /// The simulation worker's join handle, so [`App::exiting`] waits for its final DB writes
@@ -157,6 +181,8 @@ impl App {
             camera: None,
             last_cursor_pos: None,
             last_drag_instant: None,
+            press_pos: None,
+            press_instant: None,
             last_frame_instant: None,
             stats: FrameStats::default(),
             stats_visible: false,
@@ -169,6 +195,8 @@ impl App {
             last_sent_region: RegionQuery::default(),
             feed_consumer: None,
             current_feed: RenderFeed::default(),
+            selected_icao24: None,
+            select_tx: None,
             sim_shutdown: None,
             sim_handle: None,
         }
@@ -274,12 +302,14 @@ impl App {
         // this thread swaps at frame start.
         let shutdown = Arc::new(AtomicBool::new(false));
         let (producer, consumer) = double_buffer::channel();
+        let (select_tx, select_rx) = watch::channel(None);
         let sim_handle = simulation::spawn(
             Simulator::new(),
             SessionTable::new(),
             writer,
             receiver,
             producer,
+            select_rx,
             Arc::clone(&shutdown),
         )
         .context("spawn the simulation worker")?;
@@ -290,6 +320,7 @@ impl App {
         self.retarget_tx = Some(retarget_tx);
         self.last_sent_region = initial_query;
         self.feed_consumer = Some(consumer);
+        self.select_tx = Some(select_tx);
         self.sim_shutdown = Some(shutdown);
         self.sim_handle = Some(sim_handle);
         Ok(())
@@ -423,6 +454,43 @@ impl App {
         }
     }
 
+    /// If the left-button press/release pair that just ended looks like a click rather than a
+    /// drag ([`CLICK_MAX_MOVEMENT_PX`]/[`CLICK_MAX_DURATION`]), hit-tests `release_pos` against
+    /// the currently drawn feed and updates the selection (M2 item 2.8a) — a click that hits no
+    /// aircraft deselects, the same way a click that hits one selects it. Mirrored to the
+    /// simulation worker over `select_tx` so `core::sim::Simulator` marks the right instance on
+    /// its next `advance_all`; a closed channel (worker gone) only stops that mirroring, the same
+    /// tolerance `maybe_retarget`'s own send has.
+    fn maybe_select(&mut self, release_pos: (f64, f64), released_at: Instant) {
+        let (Some(press_pos), Some(pressed_at)) = (self.press_pos, self.press_instant) else {
+            return;
+        };
+        let moved_px = (release_pos.0 - press_pos.0).hypot(release_pos.1 - press_pos.1);
+        if moved_px > CLICK_MAX_MOVEMENT_PX {
+            return;
+        }
+        if released_at.saturating_duration_since(pressed_at) > CLICK_MAX_DURATION {
+            return;
+        }
+        let Some(camera) = self.camera.as_ref() else {
+            return;
+        };
+
+        let selected = hit_test(
+            &self.current_feed.aircraft,
+            release_pos,
+            camera.center_m(),
+            camera.meters_per_pixel(),
+            camera.width_px(),
+            camera.height_px(),
+        );
+        tracing::info!(?selected, "selection changed");
+        self.selected_icao24 = selected;
+        if let Some(select_tx) = &self.select_tx {
+            let _ = select_tx.send(selected);
+        }
+    }
+
     /// Park a fatal error and stop the loop. The first one wins: later failures are usually
     /// fallout from it.
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
@@ -494,14 +562,24 @@ impl ApplicationHandler for App {
             } => {
                 if let Some(camera) = self.camera.as_mut() {
                     match state {
-                        ElementState::Pressed => {
-                            camera.begin_drag();
-                            self.last_drag_instant = Some(Instant::now());
+                        ElementState::Pressed => camera.begin_drag(),
+                        ElementState::Released => camera.end_drag(),
+                    }
+                }
+                match state {
+                    ElementState::Pressed => {
+                        let now = Instant::now();
+                        self.last_drag_instant = Some(now);
+                        self.press_pos = self.last_cursor_pos;
+                        self.press_instant = Some(now);
+                    }
+                    ElementState::Released => {
+                        self.last_drag_instant = None;
+                        if let Some(release_pos) = self.last_cursor_pos {
+                            self.maybe_select(release_pos, Instant::now());
                         }
-                        ElementState::Released => {
-                            camera.end_drag();
-                            self.last_drag_instant = None;
-                        }
+                        self.press_pos = None;
+                        self.press_instant = None;
                     }
                 }
             }

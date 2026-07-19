@@ -359,6 +359,7 @@ mod tests {
             callsign: None,
             altitude_ft: None,
             ground_speed_kt: None,
+            selected: false,
         };
 
         let raw = pack_instance(&instance, &opaque_white_table);
@@ -407,6 +408,7 @@ mod tests {
             callsign: None,
             altitude_ft: None,
             ground_speed_kt: None,
+            selected: false,
         };
 
         let raw = pack_instance(&instance, &table);

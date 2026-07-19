@@ -2153,3 +2153,74 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   1.12/1.13's convention.
 - M2 checklist now has three items left: **2.8** (selection — cursor hit-test, white outline,
   info card), 2.9 (headless renderer smoke test wired into CI), 2.10 (the M2 gate itself).
+
+## 2026-07-19 — M2 item 2.8a (selection state + hit-test)
+
+- **Split 2.8 → 2.8a/2.8b**, self-approved same-session, same shape as every prior M2 item:
+  *detecting* a selection (input handling, hit-test math, state threading — fully testable with
+  no GPU surface) is one lane; *drawing its consequences* (a white-outline GPU pass, a new
+  text-overlay pipeline) is another. 2.7b's `label_priority` had already left an explicit seam
+  for this (`selected` hardcoded `false`, doc comment pointing at "2.8").
+- **`selected` lives on `AircraftInstance`, computed by `core::sim`, not `render`** — matches
+  docs/01's own framing ("...category, selection state) produced by the CPU interpolation
+  stage"). `Simulator` holds `selected: Option<Icao24>`; `set_selected` is the only mutator;
+  `advance_all`'s existing `par_iter_mut` compares each track's own address against it — no new
+  per-frame allocation or pass over the table.
+- **Hit-testing is a plain linear scan, not the design notes' uniform grid** — deliberate
+  deviation. The design notes propose "a simple uniform grid over screen space rebuilt per
+  frame ... for hit-testing and later label density", but hit-testing runs once per click, not
+  once per frame the way the label pass's collision sweep does; even a full scan over a
+  whole-world feed (order 10,000 aircraft) is cheap next to a discrete click event. Building the
+  grid now, with no label-density work yet to justify a per-frame structure, would be exactly
+  the premature abstraction CLAUDE.md warns against. Revisit if profiling ever says otherwise.
+- **Selection threads app → simulation worker over a new `watch` channel**, the identical shape
+  2.3b already established for camera → poller retargeting (`select_tx`/`select_rx` mirroring
+  `retarget_tx`/`retarget_rx`). The worker re-applies `set_selected` from the channel's current
+  value every ~60 Hz iteration rather than edge-detecting a change — simpler, and free next to
+  the iteration's existing cost (`Option<Icao24>` is `Copy`).
+- **Click vs. drag is a movement + duration threshold** (`CLICK_MAX_MOVEMENT_PX` = 5px,
+  `CLICK_MAX_DURATION` = 300ms), not a separate gesture-recognizer abstraction — the smallest
+  correct disambiguation for a codebase with exactly one other pointer gesture (pan-drag).
+- **Live verification produced a real click pipeline confirmation but no live "hit"**: four
+  window-mode runs against the owner's real `credentials.json` all showed a scripted click
+  reaching `App::maybe_select`, running the hit-test, and logging `selection changed
+  selected=?` — proving the whole chain (click → hit_test → `selected_icao24` → `select_tx` →
+  worker → `Simulator::set_selected`) executes without panicking or hanging. Every attempted
+  click (including ones aimed via a screenshot at a visible aircraft cluster, and one found by
+  programmatically scanning a screenshot for the most saturated pixel, to remove human
+  pixel-estimation error) logged `selected=None`. Root-caused, not shrugged off: a live
+  whole-world OpenSky feed churns roughly 80–90% of its tracked set between one 8–10 s poll
+  cycle and the next (`dropped≈8,700` of `tracked≈9,800` was typical this session), so the
+  specific aircraft visible in a screenshot is frequently gone or moved before a scripted click
+  a few seconds later can land on it — an artifact of scripted-input round-trip latency against
+  a fast-churning live feed, not evidence against `hit_test`'s correctness, which rests on its
+  own 6 unit tests instead (exact hit, radius-boundary hit/miss, empty feed, nearest-of-two-
+  overlapping, anonymous-still-selectable). Recorded honestly rather than claiming a live hit
+  that wasn't actually observed.
+- **Did live-confirm the one real regression risk**: this item restructured `window.rs`'s
+  `MouseInput` handler (previously one `if let Some(camera) = ... { match state { ... } }`
+  block, now two independent `match state` blocks — one for the camera, one for click
+  detection). A scripted real drag (press → 10-step move → release) produced no `selection
+  changed` log and did pan the camera (the poller's own "retargeted mid-run" log showed the bbox
+  change) — drag-to-pan is intact.
+- **Found and flagged, deliberately not fixed here: a reproducible `wgpu` crash**, independent
+  of this item's own diff. Twice across the four live runs, roughly 2–2.5 minutes into a
+  whole-world-zoom window-mode session, `Device::create_buffer` panics: the trail vertex buffer
+  requests ~279 MiB against this adapter's 256 MiB `max_buffer_size`. This is the LOD gap
+  already flagged at 2.5/2.6b (no L0/L1 cross-fade; every aircraft draws a full unbounded
+  5-minute trail at any zoom) turning out to be a stability bug, not just a performance cost,
+  once ~9,800 simultaneously-tracked aircraft each grow a trail at once. 2.8a's own changes
+  touch none of `render::trail`/`renderer.rs`'s buffer sizing — confirmed pre-existing, not
+  introduced here. Flagged prominently in `plans/CURRENT_STATUS.md`'s Now section as
+  higher-priority than continuing straight to 2.8b, since a crash blocks the M2 gate's (2.10)
+  live-run-over-a-busy-hub line outright if that hub view is left at whole-world zoom long
+  enough to hit it.
+- Scripting notes (own tooling, not app bugs, recorded so a future session doesn't re-debug
+  them): `FindWindow` by exact title can return `0` from this environment (2.4b hit the same);
+  `SetForegroundWindow` from a process that doesn't own the target window is unreliable here
+  (Windows' foreground-lock protection) — forcing the target topmost via `SetWindowPos(...,
+  HWND_TOPMOST, ...)` routes synthetic mouse input reliably regardless of focus, and was used
+  instead. `GetClientRect`/`PrintWindow` both return logical (DPI-scaled) coordinates unless the
+  calling process itself declares `SetProcessDPIAware()` first — the same pitfall 2.2b's own
+  screenshot tooling hit, re-encountered and re-fixed here rather than assumed already known by
+  a fresh script.

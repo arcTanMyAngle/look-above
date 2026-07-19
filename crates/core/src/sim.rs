@@ -166,6 +166,11 @@ pub struct AircraftInstance {
     /// Ground speed in knots, for the label's `nnnkt` text. `None` when the fix has never
     /// reported a velocity (the skill's missing-field rule) — the label's "omit unknowns" case.
     pub ground_speed_kt: Option<f64>,
+    /// Whether this is the one aircraft [`Simulator::set_selected`] currently names (M2 item
+    /// 2.8a). Drives the render side's white outline (2.8b) and label priority ("selected >
+    /// speed > proximity", docs/01) — `render::label::label_priority` hardcoded this to `false`
+    /// with a doc comment pointing here until this field existed.
+    pub selected: bool,
 }
 
 /// One point along an aircraft's trail (M2 item 2.6a) — a flat centerline sample, not yet
@@ -220,12 +225,24 @@ pub struct RenderFeed {
 #[derive(Debug, Clone, Default)]
 pub struct Simulator {
     tracks: HashMap<Icao24, Track>,
+    /// The one aircraft the user has clicked on (M2 item 2.8a), or `None`. Naming an `icao24`
+    /// with no live track is harmless — [`Simulator::advance_all`] just never finds a match to
+    /// mark, and it self-corrects the moment that aircraft (re)appears, so nothing here needs to
+    /// clear this when a track expires.
+    selected: Option<Icao24>,
 }
 
 impl Simulator {
     /// An empty simulator.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets (or clears, with `None`) the currently selected aircraft — `app::window`'s click
+    /// hit-test calls this (via the simulation worker) each time the user clicks the map. Applied
+    /// to the very next [`Simulator::advance_all`], no faster.
+    pub fn set_selected(&mut self, icao24: Option<Icao24>) {
+        self.selected = icao24;
     }
 
     /// Applies a poll cycle's deduplicated states: a record newer than the held fix installs a
@@ -254,10 +271,11 @@ impl Simulator {
     ///
     /// Parallel over the track table: each track advances independently of the others.
     pub fn advance_all(&mut self, now_s: f64) -> RenderFeed {
+        let selected = self.selected;
         let mut frames: Vec<(AircraftInstance, Vec<TrailVertex>)> = self
             .tracks
             .par_iter_mut()
-            .filter_map(|(_, track)| track.advance(now_s))
+            .filter_map(|(icao24, track)| track.advance(now_s, selected == Some(*icao24)))
             .collect();
 
         // Deterministic order for a stable feed and reproducible tests; true draw-priority
@@ -383,7 +401,14 @@ impl Track {
     /// Advances to `now_s`, updating [`Track::display`] and returning the drawable instance plus
     /// its current trail vertices — `None` once the stale fade has reached zero (the track
     /// lingers for reacquisition but is not drawn, and records no trail sample while invisible).
-    fn advance(&mut self, now_s: f64) -> Option<(AircraftInstance, Vec<TrailVertex>)> {
+    /// `selected` is [`Simulator::advance_all`]'s per-track comparison against its own held
+    /// `icao24` (M2 item 2.8a) — carried in as a plain `bool` rather than an `Icao24` so `Track`
+    /// itself never needs to know its own address is being compared against anything.
+    fn advance(
+        &mut self,
+        now_s: f64,
+        selected: bool,
+    ) -> Option<(AircraftInstance, Vec<TrailVertex>)> {
         let prev = self.display;
         let mut alpha_mul = 1.0;
 
@@ -464,6 +489,7 @@ impl Track {
             callsign: self.callsign.clone(),
             altitude_ft: alt_known.then_some(self.display.alt_m * FT_PER_M),
             ground_speed_kt: self.fix.speed_ms.map(|v| v * KT_PER_MS),
+            selected,
         };
 
         // Only recorded while the instance is actually visible this frame — an aircraft that
@@ -996,6 +1022,58 @@ mod tests {
         s.anonymous = true;
         sim.ingest(&[s], 1_000.0);
         assert!(sim.advance_all(1_000.0).aircraft[0].anonymous);
+    }
+
+    // ---- Selection (M2 item 2.8a) -----------------------------------------------------------------
+
+    #[test]
+    fn nothing_is_selected_by_default() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        assert!(!sim.advance_all(1_000.0).aircraft[0].selected);
+    }
+
+    #[test]
+    fn set_selected_marks_only_the_named_aircraft() {
+        let mut sim = Simulator::new();
+        sim.ingest(
+            &[
+                state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST),
+                state("4b1815", 1_000, 0.0, 0.0, 0.0, EAST),
+            ],
+            1_000.0,
+        );
+        sim.set_selected(Some(hex("4b1815")));
+
+        let feed = sim.advance_all(1_000.0);
+        let selected = |icao: &str| {
+            feed.aircraft
+                .iter()
+                .find(|a| a.icao24 == hex(icao))
+                .expect("aircraft present")
+                .selected
+        };
+        assert!(!selected("3c6444"));
+        assert!(selected("4b1815"));
+    }
+
+    #[test]
+    fn set_selected_none_clears_the_selection() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        sim.set_selected(Some(hex("3c6444")));
+        assert!(sim.advance_all(1_000.0).aircraft[0].selected);
+
+        sim.set_selected(None);
+        assert!(!sim.advance_all(1_000.0).aircraft[0].selected);
+    }
+
+    #[test]
+    fn selecting_an_icao24_with_no_live_track_is_harmless() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        sim.set_selected(Some(hex("aa0011"))); // never ingested
+        assert!(!sim.advance_all(1_000.0).aircraft[0].selected);
     }
 
     // ---- Label content (M2 item 2.7a) ------------------------------------------------------------
