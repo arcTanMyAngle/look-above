@@ -1,11 +1,13 @@
 //! Device, swapchain, and the frame(s) M0/M2 know how to draw.
 
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::Arc;
 
 use look_above_core::camera::Camera;
 use look_above_core::geo::WEB_MERCATOR_EXTENT_M;
 use look_above_core::sim::{AircraftInstance, RenderFeed, TrailVertex};
+use look_above_core::types::Icao24;
 use wgpu::util::DeviceExt as _;
 use wgpu::{CurrentSurfaceTexture, DisplayAndWindowHandle};
 
@@ -14,6 +16,8 @@ use crate::basemap::{self, MeshData};
 use crate::color;
 use crate::error::RenderError;
 use crate::glyph_atlas;
+use crate::label::{self, LabelPlacement, LeaderVertexRaw, TextInstanceRaw, TextQuadVertex};
+use crate::label_atlas;
 use crate::trail::{self, TrailVertexRaw};
 
 /// docs/01's render-target sample count. Checked against the adapter's format features in
@@ -33,6 +37,11 @@ const AIRCRAFT_SHADER: &str = include_str!("shaders/aircraft.wgsl");
 /// The trail ribbon shader (M2 item 2.6b): pass-through vertices that `trail.rs` already offset
 /// and colored on the CPU — see `trail.wgsl`'s module doc comment.
 const TRAIL_SHADER: &str = include_str!("shaders/trail.wgsl");
+
+/// The label shader (M2 item 2.7b): two tiny screen-space pipelines (instanced text-glyph quads,
+/// a leader-line `LineList`) sharing one viewport-size uniform — see `label.wgsl`'s module doc
+/// comment.
+const LABEL_SHADER: &str = include_str!("shaders/label.wgsl");
 
 /// What [`Renderer::render`] did with a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,12 +272,245 @@ impl TrailLayer {
     }
 }
 
+/// The label pass's GPU resources (M2 item 2.7b): two tiny pipelines (instanced text-glyph
+/// quads, a leader-line `LineList`) sharing one screen-space `@group(0)` viewport-size uniform —
+/// unlike every earlier pass, this one does **not** read the shared world view-proj matrix
+/// (`basemap_view_proj_bind_group`): label placement/collision already happened in screen-pixel
+/// space on the CPU (`label.rs`), so the vertex shader only needs to know the viewport size to
+/// convert pixels to clip space.
+///
+/// Also owns the collision/hysteresis state `label::resolve_collisions` needs across frames
+/// (`held`, `last_eval_s`, `cached_placements`) — the same "layer owns the state a pure CPU
+/// function needs threaded frame to frame" shape [`AircraftLayer`]'s `instance_scratch` and
+/// [`TrailLayer`]'s `vertex_scratch` already have, just with real cross-frame *decisions* (not
+/// only scratch reuse) behind it here. See `label.rs`'s module doc comment for why the
+/// re-evaluation itself is throttled to ≤ 5 Hz while the *positions* of already-shown labels are
+/// still refreshed every frame.
+#[derive(Debug)]
+struct LabelLayer {
+    text_pipeline: wgpu::RenderPipeline,
+    leader_pipeline: wgpu::RenderPipeline,
+    screen_params_buffer: wgpu::Buffer,
+    screen_params_bind_group: wgpu::BindGroup,
+    atlas_bind_group: wgpu::BindGroup,
+    quad_vertex_buffer: wgpu::Buffer,
+    quad_index_buffer: wgpu::Buffer,
+    text_instance_buffer: wgpu::Buffer,
+    text_instance_capacity: usize,
+    text_instance_scratch: Vec<TextInstanceRaw>,
+    leader_vertex_buffer: wgpu::Buffer,
+    leader_vertex_capacity: usize,
+    leader_vertex_scratch: Vec<LeaderVertexRaw>,
+    /// This renderer's surface format's label colors, built once (see
+    /// [`color::label_text_color`]/[`color::label_leader_color`]).
+    text_color: [f32; 4],
+    leader_color: [f32; 4],
+    /// `icao24`s that held a slot as of the most recent re-evaluation — the hysteresis input
+    /// `label::resolve_collisions` boosts against (see that function's doc comment).
+    held: HashSet<Icao24>,
+    /// Frame time (`RenderFeed::frame_ts`) of the most recent re-evaluation, or `None` before the
+    /// first one — throttles re-evaluation to `label::MIN_EVAL_INTERVAL_S`.
+    last_eval_s: Option<f64>,
+    /// The labels actually shown as of the most recent re-evaluation, re-projected to this
+    /// frame's live aircraft positions every frame regardless of whether this frame itself is an
+    /// evaluation tick (see this struct's doc comment).
+    cached_placements: Vec<LabelPlacement>,
+}
+
+impl LabelLayer {
+    /// Rewrites the viewport-size uniform both label pipelines read to convert screen pixels to
+    /// clip space — like [`AircraftLayer::set_glyph_scale`], this must be recomputed every frame
+    /// (the viewport can resize) rather than once at startup.
+    fn set_screen_params(&self, queue: &wgpu::Queue, width_px: f64, height_px: f64) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "viewport dimensions in physical pixels stay well within f32's precision at \
+                      any window size this app supports"
+        )]
+        let params = [width_px as f32, height_px as f32, 0.0_f32, 0.0_f32];
+        queue.write_buffer(&self.screen_params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// Refreshes which labels are shown — re-evaluating candidates/collisions at ≤ 5 Hz with
+    /// hysteresis, or (between evaluations) just re-projecting each currently shown label's
+    /// screen position from this frame's live aircraft positions — then packs this frame's
+    /// text-instance and leader-vertex GPU buffers, growing them first if needed. Returns
+    /// `(text_instance_count, leader_vertex_count)` to draw.
+    ///
+    /// Split into [`LabelLayer::refresh_placements`] (the ≤ 5 Hz decision) and
+    /// [`LabelLayer::upload`] (packing + GPU upload) purely to stay under clippy's line-count
+    /// lint — the two are only ever called back to back, here.
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        feed: &RenderFeed,
+        camera: &Camera,
+    ) -> (u32, u32) {
+        self.refresh_placements(feed, camera);
+        self.upload(device, queue)
+    }
+
+    /// The ≤ 5 Hz-with-hysteresis re-evaluation, or (between evaluations) a cheap per-frame
+    /// re-projection of the currently shown labels — see [`LabelLayer::update`]'s doc comment.
+    fn refresh_placements(&mut self, feed: &RenderFeed, camera: &Camera) {
+        let width_px = camera.width_px();
+        let height_px = camera.height_px();
+        let center_m = camera.center_m();
+        let meters_per_pixel = camera.meters_per_pixel();
+        let now_s = feed.frame_ts;
+
+        let should_reevaluate = self
+            .last_eval_s
+            .is_none_or(|last| now_s - last >= label::MIN_EVAL_INTERVAL_S);
+
+        if should_reevaluate {
+            let candidates = label::build_candidates(
+                &feed.aircraft,
+                center_m,
+                meters_per_pixel,
+                width_px,
+                height_px,
+            );
+            let placements =
+                label::resolve_collisions(&candidates, &self.held, width_px, height_px);
+            self.held = placements
+                .iter()
+                .map(|placement| placement.icao24)
+                .collect();
+            self.cached_placements = placements;
+            self.last_eval_s = Some(now_s);
+            return;
+        }
+
+        // Not a re-evaluation tick: the shown *set* doesn't change, but each shown label's
+        // aircraft has kept moving at render cadence, so its on-screen position (and leader
+        // line) still needs to track it. `label.rs`'s doc comment on why this calls
+        // `placement_geometry` directly rather than rebuilding a whole candidate (no text
+        // re-allocation on this, the common, path).
+        self.cached_placements.retain_mut(|placement| {
+            let Some(instance) = label::find_instance(&feed.aircraft, placement.icao24) else {
+                // The aircraft left the feed (faded out) between evaluations — drop its label
+                // rather than leaving it frozen in place.
+                return false;
+            };
+            let glyph_px = label::world_to_screen_px(
+                instance.position,
+                center_m,
+                meters_per_pixel,
+                width_px,
+                height_px,
+            );
+            let (anchor_px, leader) = label::placement_geometry(
+                glyph_px,
+                placement.width_px,
+                placement.height_px,
+                width_px,
+                height_px,
+            );
+            placement.anchor_px = anchor_px;
+            placement.leader = leader;
+            true
+        });
+    }
+
+    /// Packs [`LabelLayer::cached_placements`] into this frame's GPU buffers, growing them first
+    /// if needed, and returns `(text_instance_count, leader_vertex_count)` to draw.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32) {
+        label::pack_text_instances(
+            &self.cached_placements,
+            self.text_color,
+            &mut self.text_instance_scratch,
+        );
+        label::pack_leader_vertices(
+            &self.cached_placements,
+            self.leader_color,
+            &mut self.leader_vertex_scratch,
+        );
+
+        if self.text_instance_scratch.len() > self.text_instance_capacity {
+            let new_capacity = self
+                .text_instance_scratch
+                .len()
+                .max(self.text_instance_capacity.saturating_mul(2))
+                .max(label::MIN_TEXT_INSTANCE_CAPACITY);
+            self.text_instance_buffer = create_text_instance_buffer(device, new_capacity);
+            self.text_instance_capacity = new_capacity;
+        }
+        if !self.text_instance_scratch.is_empty() {
+            queue.write_buffer(
+                &self.text_instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.text_instance_scratch),
+            );
+        }
+
+        if self.leader_vertex_scratch.len() > self.leader_vertex_capacity {
+            let new_capacity = self
+                .leader_vertex_scratch
+                .len()
+                .max(self.leader_vertex_capacity.saturating_mul(2))
+                .max(label::MIN_LEADER_VERTEX_CAPACITY);
+            self.leader_vertex_buffer = create_leader_vertex_buffer(device, new_capacity);
+            self.leader_vertex_capacity = new_capacity;
+        }
+        if !self.leader_vertex_scratch.is_empty() {
+            queue.write_buffer(
+                &self.leader_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.leader_vertex_scratch),
+            );
+        }
+
+        // Both counts are bounded by docs/01's own 10,000-aircraft budget (a handful of
+        // characters/one leader line per label at most), far inside `u32`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "label instance/vertex counts are bounded by docs/01's aircraft budget, far \
+                      inside u32::MAX"
+        )]
+        {
+            (
+                self.text_instance_scratch.len() as u32,
+                self.leader_vertex_scratch.len() as u32,
+            )
+        }
+    }
+
+    /// Binds each label pipeline in turn and draws its uploaded geometry. The leader lines are
+    /// drawn *before* the text (so a line never overlaps its own label's characters — it already
+    /// terminates at the label box's near edge, per `label::nearest_point_on_box`, but drawing
+    /// order still matters for the alpha-blended edge pixels right at that seam).
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        text_count: u32,
+        leader_vertex_count: u32,
+    ) {
+        if leader_vertex_count > 0 {
+            pass.set_pipeline(&self.leader_pipeline);
+            pass.set_bind_group(0, &self.screen_params_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.leader_vertex_buffer.slice(..));
+            pass.draw(0..leader_vertex_count, 0..1);
+        }
+        if text_count > 0 {
+            pass.set_pipeline(&self.text_pipeline);
+            pass.set_bind_group(0, &self.screen_params_bind_group, &[]);
+            pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.text_instance_buffer.slice(..));
+            pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..6, 0, 0..text_count);
+        }
+    }
+}
+
 /// Owns the GPU device and a window's swapchain, and paints the map.
 ///
 /// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), 2.5
-/// added the aircraft glyph pass, and 2.6b adds the trail ribbon pass between them — four of
-/// docs/01's draw order ("map base → map lines → trails → aircraft → labels → UI"). Labels (2.7)
-/// are what remain.
+/// added the aircraft glyph pass, 2.6b added the trail ribbon pass between them, and 2.7b adds
+/// the label pass (text + leader lines) last — every piece of docs/01's draw order ("map base →
+/// map lines → trails → aircraft → labels → UI overlay") except the UI overlay itself now exists.
 #[derive(Debug)]
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -299,10 +541,14 @@ pub struct Renderer {
     /// glyphs, reusing [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
     /// [`TrailLayer::draw`]).
     trail: TrailLayer,
-    /// The aircraft glyph pass (M2 item 2.5) — drawn last (after the trails), reusing
+    /// The aircraft glyph pass (M2 item 2.5) — drawn after the trails, reusing
     /// [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
     /// [`AircraftLayer::draw`]).
     aircraft: AircraftLayer,
+    /// The label pass (M2 item 2.7b) — drawn last, after the aircraft glyphs. Unlike every
+    /// other pass, it does *not* share [`Renderer::basemap_view_proj_bind_group`]: label
+    /// placement is already in screen-pixel space (see [`LabelLayer`]'s own doc comment).
+    label: LabelLayer,
 }
 
 impl Renderer {
@@ -374,6 +620,7 @@ impl Renderer {
         );
         let trail = build_trail_resources(&device, &view_proj_layout, config.format);
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, config.format);
+        let label = build_label_resources(&device, &queue, config.format);
 
         Ok(Self {
             surface,
@@ -389,6 +636,7 @@ impl Renderer {
             basemap_coastline: basemap_resources.coastline,
             trail,
             aircraft,
+            label,
         })
     }
 
@@ -496,20 +744,22 @@ impl Renderer {
     }
 
     /// Draw and present one frame: the background clear, the base map (land fill, coastline
-    /// stroke), then `feed`'s trail ribbons, then its aircraft glyphs on top (docs/01's draw
-    /// order — labels are 2.7, not yet drawn).
+    /// stroke), then `feed`'s trail ribbons, its aircraft glyphs, and finally its labels
+    /// (text + leader lines) on top — docs/01's full draw order short of the UI overlay.
     ///
-    /// `meters_per_pixel` is the camera's current zoom, needed to size the aircraft glyphs a
-    /// constant number of screen pixels regardless of zoom (see
-    /// [`aircraft::glyph_scale_normalized`]) and to keep the trail ribbons a constant
-    /// screen-space width the same way (see [`trail::tessellate_trails`]) — passing the scalar
-    /// rather than a whole `Camera` keeps this crate from needing to know anything else about the
-    /// camera's shape.
+    /// Takes the live `camera` itself (M2 item 2.7b), not just its `meters_per_pixel` scalar as
+    /// before: the aircraft/trail passes still only need that scalar (to size glyphs/ribbons a
+    /// constant number of screen pixels regardless of zoom — see
+    /// [`aircraft::glyph_scale_normalized`]/[`trail::tessellate_trails`]), but the label pass
+    /// additionally needs the camera's `center_m`/`width_px`/`height_px` to project aircraft
+    /// positions into screen-pixel space for placement and collision (see [`label`]'s module doc
+    /// comment on why that stays render-side rather than living in `core`).
     pub fn render(
         &mut self,
         feed: &RenderFeed,
-        meters_per_pixel: f64,
+        camera: &Camera,
     ) -> Result<FrameOutcome, RenderError> {
+        let meters_per_pixel = camera.meters_per_pixel();
         let (frame, stale) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             // Usable, but the swapchain no longer matches the window. Draw it anyway —
@@ -540,6 +790,10 @@ impl Renderer {
         let instance_count =
             self.aircraft
                 .upload_instances(&self.device, &self.queue, &feed.aircraft);
+        self.label
+            .set_screen_params(&self.queue, camera.width_px(), camera.height_px());
+        let (label_text_count, label_leader_count) =
+            self.label.update(&self.device, &self.queue, feed, camera);
 
         let view = frame
             .texture
@@ -573,7 +827,7 @@ impl Renderer {
             });
 
             // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
-            // glyphs (2.5) on top of them. Labels (2.7) are the remaining gap in that order.
+            // glyphs (2.5), then labels (2.7b) on top of everything else.
             self.basemap_land
                 .draw(&mut pass, &self.basemap_view_proj_bind_group);
             self.basemap_coastline
@@ -588,6 +842,8 @@ impl Renderer {
                 &self.basemap_view_proj_bind_group,
                 instance_count,
             );
+            self.label
+                .draw(&mut pass, label_text_count, label_leader_count);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1206,6 +1462,289 @@ fn create_aircraft_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Builds the label pass's GPU resources (M2 item 2.7b): the procedurally-generated stroke-font
+/// SDF atlas, the shared unit text-quad mesh, the screen-size uniform, and both label pipelines.
+/// Runs once, in [`Renderer::new`], alongside the base-map/trail/aircraft resource builders.
+///
+/// Unlike [`build_aircraft_resources`]/[`build_trail_resources`], this does *not* take the
+/// shared `view_proj_layout`: the label pass reads a screen-size uniform instead of the world
+/// view-proj matrix (see [`LabelLayer`]'s own doc comment), so it needs no bind-group-layout
+/// compatibility with the other passes.
+fn build_label_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> LabelLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above label shader"),
+        source: wgpu::ShaderSource::Wgsl(LABEL_SHADER.into()),
+    });
+
+    let screen_params_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::VERTEX,
+        "look-above label screen-params bind group layout",
+    );
+    let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("look-above label atlas bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above label text pipeline layout"),
+        bind_group_layouts: &[Some(&screen_params_layout), Some(&atlas_layout)],
+        immediate_size: 0,
+    });
+    let leader_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above label leader pipeline layout"),
+        bind_group_layouts: &[Some(&screen_params_layout)],
+        immediate_size: 0,
+    });
+
+    let text_pipeline = create_label_text_pipeline(device, &shader, &text_pipeline_layout, format);
+    let leader_pipeline =
+        create_label_leader_pipeline(device, &shader, &leader_pipeline_layout, format);
+
+    // Seeded with zeros: like the aircraft pass's glyph-params uniform, nothing reads this
+    // before `Renderer::render` has already rewritten it for the frame (`LabelLayer::draw` is
+    // never called before `LabelLayer::set_screen_params`/`update` run first in `render`).
+    let screen_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above label screen-params uniform"),
+        contents: bytemuck::bytes_of(&[0.0_f32; 4]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let screen_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above label screen-params bind group"),
+        layout: &screen_params_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: screen_params_buffer.as_entire_binding(),
+        }],
+    });
+
+    let atlas_bind_group = build_label_atlas_bind_group(device, queue, &atlas_layout);
+    let (quad_vertex_buffer, quad_index_buffer) = build_label_quad_mesh_buffers(device);
+    let text_instance_buffer =
+        create_text_instance_buffer(device, label::MIN_TEXT_INSTANCE_CAPACITY);
+    let leader_vertex_buffer =
+        create_leader_vertex_buffer(device, label::MIN_LEADER_VERTEX_CAPACITY);
+
+    LabelLayer {
+        text_pipeline,
+        leader_pipeline,
+        screen_params_buffer,
+        screen_params_bind_group,
+        atlas_bind_group,
+        quad_vertex_buffer,
+        quad_index_buffer,
+        text_instance_buffer,
+        text_instance_capacity: label::MIN_TEXT_INSTANCE_CAPACITY,
+        text_instance_scratch: Vec::new(),
+        leader_vertex_buffer,
+        leader_vertex_capacity: label::MIN_LEADER_VERTEX_CAPACITY,
+        leader_vertex_scratch: Vec::new(),
+        text_color: color::label_text_color(format),
+        leader_color: color::label_leader_color(format),
+        held: HashSet::new(),
+        last_eval_s: None,
+        cached_placements: Vec::new(),
+    }
+}
+
+/// Rasterizes and uploads the stroke-font SDF atlas texture (once, at startup) and builds its
+/// `@group(1)` bind group (texture + sampler) — the label-pass analog of
+/// [`build_atlas_bind_group`], reading [`label_atlas`] instead of [`glyph_atlas`].
+fn build_label_atlas_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::BindGroup {
+    let atlas_bytes = label_atlas::build_atlas_bytes();
+    let atlas_texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("look-above label glyph atlas"),
+            size: wgpu::Extent3d {
+                width: label_atlas::ATLAS_WIDTH_PX,
+                height: label_atlas::ATLAS_HEIGHT_PX,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &atlas_bytes,
+    );
+    let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("look-above label atlas sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above label atlas bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&atlas_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+            },
+        ],
+    })
+}
+
+/// The shared unit text-quad mesh every character cell reuses (vertex buffer, index buffer) —
+/// static, built once, never rebuilt. The label-pass analog of [`build_quad_mesh_buffers`].
+fn build_label_quad_mesh_buffers(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer) {
+    let quad_vertices = label::text_quad_vertices();
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above label quad vertices"),
+        contents: bytemuck::cast_slice(&quad_vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above label quad indices"),
+        contents: bytemuck::cast_slice(&label::TEXT_QUAD_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    (vertex_buffer, index_buffer)
+}
+
+/// An empty text-instance buffer sized for `capacity` characters —
+/// [`LabelLayer::update`] recreates this at a larger capacity if a frame's labels outgrow it.
+fn create_text_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above label text instance buffer"),
+        size: (capacity * size_of::<TextInstanceRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// An empty leader-line vertex buffer sized for `capacity` vertices — [`LabelLayer::update`]
+/// recreates this at a larger capacity if a frame's leader lines outgrow it.
+fn create_leader_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above label leader vertex buffer"),
+        size: (capacity * size_of::<LeaderVertexRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the label text pipeline: `TriangleList` over the shared text-quad mesh
+/// (`label::TextQuadVertex` per-vertex, `label::TextInstanceRaw` per-instance),
+/// `SAMPLE_COUNT`-multisampled like every other pass, no depth/stencil, alpha-blended (the SDF's
+/// own edge antialiasing needs it, same as the aircraft pipeline).
+fn create_label_text_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above label text pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_text"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(TextQuadVertex::LAYOUT), Some(TextInstanceRaw::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_text"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Builds the leader-line pipeline: a `LineList` over `label::LeaderVertexRaw` (two vertices per
+/// line, no instancing — `renderer.rs` draws every displaced label's leader in one call),
+/// `SAMPLE_COUNT`-multisampled, alpha-blended (the leader color's own reduced alpha needs it).
+fn create_label_leader_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above label leader pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_leader"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(LeaderVertexRaw::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_leader"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,

@@ -121,6 +121,30 @@ pub fn altitude_bucket_tint(bucket: AltitudeBucket, format: wgpu::TextureFormat)
     layer_color(srgb, format)
 }
 
+/// Label text color (M2 item 2.7b), authored as nonlinear sRGB (`#EAF0F6`) — docs/01: "aircraft
+/// are the brightest things on screen," and a label is an aircraft's own text, so it reads at a
+/// comparably bright near-white rather than receding into the map palette.
+const LABEL_TEXT_SRGB: [u8; 3] = [0xEA, 0xF0, 0xF6];
+
+/// Leader-line color (M2 item 2.7b), authored as nonlinear sRGB (`#8A939E`) — a muted gray that
+/// reads as connective tissue between a displaced label and its aircraft without competing with
+/// either.
+const LABEL_LEADER_SRGB: [u8; 3] = [0x8A, 0x93, 0x9E];
+
+/// The label text color as shader-ready, opaque linear RGBA (same linearize-if-`srgb` reasoning
+/// as [`land_fill_color`]/[`coastline_stroke_color`]).
+pub fn label_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    layer_color(LABEL_TEXT_SRGB, format)
+}
+
+/// The leader-line color as shader-ready linear RGBA, at a reduced alpha (`0.6`) so it stays
+/// visually secondary to both the label text and the aircraft glyph it connects.
+pub fn label_leader_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    let mut color = layer_color(LABEL_LEADER_SRGB, format);
+    color[3] = 0.6;
+    color
+}
+
 /// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
 /// `renderer.rs` (the colors never change frame to frame, only which bucket applies), so the
 /// per-instance packing path (`aircraft::pack_instance`) is a plain array lookup rather than
@@ -251,6 +275,34 @@ mod tests {
         assert!(land_srgb[0] < land_plain[0]);
         assert!(land_srgb[1] < land_plain[1]);
         assert!(land_srgb[2] < land_plain[2]);
+    }
+
+    // ---- Label colors (M2 item 2.7b) ---------------------------------------------------------
+
+    #[test]
+    fn label_text_is_bright_and_opaque_and_darkens_on_an_srgb_surface() {
+        let srgb = label_text_color(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let plain = label_text_color(wgpu::TextureFormat::Bgra8Unorm);
+        assert!((plain[3] - 1.0).abs() < 1e-6, "label text is opaque");
+        let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        assert!(luma(plain) > 0.8, "label text must read as near-white");
+        assert!(
+            srgb[0] < plain[0],
+            "srgb surface must darken the encoded color"
+        );
+    }
+
+    #[test]
+    fn leader_line_is_dimmer_than_label_text_and_semi_transparent() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let text = label_text_color(format);
+        let leader = label_leader_color(format);
+        let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        assert!(
+            luma(leader) < luma(text),
+            "leader line must not outshine the label text"
+        );
+        assert!(leader[3] < 1.0, "leader line must be semi-transparent");
     }
 
     // ---- Altitude-bucket tint (M2 item 2.5) --------------------------------------------------

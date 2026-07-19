@@ -8,6 +8,8 @@ mod basemap;
 mod color;
 mod error;
 mod glyph_atlas;
+mod label;
+mod label_atlas;
 mod renderer;
 mod trail;
 

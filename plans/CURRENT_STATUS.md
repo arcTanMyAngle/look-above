@@ -7,14 +7,29 @@
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
   open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5,
-  2.6a, 2.6b, 2.7a done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.7b** — the render-side half of labels: a procedurally generated
-  stroke-font SDF text atlas (same technique as 2.5's `glyph_atlas.rs`), content
-  `CALLSIGN  FLnnn  nnnkt` from 2.7a's new `AircraftInstance` fields, placement right of the glyph
-  (flip left near the viewport edge), CPU collision culling with priority (docs/01: selected >
-  speed > proximity to center — "selected" has no real signal until 2.8, treat as always-false and
-  flag it), leader-line when displaced, re-evaluated at ≤ 5 Hz with hysteresis. (2.1b — the F3
-  stats overlay — also depends on this glyph-atlas text and is still open; do 2.7b first.)
+  2.6a, 2.6b, 2.7a, 2.7b done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** either **2.1b** (the F3 stats overlay's on-screen text — unblocked now that
+  2.7b's text atlas exists, per that item's own deferral note) or **2.8** (selection: cursor
+  hit-test, white outline, info card — also what gives 2.7b's hardcoded `selected = false` a real
+  signal). Neither started; owner's call on order.
+- **2.7b landed:** the render-side label pipeline — `render::label` (content formatting,
+  screen-space placement/flip-near-edge, the collision sweep with priority + hysteresis, leader
+  lines, GPU packing) and `render::label_atlas` (a procedurally generated stroke-font SDF atlas,
+  39 characters, same ray-casting technique as 2.5's `glyph_atlas.rs` generalized to unsigned
+  distance-to-stroke). New `LabelLayer` in `renderer.rs`, drawn last per docs/01's order;
+  `Renderer::render` now takes `&Camera` instead of a lone `meters_per_pixel` (the label pass
+  needs `center_m`/`width_px`/`height_px` too). Delegated to the renderer-agent (interrupted
+  mid-task by a session API/rate-limit error, resumed via `SendMessage` from its transcript, same
+  recovery path as 2.5/2.2b). **Independent re-verification caught a real bug the agent's
+  headless-only checks couldn't**: `build_candidates` labeled every aircraft in the feed with no
+  on-screen check, so aircraft outside the viewport (the feed can span wider than the camera)
+  got labels clamped to the viewport edge with no glyph nearby — a dense orphaned-label column,
+  confirmed live against the owner's real `credentials.json`. Fixed directly (`glyph_is_visible`,
+  margin = the aircraft glyph's own half-width; 3 new tests); re-verified green — **477 passed, 5
+  ignored, 0 failed** (+36 over 2.7a's 441) — and a second live run confirmed the fix (labels
+  correctly attached to glyphs) plus the collision sweep itself (a cropped/upscaled dense cluster
+  showed culled-not-shrunk losers, no overlap). Both live runs clean `WM_CLOSE`, scratch
+  `look_above.db` deleted after. DECISION_LOG 2.7b.
 - **2.7a landed:** `core::sim`'s `AircraftInstance` gained `callsign`/`altitude_ft`/
   `ground_speed_kt` — the label *content* half, split from *placement/collision* (2.7b, screen-
   space, needs the camera `core` doesn't have). `callsign` is sticky across fixes that omit it;
@@ -209,6 +224,12 @@
   between the local ledger and OpenSky's own account usage.
 - **⚠ Carried to M3:** `anonymous` catches only the no-callsign half of privacy rule 2.2 — a
   PIA hex broadcasting a callsign needs FAA range data not yet available. DECISION_LOG 1.4.
+- **2.7b's two live-verification runs (2026-07-19) added an untallied credit spend** on top of
+  the above: the verification script launched the binary directly rather than through a
+  log-capturing harness, so the per-cycle credit lines weren't recorded. Each run's own normal
+  whole-world startup poll against the owner's real `credentials.json` was, per 2.4b/2.5's own
+  logged figures, on the order of ~4 credits/cycle — flagged here as a known gap in this
+  session's own bookkeeping rather than assumed zero, still nowhere near the 3,200/80% cap.
 
 ## Gate record
 
@@ -234,6 +255,71 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.7b: labels render, closing out "labels" (2.7a + 2.7b). New
+  `render::label` (pure, testable: `format_label_text` per the `CALLSIGN  FLnnn  nnnkt` spec
+  omitting unknowns and anonymous targets; `world_to_screen_px`; `label_priority` folding
+  "selected > speed > proximity" into one scalar, `selected` hardcoded `false` with a doc comment
+  since 2.8 hasn't landed; `placement_geometry` for right-of-glyph/flip-near-edge/leader-line
+  geometry; `resolve_collisions`, a priority-ordered greedy sweep where losers are culled
+  entirely — never shrunk — with a `× 1.1` boost on the held candidate implementing the skill's
+  ">10%" hysteresis; GPU instance/vertex packing). New `render::label_atlas`: a procedurally
+  generated **stroke-font** SDF atlas (no font/asset crate exists in this workspace, same
+  constraint 2.5's `glyph_atlas.rs` hit) covering exactly the 39 characters the content format
+  needs (`A`–`Z`, `0`–`9`, space, `k`/`t`), each letterform 2–6 line segments over a 3×5 grid,
+  rasterized by the same ray-casting-to-distance-field technique as `glyph_atlas.rs` generalized
+  to *unsigned* distance-to-nearest-stroke (a stroke has no "inside"); `glyph_atlas`'s
+  `distance_to_segment`/`encode_distance` were widened to `pub(crate)`/parameterized-on-spread so
+  both atlases share the primitive. New `label.wgsl` (text-quad SDF pipeline mirroring
+  `aircraft.wgsl`'s antialiasing, plus a leader-line `LineList` mirroring `trail.wgsl`'s
+  pass-through shape) and a `LabelLayer` in `renderer.rs`, drawn last per docs/01's draw order —
+  the only pass that skips the shared world view-proj bind group (placement is already
+  screen-pixel space) and the only one that owns real cross-frame *decisions* (`held`/
+  `last_eval_s`/`cached_placements`), not just scratch-buffer reuse: the ≤5 Hz re-evaluation
+  throttle means shown labels are re-projected to their aircraft's live position every frame
+  between ticks without re-running the collision sweep or reallocating text.
+  `Renderer::render`'s signature changed from `(&mut self, feed, meters_per_pixel: f64)` to
+  `(&mut self, feed, camera: &Camera)`, since the label pass needs `center_m`/`width_px`/
+  `height_px` too, not just the zoom scalar the aircraft/trail passes use; the one app call site
+  (`window.rs`) updated to pass `&camera`. Delegated to the renderer-agent (glyph/SDF atlases and
+  label drawing are its stated remit, same as 2.5/2.6b); interrupted mid-task by a session
+  API/rate-limit error, resumed via `SendMessage` from its own transcript rather than restarting
+  cold — the same recovery path 2.5/2.2b used, no work lost. **Independently re-verified rather
+  than trusted, and this pass caught a real bug the agent's headless-only verification structurally
+  couldn't**: every changed/new file read in full, fresh `fmt`/`clippy --all-targets -D warnings`/
+  `test --workspace` matched the agent's reported 474 exactly — then a **live run against the
+  owner's real `credentials.json`** (scripted zoom over Scandinavia/the Baltic via Win32
+  `mouse_event` wheel synthesis, `PrintWindow` capture) showed most labels correctly attached to
+  their aircraft, but also a dense stack of orphaned labels along the window's left edge with no
+  glyph anywhere near them. Root cause: `build_candidates` built a label candidate for *every*
+  aircraft in the feed with no check that its glyph was actually on screen — the feed can span a
+  wider region than the current viewport (e.g. right after a camera zoom, before the poller has
+  retargeted), and `placement_geometry`'s edge-clamp then pinned each off-screen candidate's label
+  to the viewport border regardless of how far away its real aircraft was. `aircraft.rs` has no
+  equivalent CPU-side check — an off-screen glyph simply never rasterizes in clip space — so this
+  was a defect new to the label pass, not an inherited gap. **Fixed directly** (small, well-scoped,
+  in a file already fully read this session, this session's own bar for not delegating a
+  sub-20-line change): added `glyph_is_visible` (margin = the aircraft glyph's own half-width, so
+  a glyph straddling the exact edge — and therefore still partly drawn — still gets labeled) and
+  an early return in `build_candidates`; 3 new tests (an off-screen aircraft produces no candidate,
+  an on-screen one does, the margin boundary itself). Re-ran `fmt`/`clippy`/`test` green after the
+  fix — **477 passed, 5 ignored, 0 failed** (+36 over 2.7a's 441, +3 over the agent's own count).
+  **Rebuilt the binary and re-ran the live capture**: the orphaned column was gone, every visible
+  label sat beside its aircraft; a cropped/upscaled inspection of a dense airport cluster further
+  confirmed the collision sweep itself works as specified (fewer labels than glyphs in the
+  cluster — overlapping losers culled entirely, never shrunk — no visible overlap anywhere in the
+  frame). Flip-near-edge and leader-line behavior verified by unit test rather than hunted for
+  pixel-by-pixel live (`placement_flips_to_the_left_near_the_right_edge`,
+  `no_leader_line_when_the_label_is_not_displaced`), the same "unit tests + one confirming live
+  pass" bar 2.6b's ribbon taper was held to. Clean `WM_CLOSE` exit on both live runs (via scripted
+  Win32 `WM_CLOSE`); scratch `look_above.db` deleted after each per 1.12/1.13's convention.
+  **Credit spend not captured this session**: the verification script launched the binary
+  directly (`Start-Process`, stdout not redirected to a file), so the per-cycle credit log lines
+  weren't recorded — each run does make the app's normal whole-world startup poll against the
+  owner's real `credentials.json` (typically ~4 credits/cycle per 2.5/2.4b's own logged figures),
+  so treat this as a small, not-precisely-tallied spend on top of the day's running total, flagged
+  here rather than silently assumed zero. DECISION_LOG 2.7b. Next: **2.1b** (F3 overlay text, now
+  unblocked) or **2.8** (selection) — owner's call, neither started.
 
 - **2026-07-19** — Housekeeping + M2 item 2.7a: label content. Found 2.6b's work (trails render)
   fully implemented and documented by a prior session but never committed — independently

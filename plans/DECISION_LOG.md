@@ -2018,3 +2018,80 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   data plumbing with no renderable surface until 2.7b consumes the new fields (2.4a/2.6a's own
   precedent for the same reason). Next: **2.7b**, the render-side text glyph atlas + placement +
   collision culling + leader lines.
+
+## 2026-07-19 — M2 item 2.7b (labels render)
+
+- **Stroke font, not a filled-silhouette atlas.** 2.5's `glyph_atlas.rs` rasterizes closed
+  polygons (signed inside/outside distance); text strokes aren't closed shapes, so `label_atlas.rs`
+  rasterizes *unsigned* distance-to-nearest-line-segment instead, reusing `glyph_atlas`'s
+  `distance_to_segment` (widened to `pub(crate)`) and generalizing `encode_distance` into a
+  `pub(crate) encode_signed_distance(distance, spread)` both atlases call with their own spread —
+  shared primitive, not a duplicated one.
+- **Character set kept to exactly the 39 characters the label format needs** (`A`–`Z`, `0`–`9`,
+  space, `k`/`t`) rather than a general ASCII font — this is a technical/UI font for one fixed
+  content string, not a reusable asset; digits use the familiar seven-segment layout, letters a
+  compact stick font over a 3×5 grid. Evocative, not typographic, the same bar 2.5's aircraft
+  silhouettes were held to.
+- **`Renderer::render` takes `&Camera`, not a lone `meters_per_pixel: f64`.** The aircraft/trail
+  passes only ever needed the zoom scalar; the label pass additionally needs `center_m`/
+  `width_px`/`height_px` to project world positions into screen-pixel space for placement and
+  collision. Passing the whole camera (rather than growing the parameter list scalar by scalar)
+  keeps the signature stable as any future screen-space pass gets added. One call site
+  (`app::window`) updated.
+- **Hysteresis as a priority boost, not a stored margin.** The skill's "a label keeps its slot
+  until beaten by >10%" is implemented by ranking a currently-held candidate at
+  `priority × 1.1` during the collision sort — a challenger only outranks it once its own raw
+  priority exceeds that boosted value, which is exactly the >10% margin, without needing a second
+  comparison path.
+- **Priority folded into one scalar** (`selected` weight `»` speed weight `»` proximity term),
+  not a lexicographic tuple — makes the hysteresis "beaten by >10%" comparison a single number
+  rather than a tuple ordering rule. Weights are sized so each tier dominates the next at any
+  viewport size docs/01 supports; `selected` is hardcoded `false` with a doc comment (no
+  placeholder signal) since 2.8 hasn't landed.
+- **Re-evaluation (≤5 Hz) and per-frame refresh are two different code paths, on purpose.** The
+  candidate rebuild + collision sweep is genuinely throttled (`LabelLayer::last_eval_s`), but a
+  *shown* label still needs to visually track its moving aircraft every frame in between — so
+  `LabelLayer` calls `label::placement_geometry` alone (no text allocation, no sweep) on the
+  off-ticks. Keeps ADR-002's no-per-frame-allocation rule on the common path while still meeting
+  the "doesn't flicker" requirement on the throttled one.
+- **Delegated to the renderer-agent** (glyph/SDF atlases and label drawing are its stated remit,
+  same call as 2.5/2.6b); interrupted mid-task by a session API/rate-limit error, resumed via
+  `SendMessage` from its own transcript rather than restarting cold — the same recovery path
+  2.5/2.2b used, no work re-derived or lost.
+- **Independent re-verification found a real bug, not just a rubber stamp.** Every changed/new
+  file read in full; fresh `fmt`/`clippy --all-targets -D warnings`/`test --workspace` matched the
+  agent's own reported 474 exactly. A **live run against the owner's real `credentials.json`**
+  (scripted zoom over Scandinavia/the Baltic via Win32 `mouse_event` wheel synthesis + `PrintWindow`
+  capture, DPI-aware per 2.2b's own recorded lesson) showed a dense stack of labels along the
+  window's left edge with no aircraft glyph anywhere near most of them.
+- **Root cause and fix: `build_candidates` had no on-screen check.** It built a label candidate
+  for every aircraft in the feed regardless of whether its glyph was actually visible — the feed
+  can span a wider region than the current viewport (e.g. right after a camera zoom, before the
+  poller has retargeted per 2.3b) — and `placement_geometry`'s viewport-edge clamp then pinned
+  each off-screen candidate's label to the border. `aircraft.rs` needs no equivalent check because
+  an off-screen glyph simply never rasterizes in wgpu's clip space; the label pass, having no such
+  natural clipping of its own, needed one added explicitly. Fixed with `glyph_is_visible` (margin
+  = the aircraft glyph's own on-screen half-width, so a glyph straddling the exact edge — still
+  partly drawn — still gets labeled) gating `build_candidates`. Done directly (small, well-scoped,
+  in a file already fully read this session — this session's own bar for not delegating a
+  sub-20-line fix, same as the token skill's rule). 3 new tests (off-screen aircraft → no
+  candidate; on-screen → a candidate; the margin boundary itself).
+- **Re-verified again after the fix, live, not just re-tested.** Rebuilt the binary (the first
+  live capture had run against a stale pre-fix build — a process-hygiene lesson for any future
+  session scripting a live check against a directly-launched `.exe`: `cargo test`/`clippy` do not
+  refresh `target/debug/<bin>.exe`, only `cargo build -p <bin>` does), re-ran the same scripted
+  zoom: the orphaned-label column was gone, and a cropped/upscaled inspection of a dense airport
+  cluster confirmed the collision sweep itself works as specified (fewer labels than glyphs —
+  overlapping losers culled entirely, never shrunk — no visible overlap in the captured frame).
+  Flip-near-edge and leader-line behavior relied on unit tests rather than a live pixel hunt
+  (`placement_flips_to_the_left_near_the_right_edge`,
+  `no_leader_line_when_the_label_is_not_displaced`), the same "unit tests + one confirming live
+  pass" bar 2.6b's ribbon taper was held to.
+- `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green
+  — **477 passed, 5 ignored, 0 failed** (+36 over 2.7a's 441: 33 from the agent's implementation,
+  +3 from this session's fix). Clean `WM_CLOSE` on both live runs; scratch `look_above.db` deleted
+  after each per 1.12/1.13's convention. Credit spend from the two live runs not precisely
+  tallied — the verification script launched the binary directly rather than through a
+  log-capturing harness, so the per-cycle credit lines weren't recorded; flagged in
+  CURRENT_STATUS rather than assumed zero. Next: **2.1b** (F3 stats overlay text, unblocked now
+  that a text atlas exists) or **2.8** (selection) — owner's call, neither started.

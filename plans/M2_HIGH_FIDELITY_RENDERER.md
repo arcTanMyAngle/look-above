@@ -447,7 +447,7 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       renderable surface until 2.7b consumes the new fields (2.4a/2.6a's own precedent for the
       same reason). DECISION_LOG 2.7a. Next: **2.7b**, the render-side text glyph atlas +
       placement + collision culling + leader lines.)*
-- [ ] 2.7b Labels render: glyph-atlas text (a procedurally generated stroke-font SDF atlas, same
+- [x] 2.7b Labels render: glyph-atlas text (a procedurally generated stroke-font SDF atlas, same
       technique as 2.5's `glyph_atlas.rs` — no font/asset crate exists in this workspace), content
       `CALLSIGN  FLnnn  nnnkt` from 2.7a's new `AircraftInstance` fields (omit unknowns; anonymous
       targets get no label — there is no selection yet to except them into "Unidentified", that
@@ -457,6 +457,62 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       until then and flag the gap explicitly rather than silently faking it), leader-line when
       displaced, re-evaluated at ≤ 5 Hz with the skill's >10%-priority-beaten hysteresis so a label
       doesn't flicker. Depends on 2.7a.
+      *(2026-07-19: implemented — new `render::label` (pure/testable content formatting, screen-
+      space projection, priority, placement geometry, the collision sweep, GPU packing) and
+      `render::label_atlas` (a procedurally generated **stroke-font** SDF atlas: exactly the 39
+      characters the content format needs — `A`–`Z`, `0`–`9`, space, `k`/`t` — each 2–6 line
+      segments over a 3×5 grid, rasterized via the same ray-casting-to-distance-field technique as
+      2.5's `glyph_atlas.rs`, generalized to *unsigned* distance-to-nearest-stroke since a stroke
+      isn't a closed polygon; `glyph_atlas::distance_to_segment`/`encode_distance` were widened to
+      `pub(crate)`/parameterized-on-spread so both atlases share the primitive rather than
+      duplicating it). New `label.wgsl` (two tiny pipelines sharing one screen-size uniform: text
+      quads with the same SDF antialiasing as `aircraft.wgsl`, plus a leader-line `LineList`,
+      mirroring `trail.wgsl`'s pass-through shape). New `LabelLayer` in `renderer.rs`, drawn last
+      (after aircraft glyphs, docs/01's order) — the one pass that does *not* share the world
+      view-proj bind group, since placement/collision are already screen-pixel space; it also owns
+      the cross-frame hysteresis state (`held`/`last_eval_s`/`cached_placements`) the ≤5 Hz
+      re-evaluation needs, re-projecting already-shown labels every frame in between ticks so
+      motion stays smooth without reallocating text off the throttled path. `Renderer::render`'s
+      signature changed from `(&mut self, feed, meters_per_pixel: f64)` to
+      `(&mut self, feed, camera: &Camera)` — the label pass needs the camera's `center_m`/
+      `width_px`/`height_px`, not just its zoom scalar; the one app call site
+      (`crates/app/src/window.rs`) updated to pass `&camera`. Hysteresis is a priority *boost*
+      (`× 1.1`) applied only to the currently-held candidate during the collision sort, which
+      reduces the skill's ">10%" margin to a plain comparison. `selected` is hardcoded `false` in
+      `label_priority` with an explicit doc comment (2.8 wires a real signal in later) rather than
+      faking one. **Delegated to the renderer-agent** (glyph/SDF atlases and label drawing are
+      squarely its remit, same as 2.5/2.6b); **interrupted mid-task by a session API/rate-limit
+      error**, resumed via `SendMessage` from its own transcript rather than restarting cold — the
+      same recovery path 2.5/2.2b used. **Independently re-verified, and this pass caught a real
+      bug the agent's own headless-only verification couldn't have**: every changed/new file read
+      in full, fresh `fmt`/`clippy --all-targets -D warnings`/`test --workspace` re-run (474
+      passed, matching the agent's count exactly) — then a **live run against the owner's real
+      `credentials.json`** (scripted zoom over Scandinavia/the Baltic, Win32 `mouse_event` wheel
+      synthesis + `PrintWindow` capture) showed labels correctly attached to their aircraft and a
+      genuine defect: `render::label::build_candidates` labeled *every* aircraft in the feed with
+      no on-screen check, so aircraft outside the current viewport (the feed can span a wider
+      region than the camera — e.g. right after a zoom, before the poller retargets) got labels
+      whose position `placement_geometry`'s edge-clamp then pinned to the viewport border, drawing
+      a dense stack of orphaned labels with no glyph anywhere near them (`aircraft.rs` has no such
+      CPU-side viewport check of its own — an off-screen glyph simply never rasterizes in clip
+      space — so this was new to the label pass, not an existing gap it inherited). **Fixed
+      directly** (small, well-scoped, in a file already fully read this session — this session's
+      own precedent for not delegating a sub-20-line fix): added `glyph_is_visible` (margin =
+      the aircraft glyph's own half-width, so a glyph straddling the exact edge still gets
+      labeled) and an early return in `build_candidates`; 3 new tests (an off-screen aircraft
+      produces no candidate, an on-screen one does, the margin boundary itself). Re-verified
+      green after the fix — **477 passed, 5 ignored, 0 failed** (+36 over 2.7a's 441). **Re-ran
+      the live capture after rebuilding the binary with the fix**: the orphaned-label column was
+      gone, every visible label sat beside its aircraft, and a cropped/upscaled inspection of a
+      dense cluster confirmed the collision sweep itself works as specified — overlapping
+      candidates culled entirely (fewer labels than glyphs in the cluster), no shrinking, no
+      visible overlap anywhere in the captured frame. Flip-near-edge and leader-line behavior
+      verified by the unit tests (`placement_flips_to_the_left_near_the_right_edge`,
+      `no_leader_line_when_the_label_is_not_displaced`) rather than hunted for pixel-by-pixel live,
+      per the same "unit tests + one confirming live pass" bar 2.6b's ribbon taper was held to.
+      Clean `WM_CLOSE` exit both live runs; scratch `look_above.db` deleted after per 1.12/1.13's
+      convention. DECISION_LOG 2.7b. Next: **2.1b** (the F3 stats overlay text, unblocked now that
+      a text atlas exists) or **2.8** (selection) — both open, neither started.)*
 - [ ] 2.8 Selection: cursor hit-test against glyph quads (CPU, spatial index), white outline,
       minimal info card (callsign/alt/speed/source — enrichment fields arrive in M3;
       anonymous → "Unidentified" already enforced here).

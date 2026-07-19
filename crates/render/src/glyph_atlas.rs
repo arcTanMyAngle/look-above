@@ -202,7 +202,11 @@ fn distance_to_polygon_edges(point: (f32, f32), poly: &[(f32, f32)]) -> f32 {
 }
 
 /// The shortest distance from `point` to the segment `a`–`b`.
-fn distance_to_segment(point: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+///
+/// `pub(crate)`, not private: `label_atlas.rs` (M2 item 2.7b) reuses this exact primitive for its
+/// stroke-font rasterization (distance to the nearest stroke segment) rather than duplicating it —
+/// the same point-to-segment math, just fed a font's line strokes instead of a silhouette's edges.
+pub(crate) fn distance_to_segment(point: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (ax, ay) = a;
     let (bx, by) = b;
     let (px, py) = point;
@@ -239,9 +243,15 @@ fn signed_distance_to_shapes(point: (f32, f32), shapes: &[Vec<(f32, f32)>]) -> f
 }
 
 /// Encodes a signed distance (positive inside, negative outside) as the atlas's `R8Unorm`
-/// convention: `0.5` at the edge, ramping linearly to `1.0`/`0.0` over ±[`SPREAD`].
-fn encode_distance(signed_distance: f32) -> u8 {
-    let normalized = (0.5 + signed_distance / (2.0 * SPREAD)).clamp(0.0, 1.0);
+/// convention: `0.5` at the edge, ramping linearly to `1.0`/`0.0` over ±`spread`.
+///
+/// `pub(crate)` and parameterized on `spread` (rather than capturing [`SPREAD`] directly): shared
+/// with `label_atlas.rs`, whose stroke-font tiles are smaller and want their own antialiasing
+/// band width — see that module's own spread constant. [`encode_distance`] is this module's own
+/// thin wrapper fixing `spread` to [`SPREAD`], kept so every existing call site/test here reads
+/// exactly as before.
+pub(crate) fn encode_signed_distance(signed_distance: f32, spread: f32) -> u8 {
+    let normalized = (0.5 + signed_distance / (2.0 * spread)).clamp(0.0, 1.0);
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -251,6 +261,11 @@ fn encode_distance(signed_distance: f32) -> u8 {
     {
         (normalized * 255.0).round() as u8
     }
+}
+
+/// This module's own [`encode_signed_distance`] call, fixed to its own [`SPREAD`].
+fn encode_distance(signed_distance: f32) -> u8 {
+    encode_signed_distance(signed_distance, SPREAD)
 }
 
 /// Maps one tile-local texel (row 0 = top = local `y = +0.5`, matching `aircraft.wgsl`'s
