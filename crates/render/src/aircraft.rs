@@ -4,7 +4,7 @@
 //! all of it is plain, testable Rust.
 //!
 //! Draw order (docs/01): map base → map lines → trails → **aircraft glyphs** → labels → UI.
-//! Trails (2.6) and labels (2.7) don't exist yet, so this is simply the last pass added.
+//! Trails land in 2.6b (drawn just before this pass); labels (2.7) don't exist yet.
 
 use std::mem::size_of;
 

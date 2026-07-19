@@ -1882,3 +1882,85 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   green — **427 passed, 5 ignored, 0 failed** (+7 over 2.5's 420). No live run: pure library math
   with no runtime surface until 2.6b wires a consumer, same as 2.4a. Next: **2.6b**, the
   render-side ribbon tessellation + WGSL trail pipeline.
+
+## 2026-07-19 — M2 item 2.6b (trails render: ribbon tessellation + WGSL pipeline)
+
+- **CPU triangle-list tessellation, not GPU-instanced segments or a `TriangleStrip` primitive.**
+  The checklist says "triangle-strip ribbons"; the design note says "CPU packing on the render
+  thread, same pattern as 2.5's `pack_instance`". Both point at building ribbon geometry on the
+  CPU. Chose a **triangle list** (`trail::tessellate_trails` → a per-frame, dynamically-grown
+  vertex buffer, one non-indexed `draw`) over the two alternatives: (a) a real `TriangleStrip`
+  topology would need one draw call per aircraft, or a primitive-restart index between aircraft —
+  more moving parts for no gain at this vertex volume; (b) GPU-instanced line segments (one
+  instance per segment, quad built in the shader) is compact but double-blends at every joint,
+  which is visible on an alpha-blended pass. The triangle list is the simplest faithful reading
+  and is fully unit-testable (no WGSL geometry logic to leave unexercised).
+- **Continuous ribbon with shared joint vertices, not independent per-segment quads.** Each
+  centerline vertex gets one left/right offset point (offset by ±half-width along the averaged
+  perpendicular), and adjacent segments *share* those points. That is what avoids both a gap and —
+  the reason it matters for an alpha-blended pass — an overlapping (double-blended) sliver at each
+  joint that would read as a bright bead at every 1 Hz sample. Cost: a miterless join pinches the
+  width slightly at sharp turns, negligible because the no-backward-along-track invariant in
+  `core::sim` already keeps trails near-straight at 1 Hz.
+- **Taper is a pure function of each vertex's `age_s`, computed on the render side.** Width
+  `3 px → 0.5 px` (`taper_width_px`) and alpha `0.8 → 0` (`taper_alpha`) linearly over
+  `[0, TRAIL_DURATION_S]`, both clamped; the half-width is converted to normalized-plane units the
+  same "pixels → world metres ÷ extent" way `aircraft::glyph_scale_normalized` does, using the
+  camera's live `meters_per_pixel` (2.6a deliberately left `age_s` raw, not pre-normalized, so a
+  trail shorter than 5 min still taper-maps against the full scale rather than its own history).
+- **Coincident consecutive samples are dropped before building.** A stationary aircraft (on the
+  ground, or holding) records repeated identical displayed positions; a zero-length segment has no
+  travel direction (NaN normal). Dropping the newer of any pair closer than `MIN_SEGMENT_LEN_SQ`
+  (~2 cm on the ground, far below the metres a moving aircraft covers per 1 Hz sample) makes every
+  surviving segment well-defined; a run that collapses to `< 2` distinct points is a dot, not a
+  ribbon, and draws nothing.
+- **New `trail.rs` (pure, testable) + `trail.wgsl` (pass-through) + a `TrailLayer` in
+  `renderer.rs`**, mirroring 2.5's split of `aircraft.rs` (CPU math) / `aircraft.wgsl` /
+  `AircraftLayer`. The shader carries no geometry: every vertex arrives already offset and already
+  colored, so `trail.wgsl` only applies the shared `@group(0)` view-proj matrix and passes the
+  color through. The pipeline reuses the *same* `view_proj` `BindGroupLayout` object the base-map
+  and aircraft passes were built from (the one 2.5 introduced), so one bind group still serves
+  every pass. Alpha-blended like the aircraft pass (the taper alpha needs it), unlike the opaque
+  base-map passes. The instance/vertex buffer grows exactly like 2.5's (×2-or-exact, min
+  `MIN_TRAIL_VERTEX_CAPACITY`), with a reused `vertex_scratch` so a warmed-up frame never
+  allocates (ADR-002).
+- **Draw order (docs/01): trails go *before* the aircraft glyphs** (map base → map lines → trails
+  → aircraft → labels → UI), so a glyph is never occluded by its own trail. `Renderer::render`'s
+  signature is unchanged from 2.5 (`feed: &RenderFeed, meters_per_pixel: f64`) — it already
+  carried everything 2.6b needs; the trail pass just consumes `feed.trails` and the same
+  `meters_per_pixel`.
+- **Delegation: done directly, not delegated.** This session had already read `sim.rs`,
+  `aircraft.rs`, `renderer.rs`, `aircraft.wgsl`, and `color.rs` in full while implementing 2.6a
+  and orienting on 2.6b, so a cold renderer-agent would only re-derive files already in context
+  (2.4a/2.6a's precedent).
+- **9 new unit tests, all in `trail.rs`**: the two taper curves (head/tail values + clamp past the
+  tail so width never goes negative and alpha never goes below 0); half-width positivity and
+  linear scaling with both pixels and zoom; a straight run widening into a ribbon offset purely
+  perpendicular to travel, each vertex by its own age's half-width (head wider than tail); head
+  vertices more opaque and colored by *their own* bucket while tail vertices carry the older
+  sample's bucket/alpha (per-vertex coloring, not one repeated color); a single-sample run and a
+  stationary coincident-sample run both producing no geometry; each aircraft's run tessellated
+  independently (the run boundary respected, no phantom segment stitching one tail to the next
+  head); and the output buffer being cleared-and-reused rather than appended. `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` all green — **436 passed, 5
+  ignored, 0 failed** (+9 over 2.6a's 427, all in `render::trail`).
+- **Live-verified** against the owner's real `credentials.json` (Intel Arc / DX12,
+  `Bgra8UnormSrgb`, 1920×1200): scripted a wheel-zoom anchored over central Europe, which
+  retargeted the poller to a lat 47.7–49.7 / lon 5.6–10.5 bbox (~187 aircraft, updated each
+  cycle). The zoomed-in frames showed each altitude-colored dart glyph trailing a **tapered,
+  altitude-ramp-colored ribbon** behind it — cyan/green/amber matching each aircraft's own band,
+  thinning and fading toward the tail, with the glyph drawn on top of (never occluded by) its own
+  trail. No wgpu validation errors or panics anywhere in the run; clean `WM_CLOSE`
+  (`close requested → window closed`). ~17 credits across the run (spent_today reached 36, far
+  under the 3,200/80% cap); scratch `look_above.db` deleted after per 1.12/1.13's convention.
+  (A late capture that landed during `WM_CLOSE` teardown showed the view briefly back at
+  whole-world — a capture-timing artifact, not a trail issue: the camera/view-proj path was
+  untouched by 2.6b, and the retarget log shows the camera held the Europe bbox the whole run.)
+- **Trails inherit 2.5's flagged LOD gap, plus a per-frame tessellation-cost concern.** At
+  whole-world zoom the constant-3px-width trails of hundreds of aircraft pile into a colored blob
+  (the same "no L0/L1 tier" gap 2.5 flagged for glyphs — docs/13 §L2-core / the M2 2.10 gate), and
+  the CPU re-tessellates *every* visible trail *every* frame, unbounded by zoom — cheap at a
+  regional viewport (the poller's bbox keeps the feed small there) but a real cost at a
+  whole-world viewport with accumulated trails. Both resolve with the same future LOD item that
+  2.5 already flagged (draw trails only at L2); noted here so the trail cost is on record for that
+  item rather than discovered at the gate. Next: **2.7**, labels.

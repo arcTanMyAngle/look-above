@@ -7,14 +7,38 @@
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
   open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5,
-  2.6a done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.6b** — trails render: render-side ribbon tessellation (CPU
-  packing on the render thread, camera-zoom-aware taper) + WGSL trail pipeline, consuming
-  2.6a's `RenderFeed.trails`.
+  2.6a, 2.6b done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.7** — labels: glyph-atlas text (callsign + FL + kt), CPU collision
+  culling with priority (docs/01), leader-line when displaced. (2.1b — the F3 stats overlay —
+  also depends on 2.7's glyph-atlas text and is still open; do 2.7 first.)
 - **⚠ Flagged, not yet its own item: LOD tiers.** 2.5 draws every aircraft as one fixed-size
-  L2-style glyph at any zoom; no M2 checklist item (2.1–2.10) implements L0/L1 tier switching,
-  and docs/13 §L2-core's zoom-out-to-globe check is part of the M2 gate (2.10) — a future
-  milestone item for LOD cross-fade needs to exist before that gate can honestly pass. DECISION_LOG 2.5.
+  L2-style glyph at any zoom, and 2.6b draws every aircraft's full trail as a constant-3px ribbon
+  at any zoom (which piles into a colored blob at whole-world zoom, plus an unbounded per-frame
+  tessellation cost there); no M2 checklist item (2.1–2.10) implements L0/L1 tier switching, and
+  docs/13 §L2-core's zoom-out-to-globe check is part of the M2 gate (2.10) — a future milestone
+  item for LOD cross-fade (drawing glyphs/trails only at L2) needs to exist before that gate can
+  honestly pass. DECISION_LOG 2.5, 2.6b.
+- **2.6b landed:** trails render. New `render::trail` (pure, testable ribbon tessellation) +
+  `shaders/trail.wgsl` (pass-through) + a `TrailLayer` in `renderer.rs`, mirroring 2.5's
+  `aircraft.rs`/`aircraft.wgsl`/`AircraftLayer` split. Each aircraft's contiguous
+  `RenderFeed.trails` run (2.6a's grouping) becomes one **continuous CPU triangle-list ribbon** —
+  centerline vertices offset ±half-width along the averaged perpendicular, joint vertices *shared*
+  between adjacent segments so an alpha-blended pass gets no gap and no double-blended bead. Width
+  `3px → 0.5px` and alpha `0.8 → 0` taper as a pure function of each vertex's `age_s`; half-width →
+  normalized plane via the camera's live `meters_per_pixel` (same math as 2.5's glyph scale).
+  Coincident samples (a stationary aircraft) are dropped so no zero-length segment NaNs; a run
+  under 2 distinct points draws nothing. Alpha-blended pipeline reusing 2.5's shared view-proj
+  `@group(0)`; per-frame vertex buffer grows like the instance buffer with a reused scratch
+  (ADR-002). Drawn *before* the aircraft glyphs (docs/01 order) so a glyph is never occluded by its
+  own trail; `Renderer::render`'s signature was already sufficient (unchanged). Done directly, not
+  delegated. 9 new `render::trail` tests; fmt/clippy/test green — **436 passed, 5 ignored, 0
+  failed** (+9 over 2.6a's 427). **Live-verified** against the owner's real `credentials.json`
+  (Intel Arc/DX12, `Bgra8UnormSrgb`, 1920×1200): a scripted wheel-zoom over central Europe
+  retargeted the poller to a ~187-aircraft region; the zoomed-in frames showed each altitude-
+  colored dart glyph trailing a tapered, altitude-ramp-colored ribbon (thinning/fading toward the
+  tail, glyph on top, never occluded), no wgpu validation errors/panics, clean `WM_CLOSE`. ~17
+  credits (spent_today→36, far under the cap); scratch `look_above.db` deleted after. Trails
+  inherit 2.5's LOD gap (see the flag above). DECISION_LOG 2.6b.
 - **2.5 landed:** the aircraft glyph pipeline — the first item to actually draw a live aircraft.
   New `render::glyph_atlas` (a procedurally-generated SDF atlas, 6 categories, 64×64 tiles in one
   static `384×64` strip — no image/font/asset crate exists in this workspace, so the silhouettes
@@ -191,6 +215,46 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.6b: trails render — the render-side ribbon tessellation + WGSL
+  trail pipeline that consumes 2.6a's `RenderFeed.trails`. New `crates/render/src/trail.rs` (pure,
+  testable) tessellates each aircraft's contiguous trail run into one continuous triangle-list
+  ribbon: every centerline vertex offset ±half-width along the averaged perpendicular of the local
+  travel direction, joint vertices *shared* between adjacent segments (no gap, and — on this
+  alpha-blended pass — no double-blended bead at joints). Width `3 px → 0.5 px` and alpha
+  `0.8 → 0` taper as a pure function of each vertex's `age_s` over `[0, TRAIL_DURATION_S]`;
+  half-width is converted to the normalized `[-1,1]` plane the same "pixels → world metres ÷
+  extent" way 2.5's `glyph_scale_normalized` is, using the camera's live `meters_per_pixel`
+  (which `core` doesn't have — exactly why 2.6a stopped at flat centerline samples). Coincident
+  consecutive samples (a stationary/holding aircraft, which records repeated identical displayed
+  positions) are dropped so no zero-length segment produces a NaN normal; a run collapsing to
+  under 2 distinct points is a dot, not a ribbon, and draws nothing. New `shaders/trail.wgsl` is
+  pass-through (every vertex arrives already offset and colored, so it only applies the shared
+  `@group(0)` view-proj and passes the color through); the new `TrailLayer` in `renderer.rs`
+  reuses 2.5's shared view-proj `BindGroupLayout`, is alpha-blended like the aircraft pass, and
+  grows its per-frame vertex buffer with a reused scratch (ADR-002). Drawn *before* the aircraft
+  glyphs (docs/01's map → lines → trails → aircraft → labels order) so a glyph is never occluded
+  by its own trail; `Renderer::render`'s signature was already `(&RenderFeed, meters_per_pixel)`
+  from 2.5, so no plumbing changed. Done directly, not delegated (every touched file was already
+  read this session for 2.6a, per 2.4a/2.6a's precedent). 9 new unit tests, all in `render::trail`
+  (both taper curves + clamps, half-width scaling, a straight run widening perpendicular to travel
+  with per-vertex half-width, per-vertex bucket/alpha coloring, single-sample and coincident-
+  sample runs drawing nothing, per-aircraft run independence, output-buffer reuse). `cargo fmt
+  --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green — **436
+  passed, 5 ignored, 0 failed** (+9 over 2.6a's 427). **Live-verified** against the owner's real
+  `credentials.json` (Intel Arc/DX12, `Bgra8UnormSrgb`, 1920×1200): a scripted wheel-zoom anchored
+  over central Europe retargeted the poller to a lat 47.7–49.7 / lon 5.6–10.5 bbox (~187 aircraft
+  updated each cycle), and the zoomed-in frames showed each altitude-colored dart glyph trailing a
+  tapered, altitude-ramp-colored ribbon — cyan/green/amber matching each aircraft's own band,
+  thinning and fading toward the tail, glyph drawn on top and never occluded — no wgpu validation
+  errors or panics, clean `WM_CLOSE`. ~17 credits (spent_today reached 36, far under the 3,200/80%
+  cap); scratch `look_above.db` deleted after per 1.12/1.13's convention. A late capture that
+  landed during the `WM_CLOSE` teardown briefly showed the view back at whole-world — a
+  capture-timing artifact (the camera/view-proj path was untouched by 2.6b; the retarget log shows
+  the camera held the Europe bbox all run), which incidentally illustrates the flagged LOD gap
+  trails now inherit: constant-3px ribbons of hundreds of aircraft blob at whole-world zoom, plus
+  an unbounded per-frame tessellation cost there — both resolve with the same future LOD item 2.5
+  flagged. DECISION_LOG 2.6b. Next: **2.7**, labels.
 
 - **2026-07-19** — M2 item 2.6a: the `core::sim` trail ring buffer. Split 2.6 into 2.6a/2.6b
   first (same shape as every prior M2 item): the checklist bundles the pure ring-buffer/sampling

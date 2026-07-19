@@ -366,7 +366,7 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       no runtime surface until 2.6b wires a consumer (2.4a's own precedent for the same reason).
       DECISION_LOG 2.6a. Next:
       **2.6b**, the render-side ribbon tessellation + WGSL trail pipeline.)*
-- [ ] 2.6b Trails render: `render` tessellates each frame's `RenderFeed.trails` into
+- [x] 2.6b Trails render: `render` tessellates each frame's `RenderFeed.trails` into
       triangle-strip ribbons (CPU packing on the render thread, same pattern as 2.5's
       `pack_instance` — the per-vertex perpendicular offset needs the camera's current
       `meters_per_pixel` to keep the taper a constant screen-space width, which only the render
@@ -375,6 +375,35 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       pipeline, drawn in docs/01's order (map → map lines → **trails** → aircraft → labels → UI —
       before the aircraft glyphs, so a glyph never gets occluded by its own trail). Depends on
       2.6a.
+      *(2026-07-19: implemented — new `crates/render/src/trail.rs` (pure, testable ribbon
+      tessellation) + `shaders/trail.wgsl` (pass-through vertex/fragment) + a `TrailLayer` in
+      `renderer.rs`, mirroring 2.5's `aircraft.rs`/`aircraft.wgsl`/`AircraftLayer` split.
+      **CPU triangle list, not a `TriangleStrip` primitive or GPU-instanced segments**: each
+      aircraft's contiguous `RenderFeed.trails` run (2.6a's grouping invariant) becomes one
+      continuous ribbon — every centerline vertex offset ±half-width along the averaged
+      perpendicular, joint vertices *shared* between adjacent segments so there is no gap and no
+      double-blended overlap at joints (which would bead on an alpha-blended pass). Width
+      `3 px → 0.5 px` and alpha `0.8 → 0` taper linearly over `[0, TRAIL_DURATION_S]` as a pure
+      function of each vertex's `age_s`; the half-width is converted to normalized-plane units the
+      same "pixels → world metres ÷ extent" way `aircraft::glyph_scale_normalized` is, from the
+      camera's live `meters_per_pixel`. Coincident consecutive samples (a stationary/holding
+      aircraft) are dropped so no zero-length segment yields a NaN normal; a run collapsing to
+      `< 2` distinct points draws nothing. The trail pipeline reuses the shared view-proj
+      `@group(0)` `BindGroupLayout` (2.5's) and is alpha-blended like the aircraft pass; the
+      per-frame vertex buffer grows exactly like 2.5's instance buffer with a reused scratch
+      (ADR-002). Drawn *before* the aircraft glyphs so a glyph is never occluded by its own trail;
+      `Renderer::render`'s signature is unchanged (it already carried `feed`/`meters_per_pixel`).
+      Done directly, not delegated (all touched files already read this session for 2.6a). 9 new
+      unit tests in `render::trail`; `cargo fmt --check`/`clippy --workspace --all-targets -D
+      warnings`/`test --workspace` all green — **436 passed, 5 ignored, 0 failed** (+9 over 2.6a's
+      427). **Live-verified** against the owner's real `credentials.json` (Intel Arc/DX12,
+      `Bgra8UnormSrgb`, 1920×1200): a scripted wheel-zoom over central Europe retargeted the poller
+      to a ~187-aircraft region, and the zoomed-in frames showed each altitude-colored dart glyph
+      trailing a tapered, altitude-ramp-colored ribbon (thinning/fading to the tail, glyph drawn on
+      top), no wgpu validation errors/panics, clean `WM_CLOSE`. **Trails inherit 2.5's flagged LOD
+      gap** (constant-3px trails blob at whole-world zoom) plus an unbounded per-frame
+      tessellation cost there — both resolve with the same future LOD item, noted in DECISION_LOG
+      2.6b. Next: **2.7**, labels.)*
 - [ ] 2.7 Labels: glyph-atlas text (callsign + FL + kt), CPU collision culling with priority
       (docs/01), leader-line when displaced.
 - [ ] 2.8 Selection: cursor hit-test against glyph quads (CPU, spatial index), white outline,

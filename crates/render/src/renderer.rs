@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use look_above_core::camera::Camera;
 use look_above_core::geo::WEB_MERCATOR_EXTENT_M;
-use look_above_core::sim::{AircraftInstance, RenderFeed};
+use look_above_core::sim::{AircraftInstance, RenderFeed, TrailVertex};
 use wgpu::util::DeviceExt as _;
 use wgpu::{CurrentSurfaceTexture, DisplayAndWindowHandle};
 
@@ -14,6 +14,7 @@ use crate::basemap::{self, MeshData};
 use crate::color;
 use crate::error::RenderError;
 use crate::glyph_atlas;
+use crate::trail::{self, TrailVertexRaw};
 
 /// docs/01's render-target sample count. Checked against the adapter's format features in
 /// [`Renderer::new`] before the first MSAA texture is created — see
@@ -28,6 +29,10 @@ const BASEMAP_SHADER: &str = include_str!("shaders/basemap.wgsl");
 /// The aircraft glyph shader (M2 item 2.5): instanced quads, rotation from per-instance heading,
 /// SDF atlas sampling — see `aircraft.wgsl`'s module doc comment.
 const AIRCRAFT_SHADER: &str = include_str!("shaders/aircraft.wgsl");
+
+/// The trail ribbon shader (M2 item 2.6b): pass-through vertices that `trail.rs` already offset
+/// and colored on the CPU — see `trail.wgsl`'s module doc comment.
+const TRAIL_SHADER: &str = include_str!("shaders/trail.wgsl");
 
 /// What [`Renderer::render`] did with a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,11 +178,97 @@ impl AircraftLayer {
     }
 }
 
+/// The trail ribbon pass's GPU resources (M2 item 2.6b): one dynamically-grown vertex buffer,
+/// re-tessellated and re-uploaded from the frame's `RenderFeed.trails` every frame (the ribbon's
+/// width and taper depend on the camera's live zoom, so unlike the base map this cannot be built
+/// once). No atlas, no per-frame uniform: `trail.rs` bakes the geometry and color on the CPU, so
+/// the pipeline reads only the shared view-proj `@group(0)`, passed into [`TrailLayer::draw`] like
+/// the other passes.
+#[derive(Debug)]
+struct TrailLayer {
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
+    /// The six altitude-bucket tints for this renderer's surface format, built once (see
+    /// [`color::altitude_bucket_tint_table`]) — the same table the aircraft pass uses.
+    tint_table: [[f32; 4]; 6],
+    /// Reused every frame so tessellating a feed's trails never allocates once capacity has warmed
+    /// up (ADR-002) — cleared and refilled by [`trail::tessellate_trails`], not reallocated.
+    vertex_scratch: Vec<TrailVertexRaw>,
+}
+
+impl TrailLayer {
+    /// Tessellates `trails` into this frame's ribbon vertices, growing the GPU buffer first if the
+    /// frame produced more than it currently holds. Returns the vertex count to draw.
+    fn upload_trails(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        trails: &[TrailVertex],
+        meters_per_pixel: f64,
+    ) -> u32 {
+        trail::tessellate_trails(
+            trails,
+            &self.tint_table,
+            meters_per_pixel,
+            &mut self.vertex_scratch,
+        );
+
+        if self.vertex_scratch.len() > self.vertex_capacity {
+            let new_capacity = self
+                .vertex_scratch
+                .len()
+                .max(self.vertex_capacity.saturating_mul(2))
+                .max(trail::MIN_TRAIL_VERTEX_CAPACITY);
+            self.vertex_buffer = create_trail_vertex_buffer(device, new_capacity);
+            self.vertex_capacity = new_capacity;
+        }
+
+        if !self.vertex_scratch.is_empty() {
+            queue.write_buffer(
+                &self.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.vertex_scratch),
+            );
+        }
+
+        // `vertex_scratch.len()` is bounded by the feed's trail size (docs/01's 10,000-aircraft
+        // budget × the 300-sample retention window × 6 vertices/segment) — large, but far inside
+        // `u32`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "trail vertex count is bounded by docs/01's aircraft budget and the trail \
+                      retention window, far inside u32::MAX"
+        )]
+        {
+            self.vertex_scratch.len() as u32
+        }
+    }
+
+    /// Binds the trail pipeline and draws every uploaded ribbon vertex in one call.
+    /// `view_proj_bind_group` is the same `@group(0)` the base-map and aircraft passes use.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+        vertex_count: u32,
+    ) {
+        if vertex_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw(0..vertex_count, 0..1);
+    }
+}
+
 /// Owns the GPU device and a window's swapchain, and paints the map.
 ///
-/// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), and
-/// 2.5 adds the aircraft glyph pass on top of it — three of docs/01's draw order ("map base →
-/// map lines → trails → aircraft → labels → UI"). Trails (2.6) and labels (2.7) are what remain.
+/// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), 2.5
+/// added the aircraft glyph pass, and 2.6b adds the trail ribbon pass between them — four of
+/// docs/01's draw order ("map base → map lines → trails → aircraft → labels → UI"). Labels (2.7)
+/// are what remain.
 #[derive(Debug)]
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -204,7 +295,11 @@ pub struct Renderer {
     basemap_view_proj_bind_group: wgpu::BindGroup,
     basemap_land: BasemapLayer,
     basemap_coastline: BasemapLayer,
-    /// The aircraft glyph pass (M2 item 2.5) — drawn after both base-map layers, reusing
+    /// The trail ribbon pass (M2 item 2.6b) — drawn after the base map and *before* the aircraft
+    /// glyphs, reusing [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
+    /// [`TrailLayer::draw`]).
+    trail: TrailLayer,
+    /// The aircraft glyph pass (M2 item 2.5) — drawn last (after the trails), reusing
     /// [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
     /// [`AircraftLayer::draw`]).
     aircraft: AircraftLayer,
@@ -277,6 +372,7 @@ impl Renderer {
             config.width,
             config.height,
         );
+        let trail = build_trail_resources(&device, &view_proj_layout, config.format);
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, config.format);
 
         Ok(Self {
@@ -291,6 +387,7 @@ impl Renderer {
             basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
             basemap_land: basemap_resources.land,
             basemap_coastline: basemap_resources.coastline,
+            trail,
             aircraft,
         })
     }
@@ -399,13 +496,15 @@ impl Renderer {
     }
 
     /// Draw and present one frame: the background clear, the base map (land fill, coastline
-    /// stroke), then `feed`'s aircraft glyphs on top of it (docs/01's draw order — trails/labels
-    /// are 2.6/2.7, not yet drawn).
+    /// stroke), then `feed`'s trail ribbons, then its aircraft glyphs on top (docs/01's draw
+    /// order — labels are 2.7, not yet drawn).
     ///
-    /// `meters_per_pixel` is the camera's current zoom, needed only to size the aircraft glyphs
-    /// a constant number of screen pixels regardless of zoom (see
-    /// [`aircraft::glyph_scale_normalized`]) — passing the scalar rather than a whole `Camera`
-    /// keeps this crate from needing to know anything else about the camera's shape.
+    /// `meters_per_pixel` is the camera's current zoom, needed to size the aircraft glyphs a
+    /// constant number of screen pixels regardless of zoom (see
+    /// [`aircraft::glyph_scale_normalized`]) and to keep the trail ribbons a constant
+    /// screen-space width the same way (see [`trail::tessellate_trails`]) — passing the scalar
+    /// rather than a whole `Camera` keeps this crate from needing to know anything else about the
+    /// camera's shape.
     pub fn render(
         &mut self,
         feed: &RenderFeed,
@@ -435,6 +534,9 @@ impl Renderer {
         // long as they run before `queue.submit`, same as `set_view_proj`'s writes always have.
         let glyph_scale = aircraft::glyph_scale_normalized(meters_per_pixel);
         self.aircraft.set_glyph_scale(&self.queue, glyph_scale);
+        let trail_vertex_count =
+            self.trail
+                .upload_trails(&self.device, &self.queue, &feed.trails, meters_per_pixel);
         let instance_count =
             self.aircraft
                 .upload_instances(&self.device, &self.queue, &feed.aircraft);
@@ -470,12 +572,17 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // docs/01 draw order: map base, then map lines, then aircraft glyphs (2.5). Trails
-            // (2.6) and labels (2.7) are the remaining gap in that order.
+            // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
+            // glyphs (2.5) on top of them. Labels (2.7) are the remaining gap in that order.
             self.basemap_land
                 .draw(&mut pass, &self.basemap_view_proj_bind_group);
             self.basemap_coastline
                 .draw(&mut pass, &self.basemap_view_proj_bind_group);
+            self.trail.draw(
+                &mut pass,
+                &self.basemap_view_proj_bind_group,
+                trail_vertex_count,
+            );
             self.aircraft.draw(
                 &mut pass,
                 &self.basemap_view_proj_bind_group,
@@ -975,6 +1082,96 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
         size: (capacity * size_of::<InstanceRaw>()) as wgpu::BufferAddress,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    })
+}
+
+/// Builds the trail ribbon pass's GPU resources (M2 item 2.6b): the pipeline and an initial
+/// (empty) vertex buffer. Runs once, in [`Renderer::new`], alongside the base-map and aircraft
+/// resource builders.
+///
+/// `view_proj_layout` must be the exact same object the other passes were built from — see
+/// [`build_basemap_resources`]'s doc comment.
+fn build_trail_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> TrailLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above trail shader"),
+        source: wgpu::ShaderSource::Wgsl(TRAIL_SHADER.into()),
+    });
+
+    // Only `@group(0)` (the shared view-proj matrix): `trail.rs` bakes geometry and color on the
+    // CPU, so there is no atlas or per-frame uniform for this pass to bind.
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above trail pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = create_trail_pipeline(device, &shader, &pipeline_layout, format);
+    let vertex_buffer = create_trail_vertex_buffer(device, trail::MIN_TRAIL_VERTEX_CAPACITY);
+
+    TrailLayer {
+        pipeline,
+        vertex_buffer,
+        vertex_capacity: trail::MIN_TRAIL_VERTEX_CAPACITY,
+        tint_table: color::altitude_bucket_tint_table(format),
+        vertex_scratch: Vec::new(),
+    }
+}
+
+/// An empty trail vertex buffer sized for `capacity` vertices — [`TrailLayer::upload_trails`]
+/// recreates this at a larger capacity if a frame's tessellated trails outgrow it.
+fn create_trail_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above trail vertex buffer"),
+        size: (capacity * size_of::<TrailVertexRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the trail pipeline: `TriangleList` over the per-frame ribbon vertex buffer
+/// (`trail::TrailVertexRaw` per-vertex), `SAMPLE_COUNT`-multisampled like every other pass, no
+/// depth/stencil — and, like the aircraft pass and unlike the opaque base-map passes,
+/// alpha-blended: the front-to-tail taper alpha needs it.
+fn create_trail_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above trail pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(TrailVertexRaw::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
     })
 }
 

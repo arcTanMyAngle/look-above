@@ -9,6 +9,7 @@ mod color;
 mod error;
 mod glyph_atlas;
 mod renderer;
+mod trail;
 
 pub use error::RenderError;
 pub use renderer::{FrameOutcome, Renderer, camera_view_proj};
