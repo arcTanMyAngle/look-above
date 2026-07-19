@@ -175,10 +175,58 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       failed**) and live-driven against the owner's real OpenSky credentials, confirming both
       the initial fetch and five real mid-run retargets with distinct bboxes. DECISION_LOG
       2.3b. Next: **2.4**, `core::sim`.)*
-- [ ] 2.4 `core::sim`: interpolation/dead-reckoning worker — rayon over the live aircraft
-      table at render cadence; destination-point advance from last fix (speed/track/vert
-      rate); ease-out correction blend (≤ 2 s) on new fix; stale fade (60 s + 5 s); writes
-      `RenderFeed` into the double buffer. Unit tests per docs/10 §1.
+- [x] 2.4a `core::sim` engine: the pure interpolation/dead-reckoning worker and the
+      `RenderFeed`/`AircraftInstance` shapes it produces — destination-point advance from last
+      fix (speed/track/vert rate), ease-out correction blend (≤ 2 s) on a new fix with the
+      no-backward-along-track invariant, teleport-snap exception (> 10 km), stale fade (60 s +
+      5 s), altitude buckets, `advance_all` as a rayon parallel iterator. No I/O, no app/render
+      wiring. Unit tests per docs/10 §1.
+      *(Split 2026-07-18, self-approved same-session, same shape as 2.1/2.1b, 2.2a/2.2b,
+      2.3a/2.3b: 2.4 bundles the pure `core` math with the double-buffer handoff and the
+      app-loop wiring that runs it at render cadence, but those are two different lanes — pure
+      geo/sim math in `core` here (nothing else can be written or tested against an engine that
+      doesn't exist yet), vs. the double buffer + feeding it from the live `SessionTable` +
+      swapping it for 2.4b. Nothing visible renders from the feed until 2.5's glyph pipeline
+      regardless, so 2.4b's verification is a logged instance count, not a picture.)*
+      *(2026-07-18: implemented — new `crates/core/src/sim.rs` (`Simulator`, `RenderFeed`,
+      `AircraftInstance`, `AltitudeBucket`). Two entry points at two rates: `ingest(states,
+      now_s)` on each poll cycle (a fix newer than the held one starts a correction blend;
+      older-or-equal is ignored, so a re-sent `SessionTable` fix does not restart a blend), and
+      `advance_all(now_s)` once per frame — a **rayon `par_iter_mut`** over the track table that
+      dead-reckons, blends, fades, and projects to Web Mercator, returning the flat feed. The
+      math is the high-fidelity-flight-visualization skill's, reusing `core::geo`
+      (`destination_point`/`haversine`/`initial_bearing`/`web_mercator_forward`) rather than
+      re-deriving: dead reckoning with Δt clamped `[0, DROP_AFTER_S]` (never rewinds on source-
+      clock skew, never flings on a stale fix — both tested on the private `dead_reckon`
+      directly since a *visible* aircraft never ages past ~65 s); ease-out (`1−(1−u)²`) geodesic-
+      slerp blend over a 2 s window, heading blended shortest-arc; the **no-backward-along-track
+      invariant** enforced by clamping any step whose along-track component (projected on the
+      fix's track) is negative back to the previous position (a fix behind the shown position
+      slows the aircraft to a stop, never reverses it); a **teleport exception** (> 10 km error)
+      that fades out, snaps at the midpoint while invisible, and fades back in over 300 ms
+      rather than sliding across the map; and the **stale fade** reusing `merge`'s
+      `STALE_AFTER_S`(60)/`DROP_AFTER_S`(90) — alpha ramps to 0 over a new `FADE_DURATION_S`(5),
+      the instance drops out of the feed at 65 s but the track lingers (invisible) until 90 s so
+      a reacquisition inside that window blends rather than pops. `AltitudeBucket` wires the
+      skill's six ramp stops (colors are M4); `AircraftInstance.category` is `Unknown` until
+      enrichment (M3/2.5). All state is `f64` and `Copy` (no render-specific narrowing in
+      `core`); `RenderFeed` carries `frame_ts` + address-sorted `aircraft` only — trails/labels
+      (docs/09's full shape) are appended by 2.6/2.7, not defined empty ahead of need. **Done
+      directly, not delegated** — the geo-math lane's inputs (`geo.rs`, `types.rs`, `merge.rs`,
+      `contracts.rs`) were already fully read this session, so a cold subagent would only
+      re-derive them. 20 new unit tests covering every docs/10 §1 line (advance-along-track,
+      vertical-rate integration across a band boundary both signs, blend convergence within the
+      window, the no-backward invariant, teleport, stale-fade timing + reacquisition, Δt clamp,
+      missing-field holds, on-ground non-extrapolation, bucket boundaries, and the ease-out/
+      heading/geodesic helpers). `cargo fmt --check`/`clippy --workspace --all-targets -D
+      warnings`/`test --workspace` all green — **394 passed, 5 ignored, 0 failed** (+19 over
+      2.3b's 375). No live run: pure library math with no runtime surface until 2.4b/2.5 wire a
+      consumer. DECISION_LOG 2.4a. Next: **2.4b**, the double buffer + app-loop wiring.)*
+- [ ] 2.4b `core::sim` wiring: double-buffer the `RenderFeed` (producer on workers, consumer on
+      the render thread, swapped at frame start per ADR-002); feed the simulator from the live
+      `SessionTable` both pipelines maintain; run `advance_all` at render cadence in window mode
+      and hand the buffer to the renderer. No glyphs yet (2.5) — verified by a logged instance
+      count that tracks the live feed. Depends on 2.4a.
 - [ ] 2.5 Aircraft glyphs: SDF atlas (6 categories per docs/01), instanced quad pipeline,
       per-instance rotation from heading, altitude-bucket tint attribute (final ramp colors
       may land in M4; buckets wired now).

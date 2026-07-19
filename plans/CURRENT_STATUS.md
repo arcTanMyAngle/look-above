@@ -6,12 +6,25 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b done. Plan:
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a done. Plan:
   [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.4** — `core::sim`, the interpolation/dead-reckoning worker:
-  rayon over the live aircraft table (the `SessionTable` both `--headless` and window mode now
-  maintain) at render cadence, destination-point advance, ease-out correction blend, stale
-  fade, writing `RenderFeed` into the double buffer.
+- **Next action:** **M2 item 2.4b** — the double-buffer handoff + app-loop wiring for 2.4a's
+  `core::sim`: double-buffer the `RenderFeed` (producer on workers, consumer on the render
+  thread, swapped at frame start per ADR-002), feed the `Simulator` from the live `SessionTable`
+  both pipelines maintain, run `advance_all` at render cadence in window mode, hand the buffer to
+  the renderer. No glyphs yet (2.5) — verified by a logged instance count.
+- **2.4a landed:** `core::sim` — the pure interpolation/dead-reckoning engine (`Simulator`,
+  `RenderFeed`, `AircraftInstance`, `AltitudeBucket`). `ingest(states, now_s)` per poll cycle
+  starts a correction blend on any newer fix (older/equal ignored, so a re-sent `SessionTable`
+  fix doesn't restart a blend); `advance_all(now_s)` per frame is a rayon `par_iter_mut` that
+  dead-reckons (Δt clamped `[0, 90 s]`), ease-out geodesic-slerp blends over 2 s with the
+  no-backward-along-track invariant, teleport-snaps a > 10 km error over 300 ms, and stale-fades
+  (60 s + 5 s, reusing `merge`'s `STALE_AFTER_S`/`DROP_AFTER_S`) — the track lingers invisibly to
+  90 s so reacquisition blends rather than pops. All math reuses `core::geo`; all state `f64`/
+  `Copy` (render narrows to `f32` at 2.5). Split 2.4 → 2.4a/2.4b first (same shape as every prior
+  M2 item). Done directly (geo-math lane's inputs already read this session; a cold subagent
+  would only re-derive). 20 new unit tests per docs/10 §1, no live run (no runtime consumer until
+  2.4b/2.5). fmt/clippy/test green — **394 passed, 5 ignored, 0 failed** (+19). DECISION_LOG 2.4a.
 - **2.3b landed:** viewport→bbox exposed to the poller, and window mode runs the live ingest
   pipeline for the first time. New `core::camera::Camera::viewport_bbox() -> BBox` (clamped so
   an off-world/overflowing viewport still yields a valid bbox — no antimeridian wrap yet, same
@@ -127,6 +140,40 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.4a: `core::sim`, the pure interpolation/dead-reckoning engine.
+  Split 2.4 into 2.4a/2.4b first (same shape as every prior M2 item): the checklist bundles the
+  pure `core` math with the double-buffer handoff and the app-loop wiring that runs it at render
+  cadence, but those are two lanes — nothing could be written or tested against an engine that
+  didn't exist yet, and nothing visible renders from the feed until 2.5's glyphs regardless. New
+  `crates/core/src/sim.rs`: `Simulator` (one `Track` per aircraft), `RenderFeed`,
+  `AircraftInstance`, `AltitudeBucket`. Two entry points at two rates — `ingest(states, now_s)`
+  per poll cycle (a fix newer than the held one starts a correction blend; older-or-equal is
+  ignored, so a re-sent `SessionTable` fix does not restart a blend) and `advance_all(now_s)`
+  once per frame, a **rayon `par_iter_mut`** over the track table that dead-reckons, blends,
+  fades, and projects to Web Mercator into the flat feed. The math is the
+  high-fidelity-flight-visualization skill's, reusing `core::geo` rather than re-deriving:
+  dead reckoning with Δt clamped `[0, DROP_AFTER_S]` (tested directly on the private
+  `dead_reckon`, since a *visible* aircraft never ages past ~65 s so the clamp is unreachable
+  through the fade-gated feed); an ease-out (`1−(1−u)²`) geodesic-slerp blend over a 2 s window
+  with heading blended shortest-arc; the **no-backward-along-track invariant** (a step whose
+  along-track component is negative clamps back to the previous position — a fix *behind* the
+  shown position slows the aircraft to a stop, never reverses it); a **teleport exception**
+  (> 10 km) that fades out, snaps at the midpoint while invisible, and fades back in over 300 ms;
+  and the **stale fade** reusing `merge`'s `STALE_AFTER_S`(60)/`DROP_AFTER_S`(90) with a new
+  `FADE_DURATION_S`(5) — the instance leaves the feed at 65 s but the track lingers (invisible)
+  to 90 s so a reacquisition blends rather than pops. `AltitudeBucket` wires the skill's six ramp
+  stops (colors are M4); `AircraftInstance.category` is `Unknown` until enrichment (M3/2.5). All
+  state is `f64`/`Copy` — the renderer narrows to `f32` at 2.5, so `core` carries no render
+  convention; `RenderFeed` is `frame_ts` + address-sorted `aircraft` only, trails/labels appended
+  by 2.6/2.7. **Done directly, not delegated** — the geo-math lane's inputs (`geo.rs`,
+  `types.rs`, `merge.rs`, `contracts.rs`) were already fully read this session, so a cold
+  subagent would only re-derive them (per the token skill's "delegate only when it forces reads
+  you'd otherwise skip"). 20 new unit tests, one per docs/10 §1 line plus the pure helpers;
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green
+  — **394 passed, 5 ignored, 0 failed** (+19 over 2.3b's 375). No live run: pure library math
+  with no runtime surface until 2.4b/2.5 wire a consumer (the verify skill's own "nothing to
+  drive" exception). DECISION_LOG 2.4a. Next: **2.4b**, the double buffer + app-loop wiring.
 
 - **2026-07-18** — M2 item 2.3a: the regional camera. Split 2.3 into 2.3a/2.3b first (same
   shape as 2.1/2.1b and 2.2a/2.2b): the checklist bundles the camera with exposing its viewport

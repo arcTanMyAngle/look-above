@@ -1576,3 +1576,97 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   (+6 over 2.3a's 369: 4 new `core::camera::viewport_bbox` tests, 2 new `ingest::poller`
   retarget tests). Next: **2.4**, `core::sim` — the interpolation/dead-reckoning worker that
   finally gives the `SessionTable` both pipelines now maintain somewhere to render from.
+
+## 2026-07-18 — M2 item 2.4a (`core::sim`: the pure interpolation/dead-reckoning engine)
+
+- **Split 2.4 into 2.4a/2.4b before writing any code**, the same shape as 2.1/2.1b, 2.2a/2.2b,
+  and 2.3a/2.3b. 2.4 as written bundles three things: the pure `core` interpolation math, the
+  double-buffer handoff between the worker producer and the render-thread consumer (ADR-002),
+  and the app-loop wiring that runs `advance_all` at render cadence and feeds it from the live
+  `SessionTable`. The first is a self-contained geo-math lane that nothing else can be written
+  or tested against until it exists; the latter two are app/render plumbing that depend on its
+  finished API. Nothing visible renders from the feed until 2.5's glyph pipeline regardless, so
+  2.4b's verification is a logged instance count, not a picture — no honesty cost to deferring
+  it. 2.4a is this item.
+- **`core::sim` is stateful (one `Track` per aircraft), not a bag of pure functions**, because
+  the correction blend needs memory: on a new fix it eases from *where the aircraft is currently
+  shown* to the new fix, so the last displayed position must persist frame-to-frame. The pure
+  helpers (`dead_reckon`, `ease_out`, `geodesic_lerp`, `blend_heading_deg`, `alpha_from_age`,
+  `AltitudeBucket::classify`) are factored out and unit-tested in isolation; `Track::advance`
+  composes them.
+- **Two entry points at two rates, not one.** `ingest(states, now_s)` is called per poll cycle
+  (5–60 s): a record whose `ts` is strictly newer than the held fix installs it and starts a
+  blend, older-or-equal is ignored. That last rule matters — the caller (2.4b) will feed the
+  whole `SessionTable` snapshot each cycle, which re-sends the same fix until a newer one
+  arrives, and a naïve "any ingest starts a blend" would restart the ease-out every frame and
+  freeze the aircraft in place. `advance_all(now_s)` is called per frame and does all the
+  motion. The split mirrors how fixes and frames actually arrive.
+- **`advance_all` is a rayon `par_iter_mut` over the track table** (ADR-002 / the skill's
+  performance recipe: "advance all aircraft in a rayon parallel iterator … results written into
+  the render buffer"). Each track advances independently — no shared mutable state — so the
+  parallelism is embarrassing and needs no synchronization. The feed is then sorted by ICAO24
+  address for determinism (reproducible tests and a stable draw order); a *real* draw-priority
+  order (altitude, then selection) is 2.5/2.8's concern and noted as such.
+- **All sim state is `f64` and `Copy`; the renderer narrows to `f32` at 2.5.** Keeping the
+  narrowing out of `core` means `core` carries no render-specific numeric convention (the same
+  reasoning 2.3a used to keep the `/ WEB_MERCATOR_EXTENT_M` normalization in `render`), and it
+  also sidesteps the `cast_possible_truncation` pedantic-clippy lints that an f64→f32 in `core`
+  would otherwise trip. The one unavoidable cast — `i64` seconds-since-epoch → `f64` — is a
+  single `const fn` with a scoped `#[allow(clippy::cast_precision_loss)]` and a comment noting
+  epoch seconds (~1.7×10⁹) and the tens-of-seconds horizons are all exact in f64's 2⁵³ integer
+  range. Same discipline `frame_stats::percentile` used (integer arithmetic to dodge float-cast
+  lints), applied the other way.
+- **The dead-reckoning Δt clamp `[0, DROP_AFTER_S]` is defensive and, for a *visible* aircraft,
+  unreachable — so it is tested on the private `dead_reckon` directly, not through the feed.** A
+  track fully fades out at `STALE_AFTER_S + FADE_DURATION_S` = 65 s, so no drawn aircraft ever
+  has an age near the 90 s clamp; the clamp only guards a wild clock or a source-clock skew
+  (negative Δt must hold position, not rewind the aircraft). Testing it through `advance_all`
+  would be impossible (the aircraft is gone from the feed by then), which is itself the tell that
+  it belongs in a direct unit test.
+- **The no-backward-along-track invariant is enforced by clamping, not velocity-blending.** The
+  skill says a new fix behind the shown position must "slow the shown aircraft … instead of
+  reversing." Implemented as: project each frame's candidate displacement onto the fix's track
+  bearing; if the along-track component is negative, keep the previous position. This is "slow to
+  a full stop until the (still-advancing) target catches up," a faithful and directly testable
+  reading of the rule (the test asserts the along-track coordinate is monotonic non-decreasing
+  across frames). A smoother speed-blend is a candidate refinement, noted, not needed for
+  correctness.
+- **Teleport (> 10 km error) snaps at the fade midpoint, not at the window start.** The glyph
+  alpha dips symmetrically (1 → 0 → 1) over 300 ms and the position jumps only once alpha has
+  reached 0, so the eye never sees either a slide across the map or a pop — the quality bar's
+  "no visible teleporting." Below the threshold it is an ordinary ease-out slide.
+- **Stale-fade constants are reused from `core::merge`, not redefined.** `STALE_AFTER_S`(60) and
+  `DROP_AFTER_S`(90) already exist there (item 1.9) precisely as the render layer's "begin fade"
+  and "stop extrapolating" points; `sim` imports them and adds only `FADE_DURATION_S`(5). An
+  instance leaves the feed at 65 s (alpha 0) but its `Track` is retained until 90 s, so a
+  reacquisition inside that window blends from the last shown position rather than popping back
+  in as a fresh sighting — and it keeps `sim`'s own drop horizon aligned with the `SessionTable`
+  the app feeds it from, avoiding a re-create-then-fade flicker at the seam.
+- **`RenderFeed` is introduced incrementally (aircraft first).** docs/09's full shape carries
+  `trails` and `labels` too, but those types' shapes belong to 2.6/2.7; defining them empty now
+  would either invent premature types or leave dead `Vec`s. `RenderFeed` is `frame_ts` +
+  address-sorted `aircraft` for now, with a doc note that the other two fields are appended by
+  their own items — the same append-only, land-it-when-needed approach the `store` migrations and
+  the `SourceError`/`AircraftCategory` taxonomies took. This is a seam type (docs/09), so it is
+  logged here; the change is purely additive to a not-yet-implemented contract.
+- **`AircraftInstance.category` is `AircraftCategory::Unknown` for now**, because `StateVector`
+  carries no category — it arrives from adsbdb/registry enrichment in M3. The field is present so
+  the instance shape is complete for the 2.5 glyph pipeline; wiring a real category is M3/2.5.
+- **Done directly, not delegated to the geo-math-agent, despite the lane matching.** CLAUDE.md
+  names geo-math-agent for projection/interpolation, and the token skill says delegate a
+  one-lane subtask *when it would force reading files otherwise not needed*. Here the opposite
+  held: `geo.rs`, `types.rs`, `merge.rs`, and `contracts.rs` were all read in full this session
+  while scoping 2.4, so a cold subagent would only re-derive context already in hand and add a
+  verification round-trip. Implementing it directly was the cheaper, tighter path for a
+  formula-heavy module where the skill's math had to be matched exactly.
+- **Verified by the unit suite, no live run.** 20 new tests, at least one per docs/10 §1 line:
+  advance-along-track at ground speed, vertical-rate integration across a band boundary in both
+  signs, blend convergence within the window (and no jump at u=0), the no-backward invariant, the
+  teleport snap + alpha dip, stale-fade timing + reacquisition + drop, the Δt clamp and no-rewind,
+  missing-speed/missing-track holds, on-ground non-extrapolation, altitude-bucket boundaries, and
+  the ease-out/heading/geodesic helpers. `cargo fmt --check`/`clippy --workspace --all-targets -D
+  warnings`/`test --workspace` all green — **394 passed, 5 ignored, 0 failed** (+19 over 2.3b's
+  375, all in `core::sim`). No app behavior changed and nothing renders the feed yet, so there is
+  no runtime surface to drive (the verify skill's explicit "nothing to observe" exception); the
+  feed becomes live and visually checkable at 2.4b/2.5. Next: **2.4b**, the double buffer +
+  app-loop wiring.
