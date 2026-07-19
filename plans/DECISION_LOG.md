@@ -1670,3 +1670,75 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   no runtime surface to drive (the verify skill's explicit "nothing to observe" exception); the
   feed becomes live and visually checkable at 2.4b/2.5. Next: **2.4b**, the double buffer +
   app-loop wiring.
+
+## 2026-07-18 — M2 item 2.4b (`core::sim` wiring: double buffer + simulation worker thread)
+
+- **The producer is a dedicated worker thread, not the render loop calling `advance_all`.**
+  ADR-002 and the high-fidelity-flight-visualization skill are explicit: "results written into
+  the inactive render buffer, swapped atomically at frame start; the render thread never computes
+  any of the above." `advance_all` *is* interpolation/projection, so it cannot run on the render
+  thread even though its internals are rayon-parallel — orchestrating it there would still block
+  the frame on production. New `app::simulation` owns a `std::thread` that drains poll batches,
+  runs `core::sim` at ~60 Hz (a `FRAME_BUDGET` of 16,667 µs, sleeping the remainder so a quiet
+  sky does not spin a core), and publishes each feed. The render thread only swaps and draws.
+  This also moved the `SessionTable`/`Writer`/batch-receiver *off* the render thread — 2.3b had
+  them draining inside `draw`, which was acceptable only because nothing consumed the merged
+  table yet; 2.4b is where that would have started blocking frames, so it moves now.
+- **The double buffer is a latest-wins SPSC mailbox, not a queue** (`app::double_buffer`). A
+  feed the consumer never reads has no value once a newer one exists, so `Producer::publish`
+  overwrites any unconsumed feed rather than buffering it, and `Consumer::take_latest` returns
+  `Option<T>` — `None` means "nothing new since last frame", and the render thread keeps showing
+  the front buffer it already holds (`App::current_feed`) so the picture never blanks between
+  publishes. Those two held buffers (the consumer's current one + the one in the slot) are the
+  two of the double buffer. Implemented over `Arc<Mutex<Option<T>>>`; the render-thread lock is
+  one uncontended `take()` per frame (microseconds), well inside ADR-002's frame budget, so a
+  lock-free crate (triple-buffer/arc-swap) would be a dependency earned by nothing. A poisoned
+  lock is recovered (`PoisonError::into_inner`), not unwrapped — the slot holds only plain data,
+  so at worst the other side sees a stale value, never a torn one, and that beats taking the
+  render thread down with it (also keeps the no-`unwrap` rule).
+- **The simulator is fed the whole `SessionTable` each poll cycle, not just the new batch.**
+  `Simulator::ingest` ignores a fix not newer than the one it holds (2.4a's older-or-equal
+  guard), so re-installing the full deduped picture every cycle is safe: only the aircraft that
+  cycle actually refreshed start a correction blend, and a re-sent identical fix is a no-op.
+  Feeding the merged table (not the raw batch) is what carries the dedup + sticky-anonymity the
+  merge already applied. Re-sync only fires on a cycle that delivered a batch; between cycles the
+  worker just `advance_all`s (dead reckoning).
+- **Window mode evicts the table at `DROP_AFTER_S` before each ingest; headless does not.**
+  Left unbounded, the table would keep frozen entries for aircraft that left the region forever,
+  and re-feeding one the simulator had already dropped (past 90 s) would re-create a track that
+  is faded-out and immediately dropped again — churn. Evicting at the simulator's own drop
+  horizon keeps the fed picture bounded and the two horizons aligned. This lives in the sim
+  worker, deliberately *not* in the shared `pipeline::record_cycle`: headless's per-cycle
+  `stale`/`tracked` readout (items 1.12/1.13) is documented evidence, and folding eviction into
+  the shared path would zero its stale count and change that readout's meaning.
+- **`RenderFeed` is *handed to the render thread*, which logs its instance count — the buffer is
+  not yet plumbed into `Renderer::render`.** The item says "hand the buffer to the renderer";
+  the render thread (the thread that owns and drives the `Renderer`) receives the swapped feed
+  and logs `instances = current_feed.aircraft.len()`. Passing `&RenderFeed` into
+  `Renderer::render` was deferred to 2.5, when the renderer has a glyph pipeline to upload it
+  into — adding the parameter now would be a dead API on the `render` crate, the same way the
+  `instances=0` reporting path was wired ahead of the thing it counts (2.1). The logged count is
+  2.4b's verification and it is exact: live, the first whole-world OpenSky cycle showed
+  `tracked=6468 stale=776` and the very next frame-stats line read `instances=5692` — i.e.
+  `tracked − stale`, the sim's own fade/stale gating, confirming the feed reaching the render
+  thread tracks the live table rather than a stale or fabricated number.
+- **Clean shutdown joins the worker before the store is torn down.** The worker owns the only
+  window-mode `Writer` clone, so `App::exiting` signals an `AtomicBool` and joins the thread —
+  flushing the last cycle's DB writes — before dropping the renderer/window. Signal-then-join,
+  because the loop checks the flag once per iteration; live, `close requested → window closed`
+  took 58 ms (well under one poll cycle). No graceful protocol beyond that: winit delivers the
+  close and the join happens synchronously in the exit callback.
+- **Verified live against the owner's real `credentials.json`** (2× short window-mode runs,
+  2026-07-18, Intel Arc / DX12, 1920×1200). Initial whole-world region → first OpenSky cycle 4
+  credits, `instances` stepped 0 → 5692 and thereafter tracked each cycle's updates/drops
+  (~5650–5710); render held a steady ~180 fps / 5.5 ms mean throughout, confirming the double
+  buffer decouples the render thread from production (the sim runs on its own thread, the frame
+  loop never blocks on it). Second run drove a real `WM_CLOSE` (via the process
+  `MainWindowHandle` — `FindWindow` by title returned 0 in the first attempt, a
+  verification-tooling quirk on this machine like 2.2b's DPI one, not an app fault) and observed
+  the clean `close requested → window closed` join. ~24 credits total across both runs
+  (4/cycle × ~6 cycles), well under the 3,200 cap. `cargo fmt --check`/`clippy --workspace
+  --all-targets -D warnings`/`test --workspace` all green — **402 passed, 5 ignored, 0 failed**
+  (+8 over 2.4a's 394: 4 `double_buffer`, 4 `simulation`). Scratch `look_above.db` deleted after,
+  per 1.12/1.13's convention. Next: **2.5**, the aircraft glyph pipeline (SDF atlas, instanced
+  quads) — the first item to actually draw the feed 2.4b now delivers.

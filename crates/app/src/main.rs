@@ -5,10 +5,12 @@
 //! and no display attached.
 
 mod config;
+mod double_buffer;
 mod frame_stats;
 mod headless;
 mod logging;
 mod pipeline;
+mod simulation;
 mod window;
 
 use anyhow::{Result, bail};

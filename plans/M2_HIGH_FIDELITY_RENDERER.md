@@ -222,11 +222,32 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       warnings`/`test --workspace` all green — **394 passed, 5 ignored, 0 failed** (+19 over
       2.3b's 375). No live run: pure library math with no runtime surface until 2.4b/2.5 wire a
       consumer. DECISION_LOG 2.4a. Next: **2.4b**, the double buffer + app-loop wiring.)*
-- [ ] 2.4b `core::sim` wiring: double-buffer the `RenderFeed` (producer on workers, consumer on
+- [x] 2.4b `core::sim` wiring: double-buffer the `RenderFeed` (producer on workers, consumer on
       the render thread, swapped at frame start per ADR-002); feed the simulator from the live
       `SessionTable` both pipelines maintain; run `advance_all` at render cadence in window mode
       and hand the buffer to the renderer. No glyphs yet (2.5) — verified by a logged instance
       count that tracks the live feed. Depends on 2.4a.
+      *(2026-07-18: implemented — new `app::simulation` (a dedicated worker thread) and
+      `app::double_buffer` (a latest-wins SPSC mailbox, `Producer`/`Consumer` over
+      `Arc<Mutex<Option<RenderFeed>>>`). The merge/interpolate/persist side moved off the render
+      thread entirely (ADR-002): the worker owns the `SessionTable`/`Writer`/batch-receiver,
+      drains poll cycles through the shared `pipeline::record_cycle`, feeds the whole deduped
+      table into `Simulator::ingest` (older-or-equal fixes are no-ops, so re-feeding is safe and
+      only genuinely-refreshed aircraft start a blend), evicts at `DROP_AFTER_S` to keep the fed
+      picture bounded and aligned with the sim's own drop horizon, runs `advance_all` at ~60 Hz,
+      and publishes each feed. The render thread (`app::window`) now only swaps the latest feed
+      at frame start and draws — nothing computes the feed there. The swapped feed's
+      `aircraft.len()` replaces the pinned `instances=0` in the frame-stats log; plumbing the
+      feed into `Renderer::render` waits for 2.5's glyph pipeline (a dead param on `render`
+      otherwise). Clean shutdown signals + joins the worker before the store is torn down.
+      **Live-verified** against the owner's real `credentials.json` (2× window-mode runs, Intel
+      Arc/DX12): first whole-world OpenSky cycle `tracked=6468 stale=776` → next frame
+      `instances=5692` (= `tracked − stale`, the sim's fade/stale gating — the count tracks the
+      live feed exactly), steady ~180 fps / 5.5 ms mean (double buffer decouples render from
+      production), and a clean `WM_CLOSE` join (`close requested → window closed` in 58 ms).
+      `fmt`/`clippy --all-targets -D warnings`/`test --workspace` green — **402 passed, 5
+      ignored, 0 failed** (+8: 4 `double_buffer`, 4 `simulation`). DECISION_LOG 2.4b. Next:
+      **2.5**, aircraft glyphs.)*
 - [ ] 2.5 Aircraft glyphs: SDF atlas (6 categories per docs/01), instanced quad pipeline,
       per-instance rotation from heading, altitude-bucket tint attribute (final ramp colors
       may land in M4; buckets wired now).

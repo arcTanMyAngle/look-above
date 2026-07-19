@@ -6,13 +6,27 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a done. Plan:
-  [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.4b** — the double-buffer handoff + app-loop wiring for 2.4a's
-  `core::sim`: double-buffer the `RenderFeed` (producer on workers, consumer on the render
-  thread, swapped at frame start per ADR-002), feed the `Simulator` from the live `SessionTable`
-  both pipelines maintain, run `advance_all` at render cadence in window mode, hand the buffer to
-  the renderer. No glyphs yet (2.5) — verified by a logged instance count.
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b done.
+  Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.5** — the aircraft glyph pipeline: SDF atlas (6 categories per
+  docs/01), instanced quad pipeline, per-instance rotation from heading, altitude-bucket tint.
+  This is the first item to actually *draw* the `RenderFeed` 2.4b now delivers to the render
+  thread (and the point at which `&RenderFeed` finally gets plumbed into `Renderer::render`).
+- **2.4b landed:** the `core::sim` wiring. New `app::simulation` (a dedicated worker thread) +
+  `app::double_buffer` (a latest-wins SPSC mailbox). Per ADR-002 the whole merge/interpolate/
+  persist side moved *off* the render thread onto the worker: it owns the `SessionTable`/
+  `Writer`/batch-receiver, drains poll cycles (shared `pipeline::record_cycle`), feeds the deduped
+  table into `Simulator::ingest` (older-or-equal = no-op, so re-feeding is safe), evicts at
+  `DROP_AFTER_S` to bound the fed picture, runs `advance_all` at ~60 Hz, and publishes each feed;
+  the render thread now only swaps the latest feed at frame start and draws. The swapped feed's
+  `aircraft.len()` replaces the pinned `instances=0` (plumbing `&RenderFeed` into
+  `Renderer::render` waits for 2.5's glyphs — a dead param otherwise). Clean shutdown signals +
+  joins the worker before the store is torn down. **Live-verified** against the owner's real
+  `credentials.json` (2× window runs, Intel Arc/DX12): first whole-world OpenSky cycle
+  `tracked=6468 stale=776` → next frame `instances=5692` (= `tracked − stale`, the count tracks
+  the live feed exactly), steady ~180 fps / 5.5 ms mean (double buffer decouples render from
+  production), clean `WM_CLOSE` join (`close requested → window closed` in 58 ms). fmt/clippy/test
+  green — **402 passed, 5 ignored, 0 failed** (+8). DECISION_LOG 2.4b.
 - **2.4a landed:** `core::sim` — the pure interpolation/dead-reckoning engine (`Simulator`,
   `RenderFeed`, `AircraftInstance`, `AltitudeBucket`). `ingest(states, now_s)` per poll cycle
   starts a correction blend on any newer fix (older/equal ignored, so a re-sent `SessionTable`
@@ -101,7 +115,10 @@
 - **Blockers:** the owner must rename the repo `look_above` → `look-above`, then push (no SSH
   key on this machine) — CI has never run; M0's one unmet gate line.
   [NEXT_ACTIONS.md](NEXT_ACTIONS.md) #1.
-- **Credit spend to date: ~300+ of 4,000/day** (203 carried from M1's 1.4/1.12/1.13 above, plus
+- **Credit spend to date: ~325+ of 4,000/day** (the ~300+ below, plus 2.4b's two live window-mode
+  verification runs today spending ~24 more — 4 credits/cycle × ~6 whole-world OpenSky cycles,
+  2026-07-18, against the owner's real credentials; still far under the 3,200/80% cap). Detail:
+  203 carried from M1's 1.4/1.12/1.13 above, plus
   2.3b's two live-verification runs today: the renderer-agent's own window-mode drive spent at
   least 12 (its report showed 3 cycles before the snippet it quoted cut off, not necessarily its
   final total) and this session's independent re-verification spent 84 more — both against the
@@ -140,6 +157,41 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.4b: the `core::sim` wiring (double buffer + simulation worker).
+  Two new `app` modules: `double_buffer` (a latest-wins single-producer/single-consumer mailbox
+  — `Producer::publish` overwrites any unconsumed feed, `Consumer::take_latest` returns `None`
+  when nothing is new so the render thread keeps its held front buffer and never blanks) and
+  `simulation` (a dedicated `std::thread` running `core::sim` at ~60 Hz). Per ADR-002 and the
+  viz skill ("the render thread never computes any of the above"), the whole merge/interpolate/
+  persist path moved *off* the render thread: 2.3b had it draining batches inside `draw` (fine
+  while nothing consumed the merged table), and 2.4b is where that would start blocking frames,
+  so the worker now owns the `SessionTable`/`Writer`/batch-receiver, drains poll cycles through
+  the shared `pipeline::record_cycle`, feeds the whole deduped table into `Simulator::ingest`
+  (2.4a's older-or-equal guard makes re-feeding the full picture every cycle a safe no-op except
+  for genuinely-refreshed aircraft), evicts stale entries at `DROP_AFTER_S` (window-mode only —
+  *not* folded into shared `record_cycle`, which would zero headless's documented stale count),
+  runs `advance_all`, and publishes each feed. The render thread only swaps at frame start and
+  draws. The swapped feed's `aircraft.len()` replaces the pinned `instances=0` in the frame-stats
+  log; `&RenderFeed` is *not* yet plumbed into `Renderer::render` (that waits for 2.5's glyph
+  pipeline — a dead param on `render` otherwise, the same way the `instances=0` reporting path
+  was wired ahead of what it counts at 2.1). Clean shutdown signals an `AtomicBool` and joins the
+  worker before the store is torn down (it owns the only window-mode `Writer` clone). Done
+  directly, not delegated — the render/ingest/app wiring lanes were all already read this session.
+  8 new unit tests (4 double-buffer semantics, 4 the sim wiring: instance count tracks the table,
+  eviction removes dropped-out aircraft, re-sync doesn't restart a blend, the two-clock helper
+  agrees). **Live-verified** against the owner's real `credentials.json` (2× window runs, Intel
+  Arc/DX12, 1920×1200): initial whole-world region → first OpenSky cycle 4 credits,
+  `tracked=6468 stale=776` → next frame `instances=5692` (exactly `tracked − stale`, the sim's
+  fade/stale gating — the logged count tracks the live feed, not a stale or fabricated number),
+  ~180 fps / 5.5 ms mean held steady throughout (the double buffer decouples the render thread
+  from the sim thread), and a real `WM_CLOSE` (sent via the process `MainWindowHandle` —
+  `FindWindow` by title returned 0 first, a machine-specific scripting quirk like 2.2b's DPI one,
+  not an app fault) drove the clean `close requested → window closed` join in 58 ms. ~24 credits
+  total across both runs, well under the cap; scratch `look_above.db` deleted after per 1.12/1.13.
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green
+  — **402 passed, 5 ignored, 0 failed** (+8 over 2.4a's 394). DECISION_LOG 2.4b. Next: **2.5**,
+  the aircraft glyph pipeline — the first item to actually draw the feed.
 
 - **2026-07-18** — M2 item 2.4a: `core::sim`, the pure interpolation/dead-reckoning engine.
   Split 2.4 into 2.4a/2.4b first (same shape as every prior M2 item): the checklist bundles the

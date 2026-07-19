@@ -4,20 +4,30 @@
 //! [`SessionTable`]/[`Writer`] pieces [`crate::headless`] runs), sourced from the camera's own
 //! viewport instead of a fixed bbox and retargeted live as the user pans/zooms — see
 //! [`App::start`] for construction and [`App::maybe_retarget`] for the retarget policy.
+//!
+//! From M2 item 2.4b the merge/interpolation side of that pipeline moves off the render thread
+//! entirely, onto [`crate::simulation`]'s worker: ADR-002 keeps *all* simulation, interpolation,
+//! and projection on workers, leaving the render thread to only swap the latest
+//! [`RenderFeed`](look_above_core::sim::RenderFeed) (through [`crate::double_buffer`]) and draw.
+//! Nothing visible is drawn from the feed until 2.5's glyph pipeline; for now the swapped feed's
+//! instance count is logged (F3 frame stats), which is 2.4b's verification.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::unbounded;
 use look_above_core::camera::Camera;
 use look_above_core::contracts::RegionQuery;
 use look_above_core::merge::SessionTable;
+use look_above_core::sim::{RenderFeed, Simulator};
 use look_above_core::types::SourceId;
 use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::opensky::OpenSkyAuth;
-use look_above_ingest::poller::{PRIMARY, PollBatch, Poller, SystemWallClock, WallClock};
+use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
 use look_above_render::{FrameOutcome, Renderer, camera_view_proj};
 use look_above_store::Writer;
 use tokio::sync::watch;
@@ -29,7 +39,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::config::Config;
+use crate::double_buffer::{self, Consumer};
 use crate::frame_stats::FrameStats;
+use crate::simulation;
 
 const WINDOW_TITLE: &str = "Look Above";
 
@@ -102,21 +114,11 @@ struct App {
     /// A handle onto the runtime `window::run` built and is keeping alive, so the poller can be
     /// spawned from inside a winit callback (`App::start`), which is not itself async.
     runtime_handle: tokio::runtime::Handle,
-    /// Finished poll cycles, drained non-blockingly once per frame in [`App::draw`]. `None`
-    /// until [`App::start`] has built the poller.
-    batch_rx: Option<Receiver<PollBatch>>,
     /// The live handle used to retarget the running poller's region (see
     /// [`App::maybe_retarget`]). Must stay alive for as long as the poller should remain
     /// retargetable — every `Sender` dropping falls the poller back to a fixed cadence forever
     /// (see `ingest::poller`'s module doc).
     retarget_tx: Option<watch::Sender<RegionQuery>>,
-    /// A handle to the same store the headless pipeline writes to — cheap to hold (a channel
-    /// handle, not a connection). `None` until [`App::start`] has opened it.
-    writer: Option<Writer>,
-    /// The session's live, deduplicated picture, merged from every batch the poller delivers.
-    /// Nothing renders from this yet (M2 items 2.4/2.5); it exists so the ledger-persisting
-    /// merge path this item wires through has somewhere real to merge into.
-    table: SessionTable,
     /// When the camera's state (`center_m`/`meters_per_pixel`) was last observed to actually
     /// change frame-to-frame. `None` until the camera has moved for the first time — see
     /// [`App::maybe_retarget`].
@@ -124,6 +126,20 @@ struct App {
     /// The region most recently sent to the poller (or, before the camera has ever moved, the
     /// initial region it was constructed with) — so a settled camera is not resent every frame.
     last_sent_region: RegionQuery,
+
+    /// The render-thread end of the double buffer the simulation worker publishes into. Swapped
+    /// once at the start of every frame — nothing here computes the feed (ADR-002). `None` until
+    /// [`App::start`] has spawned the worker.
+    feed_consumer: Option<Consumer<RenderFeed>>,
+    /// The most recent feed taken from `feed_consumer` — the "front" buffer, kept between frames
+    /// so a frame in which the worker has published nothing new still draws the last picture
+    /// instead of blanking. Its `aircraft.len()` is the instance count 2.4b logs (2.5 draws it).
+    current_feed: RenderFeed,
+    /// Set on exit to stop the simulation worker; it checks this once per iteration.
+    sim_shutdown: Option<Arc<AtomicBool>>,
+    /// The simulation worker's join handle, so [`App::exiting`] waits for its final DB writes
+    /// before the store is torn down.
+    sim_handle: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -142,12 +158,13 @@ impl App {
             error: None,
             config,
             runtime_handle,
-            batch_rx: None,
             retarget_tx: None,
-            writer: None,
-            table: SessionTable::new(),
             last_camera_change_instant: None,
             last_sent_region: RegionQuery::default(),
+            feed_consumer: None,
+            current_feed: RenderFeed::default(),
+            sim_shutdown: None,
+            sim_handle: None,
         }
     }
 
@@ -245,13 +262,30 @@ impl App {
         );
         self.runtime_handle.spawn(poller.run());
 
+        // Hand the merge/interpolate/persist side to a worker thread (ADR-002): it owns the
+        // `SessionTable`, the `Writer`, and the batch receiver, drains poll cycles, runs
+        // `core::sim` at render cadence, and publishes each frame's feed into the double buffer
+        // this thread swaps at frame start.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (producer, consumer) = double_buffer::channel();
+        let sim_handle = simulation::spawn(
+            Simulator::new(),
+            SessionTable::new(),
+            writer,
+            receiver,
+            producer,
+            Arc::clone(&shutdown),
+        )
+        .context("spawn the simulation worker")?;
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.camera = Some(camera);
-        self.batch_rx = Some(receiver);
         self.retarget_tx = Some(retarget_tx);
-        self.writer = Some(writer);
         self.last_sent_region = initial_query;
+        self.feed_consumer = Some(consumer);
+        self.sim_shutdown = Some(shutdown);
+        self.sim_handle = Some(sim_handle);
         Ok(())
     }
 
@@ -281,11 +315,15 @@ impl App {
             &mut self.last_sent_region,
             self.retarget_tx.as_ref(),
         );
-        Self::drain_batches(
-            self.batch_rx.as_ref(),
-            self.writer.as_ref(),
-            &mut self.table,
-        );
+
+        // Swap in the latest feed the simulation worker has published (ADR-002's atomic
+        // frame-start swap). `None` means nothing new since last frame, so the held feed stays —
+        // the picture never blanks between publishes.
+        if let Some(consumer) = self.feed_consumer.as_ref()
+            && let Some(feed) = consumer.take_latest()
+        {
+            self.current_feed = feed;
+        }
 
         match renderer.render() {
             Ok(FrameOutcome::Presented) => {
@@ -298,9 +336,10 @@ impl App {
                             p50_ms = format!("{:.2}", summary.p50.as_secs_f64() * 1e3),
                             p95_ms = format!("{:.2}", summary.p95.as_secs_f64() * 1e3),
                             worst_ms = format!("{:.2}", summary.worst.as_secs_f64() * 1e3),
-                            // Pinned to 0 until M2 2.5 gives the render loop aircraft glyph
-                            // instances to count; this only wires the reporting path.
-                            instances = 0,
+                            // The live feed's drawable count (2.4b). Still nothing is *drawn*
+                            // from it — the glyph pipeline is 2.5 — so this logged number is the
+                            // item's verification that the feed reaches the render thread.
+                            instances = self.current_feed.aircraft.len(),
                             "frame stats"
                         );
                     } else {
@@ -309,6 +348,7 @@ impl App {
                             fps = format!("{:.1}", summary.fps()),
                             mean_ms = format!("{:.2}", summary.mean.as_secs_f64() * 1e3),
                             worst_ms = format!("{:.2}", summary.worst.as_secs_f64() * 1e3),
+                            instances = self.current_feed.aircraft.len(),
                             "frame stats"
                         );
                     }
@@ -323,35 +363,14 @@ impl App {
         }
     }
 
-    /// Merges any batches the poller has produced since the last frame into `table`, logging
-    /// and persisting each one through [`crate::pipeline::record_cycle`] — the same path
-    /// `headless::run` drives its own receiver loop through.
-    ///
-    /// A free-standing function, not a `&mut self` method: [`App::draw`] calls this while
-    /// `renderer`/`camera` (borrowed from other `self` fields) are still in scope, and a
-    /// `&mut self` method call there would conflict with those borrows even though the fields
-    /// touched here are disjoint from them.
-    fn drain_batches(
-        batch_rx: Option<&Receiver<PollBatch>>,
-        writer: Option<&Writer>,
-        table: &mut SessionTable,
-    ) {
-        let (Some(batch_rx), Some(writer)) = (batch_rx, writer) else {
-            return;
-        };
-        for batch in batch_rx.try_iter() {
-            crate::pipeline::record_cycle(writer, table, &batch);
-        }
-    }
-
     /// Retargets the running poller once the camera has settled on a viewport whose bbox
     /// differs from whichever region was last sent — see [`CAMERA_SETTLE_DEBOUNCE`].
     ///
     /// `changed` is whether the camera's state (`center_m`/`meters_per_pixel`) actually moved
     /// this frame; only a real change (re-)arms `last_change`, so the debounce clock never
     /// starts — and nothing is ever sent — before the user has interacted with the camera for
-    /// the first time. A free-standing function for the same borrow-shape reason as
-    /// [`App::drain_batches`].
+    /// the first time. A free-standing function so it can be called from [`App::draw`] while
+    /// `renderer`/`camera` (borrowed from other `self` fields) are still in scope.
     fn maybe_retarget(
         camera: &Camera,
         now: Instant,
@@ -506,6 +525,18 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Stop the simulation worker and wait for it to finish before the store is torn down:
+        // it owns the only `Writer` clone in window mode, so joining it flushes the last cycle's
+        // DB writes rather than racing them against process teardown. Signal-then-join — the
+        // worker checks the flag once per iteration, so this returns within ~one frame.
+        if let Some(shutdown) = &self.sim_shutdown {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.sim_handle.take() {
+            // A panic inside the worker has already unwound and logged on its own thread;
+            // nothing here can do better than shut the window down cleanly regardless.
+            let _ = handle.join();
+        }
         // Drop the renderer before the window: the surface borrows it.
         self.renderer = None;
         self.window = None;
