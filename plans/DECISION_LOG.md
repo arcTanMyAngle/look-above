@@ -2095,3 +2095,61 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   log-capturing harness, so the per-cycle credit lines weren't recorded; flagged in
   CURRENT_STATUS rather than assumed zero. Next: **2.1b** (F3 stats overlay text, unblocked now
   that a text atlas exists) or **2.8** (selection) — owner's call, neither started.
+
+## 2026-07-19 — M2 item 2.1b (F3 frame-stats overlay: on-screen HUD text)
+
+- **Owner picked 2.1b over 2.8** to close out (both were unblocked at 2.7b's landing); the F3
+  debug HUD is docs/01's last unimplemented draw-order step ("map base → map lines → trails →
+  aircraft glyphs → labels → **UI overlay**"), closing the gap 2.1's own split first opened.
+- **Reuse, not a second text renderer.** `wgpu::RenderPipeline`/`Buffer`/`BindGroup` are cheap
+  `Clone` (`Arc`-backed) handles, so the new `StatsOverlayLayer` in `renderer.rs` is built by
+  cloning `LabelLayer`'s already-built text pipeline, atlas bind group, shared text-quad mesh, and
+  screen-params bind group straight out of it — verified directly in the diff that no second SDF
+  atlas texture or pipeline is created anywhere. Only the overlay's own instance buffer/capacity/
+  scratch `Vec` and text color are new GPU state, the same "layer owns the buffer, a pure module
+  owns the content" split every other pass (`aircraft.rs`/`trail.rs`/`label.rs`) already uses.
+- **Character-set scoping call, made before delegating, not re-derived by the agent**:
+  `label_atlas::CHARSET` (39 characters: `A`-`Z`, `0`-`9`, space, `k`, `t`, from 2.7b) is
+  deliberately *not* grown for this task — extending a shared stroke-font atlas for a debug-only
+  overlay was judged out of proportion to the item. `render::stats_overlay::format_lines` stays
+  entirely ALL CAPS with whole numbers (`FPS 47`, `P50 9MS  P95 17MS`, `WORST 60MS`, `N 9102`),
+  no `.`/`=`/`_`/lowercase — a precision loss (whole ms, not `12.34`) accepted for a corner HUD,
+  not the `tracing::info!` log line the F3 toggle already writes (which keeps its own 2-decimal
+  format unchanged). A dedicated unit test iterates every character of every generated line
+  through `label_atlas::char_index` and asserts it resolves, rather than relying on
+  `pack_overlay_instances`'s own defensive skip-unsupported-characters fallback to hide a mistake
+  silently.
+- **`Renderer::render` gained a fourth parameter** (`stats: Option<StatsOverlay>`, trailing after
+  `camera`) — the third signature change this milestone (2.4b added the feed, 2.7b added the
+  camera). `StatsOverlay` is plain `f64` data (`fps`/`p50_ms`/`p95_ms`/`worst_ms`) rather than
+  `app::frame_stats::FrameSummary` itself, since `render` must not depend on `app` (the
+  workspace's one-way dependency direction, checked at M0). `None` (F3 off) builds/uploads
+  nothing for the pass at all, not even an empty buffer write — toggling the HUD off costs
+  nothing per frame beyond the existing `instance_count == 0` early-return every other pass
+  already has.
+- **`app::window`'s `FrameStats::record` only fires once a second**, but the HUD needs to draw
+  every frame — added `App::last_stats_summary: Option<FrameSummary>`, persisted unconditionally
+  (regardless of `stats_visible`) whenever a report lands, so toggling F3 on shows current numbers
+  immediately rather than waiting up to a second for the first report. The HUD's numbers therefore
+  lag the true instantaneous frame time by at most one reporting interval — an accepted,
+  documented tradeoff, not an oversight (the same interval the existing log line already reports
+  at).
+- Delegated to the renderer-agent (GPU pipeline/atlas wiring is its stated remit), briefed with
+  every design call already made (character-set constraint, reuse-don't-duplicate, the exact new
+  types/params/fields and where they live) so the agent implemented rather than re-decided them —
+  same shape as 2.5/2.6b/2.7b's delegations. **Independently re-verified rather than trusted**:
+  every new/changed file read in full (`stats_overlay.rs`, and the diffs to `renderer.rs`,
+  `color.rs`, `lib.rs`, `window.rs`, `frame_stats.rs`), `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run fresh — **486 passed,
+  5 ignored, 0 failed** (+9 over 2.7b's 477: 7 in `stats_overlay`, 2 in `color`), matching the
+  agent's own reported count exactly.
+- **Live-verified independently, not just the agent's own screenshots**: built and launched the
+  binary directly (`target/debug/look-above.exe`, real `credentials.json`, whole-world OpenSky
+  feed), screenshotted with F3 off (confirmed no HUD present) and on (confirmed a cyan HUD block
+  at the top-left), then cropped and 4x nearest-neighbor-upscaled the HUD region to read it
+  precisely: `FPS 47` / `P50 9MS  P95 17MS` / `WORST 60MS` / `N 9102`, matching the designed
+  format exactly, with aircraft glyphs/labels/trails still rendering correctly around it. Clean
+  `WM_CLOSE` (Win32 `PostMessage`, exit code 0); scratch `look_above.db` deleted after per
+  1.12/1.13's convention.
+- M2 checklist now has three items left: **2.8** (selection — cursor hit-test, white outline,
+  info card), 2.9 (headless renderer smoke test wired into CI), 2.10 (the M2 gate itself).

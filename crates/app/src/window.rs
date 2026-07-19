@@ -28,7 +28,7 @@ use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::opensky::OpenSkyAuth;
 use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
-use look_above_render::{FrameOutcome, Renderer, camera_view_proj};
+use look_above_render::{FrameOutcome, Renderer, StatsOverlay, camera_view_proj};
 use look_above_store::Writer;
 use tokio::sync::watch;
 use winit::application::ApplicationHandler;
@@ -40,7 +40,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::Config;
 use crate::double_buffer::{self, Consumer};
-use crate::frame_stats::FrameStats;
+use crate::frame_stats::{FrameStats, FrameSummary};
 use crate::simulation;
 
 const WINDOW_TITLE: &str = "Look Above";
@@ -102,10 +102,15 @@ struct App {
     /// the very first frame, which is guarded to a zero `dt_s` rather than a garbage-huge one.
     last_frame_instant: Option<Instant>,
     stats: FrameStats,
-    /// Toggled by F3. Widens the once-a-second frame-stats log from `debug` to `info` and
-    /// adds p50/p95 — see [`FrameStats`]. No on-screen overlay yet (M2 2.1b, blocked on the
-    /// glyph atlas in 2.5/2.7).
+    /// Toggled by F3. Widens the once-a-second frame-stats log from `debug` to `info`, adds
+    /// p50/p95 to it, and (M2 item 2.1b) shows the same numbers as an on-screen HUD block —
+    /// [`Renderer::render`]'s `stats` parameter, built from [`App::last_stats_summary`] — reusing
+    /// the stroke-font label text pipeline (M2 2.7b) rather than a second text renderer.
     stats_visible: bool,
+    /// The most recent frame-stats report ([`FrameStats::record`] only fires once a second),
+    /// kept so the F3 HUD shows the latest numbers on every frame in between rather than
+    /// blanking or flickering while waiting for the next report — see [`App::draw`].
+    last_stats_summary: Option<FrameSummary>,
     error: Option<anyhow::Error>,
 
     /// Needed in [`App::start`] to open the same `store::Writer` (same `db_path`) and build the
@@ -155,6 +160,7 @@ impl App {
             last_frame_instant: None,
             stats: FrameStats::default(),
             stats_visible: false,
+            last_stats_summary: None,
             error: None,
             config,
             runtime_handle,
@@ -325,9 +331,25 @@ impl App {
             self.current_feed = feed;
         }
 
-        match renderer.render(&self.current_feed, camera) {
+        // Built from the *previous* report ([`FrameStats::record`] only fires once a second —
+        // see `last_stats_summary`'s own doc comment), so the HUD's numbers this frame lag the
+        // live frame time by at most that reporting interval, never by a blank/stale gap.
+        let stats_overlay = self
+            .stats_visible
+            .then(|| {
+                self.last_stats_summary.map(|summary| StatsOverlay {
+                    fps: summary.fps(),
+                    p50_ms: summary.p50.as_secs_f64() * 1e3,
+                    p95_ms: summary.p95.as_secs_f64() * 1e3,
+                    worst_ms: summary.worst.as_secs_f64() * 1e3,
+                })
+            })
+            .flatten();
+
+        match renderer.render(&self.current_feed, camera, stats_overlay) {
             Ok(FrameOutcome::Presented) => {
                 if let Some(summary) = self.stats.record(now) {
+                    self.last_stats_summary = Some(summary);
                     if self.stats_visible {
                         tracing::info!(
                             frames = summary.frames,

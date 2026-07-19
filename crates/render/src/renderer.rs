@@ -18,6 +18,7 @@ use crate::error::RenderError;
 use crate::glyph_atlas;
 use crate::label::{self, LabelPlacement, LeaderVertexRaw, TextInstanceRaw, TextQuadVertex};
 use crate::label_atlas;
+use crate::stats_overlay::{self, StatsOverlay};
 use crate::trail::{self, TrailVertexRaw};
 
 /// docs/01's render-target sample count. Checked against the adapter's format features in
@@ -505,12 +506,111 @@ impl LabelLayer {
     }
 }
 
+/// The F3 debug frame-stats HUD's GPU resources (M2 item 2.1b) — docs/01's draw order's final
+/// "UI overlay" pass.
+///
+/// Deliberately *not* a new pipeline or atlas: `wgpu::RenderPipeline`/`wgpu::Buffer`/
+/// `wgpu::BindGroup` are cheap `Clone` (`Arc`-backed) handles, so [`build_stats_overlay_resources`]
+/// clones [`LabelLayer`]'s already-built text pipeline, atlas bind group, shared text-quad mesh,
+/// and screen-params bind group straight out of it rather than rasterizing a second copy of the
+/// stroke-font atlas or compiling a second pipeline. Only the instance buffer/capacity/scratch
+/// and the HUD's own text color are actually new state — the same "layer owns the GPU buffer +
+/// reused scratch `Vec`" shape [`AircraftLayer`]/[`TrailLayer`]/[`LabelLayer`] already have.
+///
+/// No leader lines (this HUD never needs one) and no placement/collision logic (a fixed top-left
+/// screen corner, not a world-anchored label) — see [`stats_overlay`]'s module doc comment.
+#[derive(Debug)]
+struct StatsOverlayLayer {
+    text_pipeline: wgpu::RenderPipeline,
+    screen_params_bind_group: wgpu::BindGroup,
+    atlas_bind_group: wgpu::BindGroup,
+    quad_vertex_buffer: wgpu::Buffer,
+    quad_index_buffer: wgpu::Buffer,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    /// Reused every frame so packing the HUD's text never allocates once capacity has warmed up
+    /// (ADR-002) — cleared and refilled by [`stats_overlay::pack_overlay_instances`].
+    instance_scratch: Vec<TextInstanceRaw>,
+    text_color: [f32; 4],
+}
+
+/// Fixed screen-pixel margin from the viewport's top-left corner where the HUD block starts —
+/// a static corner overlay needs no viewport-edge clamping or collision the way a world-anchored
+/// label does (`label.rs`'s own edge-margin constant, used only by that pass's placement, is a
+/// different, smaller value).
+const STATS_OVERLAY_ORIGIN_PX: (f64, f64) = (10.0, 10.0);
+
+impl StatsOverlayLayer {
+    /// Packs `stats`' HUD lines (`stats_overlay::format_lines`, fed `instances` for the `N`
+    /// line) into this frame's instance buffer, growing it first if needed. Returns the
+    /// instance count to draw.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stats: &StatsOverlay,
+        instances: usize,
+    ) -> u32 {
+        let lines = stats_overlay::format_lines(stats, instances);
+        stats_overlay::pack_overlay_instances(
+            &lines,
+            STATS_OVERLAY_ORIGIN_PX,
+            self.text_color,
+            &mut self.instance_scratch,
+        );
+
+        if self.instance_scratch.len() > self.instance_capacity {
+            let new_capacity = self
+                .instance_scratch
+                .len()
+                .max(self.instance_capacity.saturating_mul(2))
+                .max(stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY);
+            self.instance_buffer = create_text_instance_buffer(device, new_capacity);
+            self.instance_capacity = new_capacity;
+        }
+        if !self.instance_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instance_scratch),
+            );
+        }
+
+        // The HUD is a handful of short lines — nowhere near u32::MAX.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the overlay's character count is a handful of short lines, far inside \
+                      u32::MAX"
+        )]
+        {
+            self.instance_scratch.len() as u32
+        }
+    }
+
+    /// Binds the shared text pipeline/atlas and draws the uploaded HUD instances in one call —
+    /// skipped entirely (0 instances) when F3 is off, so toggling it off costs nothing per frame
+    /// beyond this no-op check.
+    fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, instance_count: u32) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.text_pipeline);
+        pass.set_bind_group(0, &self.screen_params_bind_group, &[]);
+        pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..6, 0, 0..instance_count);
+    }
+}
+
 /// Owns the GPU device and a window's swapchain, and paints the map.
 ///
 /// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), 2.5
-/// added the aircraft glyph pass, 2.6b added the trail ribbon pass between them, and 2.7b adds
-/// the label pass (text + leader lines) last — every piece of docs/01's draw order ("map base →
-/// map lines → trails → aircraft → labels → UI overlay") except the UI overlay itself now exists.
+/// added the aircraft glyph pass, 2.6b added the trail ribbon pass between them, 2.7b added the
+/// label pass (text + leader lines), and 2.1b adds the F3 debug HUD last — every piece of
+/// docs/01's draw order ("map base → map lines → trails → aircraft → labels → UI overlay") now
+/// exists.
 #[derive(Debug)]
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -545,10 +645,15 @@ pub struct Renderer {
     /// [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
     /// [`AircraftLayer::draw`]).
     aircraft: AircraftLayer,
-    /// The label pass (M2 item 2.7b) — drawn last, after the aircraft glyphs. Unlike every
-    /// other pass, it does *not* share [`Renderer::basemap_view_proj_bind_group`]: label
-    /// placement is already in screen-pixel space (see [`LabelLayer`]'s own doc comment).
+    /// The label pass (M2 item 2.7b) — drawn after the aircraft glyphs. Unlike every other
+    /// pass, it does *not* share [`Renderer::basemap_view_proj_bind_group`]: label placement is
+    /// already in screen-pixel space (see [`LabelLayer`]'s own doc comment).
     label: LabelLayer,
+    /// The F3 debug frame-stats HUD (M2 item 2.1b) — drawn last, after everything else,
+    /// docs/01's own final "UI overlay" draw-order step. Reuses [`LabelLayer`]'s pipeline/atlas
+    /// (see [`StatsOverlayLayer`]'s own doc comment); like the label pass it is screen-space
+    /// only, not the shared world view-proj matrix.
+    stats_overlay: StatsOverlayLayer,
 }
 
 impl Renderer {
@@ -621,6 +726,7 @@ impl Renderer {
         let trail = build_trail_resources(&device, &view_proj_layout, config.format);
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, config.format);
         let label = build_label_resources(&device, &queue, config.format);
+        let stats_overlay = build_stats_overlay_resources(&device, &label, config.format);
 
         Ok(Self {
             surface,
@@ -637,6 +743,7 @@ impl Renderer {
             trail,
             aircraft,
             label,
+            stats_overlay,
         })
     }
 
@@ -744,8 +851,9 @@ impl Renderer {
     }
 
     /// Draw and present one frame: the background clear, the base map (land fill, coastline
-    /// stroke), then `feed`'s trail ribbons, its aircraft glyphs, and finally its labels
-    /// (text + leader lines) on top — docs/01's full draw order short of the UI overlay.
+    /// stroke), then `feed`'s trail ribbons, its aircraft glyphs, its labels (text + leader
+    /// lines), and finally (M2 item 2.1b) the F3 debug HUD on top of everything — docs/01's full
+    /// draw order, end to end.
     ///
     /// Takes the live `camera` itself (M2 item 2.7b), not just its `meters_per_pixel` scalar as
     /// before: the aircraft/trail passes still only need that scalar (to size glyphs/ribbons a
@@ -754,10 +862,14 @@ impl Renderer {
     /// additionally needs the camera's `center_m`/`width_px`/`height_px` to project aircraft
     /// positions into screen-pixel space for placement and collision (see [`label`]'s module doc
     /// comment on why that stays render-side rather than living in `core`).
+    ///
+    /// `stats` is `Some` only while F3 is on (`app::window::App::stats_visible`); when `None`,
+    /// nothing is built or uploaded for the HUD pass at all — see [`StatsOverlayLayer::draw`].
     pub fn render(
         &mut self,
         feed: &RenderFeed,
         camera: &Camera,
+        stats: Option<StatsOverlay>,
     ) -> Result<FrameOutcome, RenderError> {
         let meters_per_pixel = camera.meters_per_pixel();
         let (frame, stale) = match self.surface.get_current_texture() {
@@ -794,6 +906,15 @@ impl Renderer {
             .set_screen_params(&self.queue, camera.width_px(), camera.height_px());
         let (label_text_count, label_leader_count) =
             self.label.update(&self.device, &self.queue, feed, camera);
+        // F3 off: build/upload nothing for the HUD pass, not even an empty buffer write — see
+        // `Renderer::render`'s own doc comment on `stats`.
+        let stats_overlay_count = match stats {
+            Some(stats) => {
+                self.stats_overlay
+                    .upload(&self.device, &self.queue, &stats, feed.aircraft.len())
+            }
+            None => 0,
+        };
 
         let view = frame
             .texture
@@ -827,7 +948,8 @@ impl Renderer {
             });
 
             // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
-            // glyphs (2.5), then labels (2.7b) on top of everything else.
+            // glyphs (2.5), then labels (2.7b), then the F3 debug HUD (2.1b) last, on top of
+            // everything else.
             self.basemap_land
                 .draw(&mut pass, &self.basemap_view_proj_bind_group);
             self.basemap_coastline
@@ -844,6 +966,7 @@ impl Renderer {
             );
             self.label
                 .draw(&mut pass, label_text_count, label_leader_count);
+            self.stats_overlay.draw(&mut pass, stats_overlay_count);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1577,6 +1700,32 @@ fn build_label_resources(
         held: HashSet::new(),
         last_eval_s: None,
         cached_placements: Vec::new(),
+    }
+}
+
+/// Builds the F3 debug HUD's GPU resources (M2 item 2.1b) by *cloning* `label`'s already-built
+/// text pipeline, atlas bind group, shared text-quad mesh, and screen-params bind group — all
+/// cheap `Arc`-backed `wgpu` handles — rather than rasterizing a second stroke-font atlas or
+/// compiling a second pipeline (see [`StatsOverlayLayer`]'s own doc comment). Runs once, in
+/// [`Renderer::new`], after `label` itself has been built.
+fn build_stats_overlay_resources(
+    device: &wgpu::Device,
+    label: &LabelLayer,
+    format: wgpu::TextureFormat,
+) -> StatsOverlayLayer {
+    let instance_buffer =
+        create_text_instance_buffer(device, stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY);
+
+    StatsOverlayLayer {
+        text_pipeline: label.text_pipeline.clone(),
+        screen_params_bind_group: label.screen_params_bind_group.clone(),
+        atlas_bind_group: label.atlas_bind_group.clone(),
+        quad_vertex_buffer: label.quad_vertex_buffer.clone(),
+        quad_index_buffer: label.quad_index_buffer.clone(),
+        instance_buffer,
+        instance_capacity: stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY,
+        instance_scratch: Vec::new(),
+        text_color: color::stats_overlay_text_color(format),
     }
 }
 

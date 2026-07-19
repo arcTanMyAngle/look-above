@@ -6,8 +6,10 @@
 //! hundred `Duration`s at most, well under the ≤4 ms render-thread budget in docs/01 since it
 //! only runs on the once-per-second reporting edge, never per frame.
 //!
-//! On-screen text (the "overlay" the M2 checklist item names) is 2.1b, deferred until the
-//! glyph atlas (2.5/2.7) exists — this module only produces the numbers.
+//! This module only produces the numbers. The on-screen "overlay" the M2 checklist item names is
+//! M2 item 2.1b, drawn by `render`'s `StatsOverlay` (`window.rs`'s `App::draw` converts a
+//! [`FrameSummary`] into that plain-data type every frame, since `render` cannot depend on
+//! `app`), reusing the stroke-font label text pipeline 2.7b built for aircraft labels.
 
 use std::time::{Duration, Instant};
 

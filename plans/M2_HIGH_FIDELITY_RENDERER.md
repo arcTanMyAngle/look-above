@@ -38,9 +38,33 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       resizes (500×400 then 1000×700) with no panic and the MSAA target rebuilding cleanly
       each time, F3 toggled `stats_visible` with the log line switching format as designed,
       `WM_CLOSE` → "close requested" → "window closed", clean exit. DECISION_LOG 2.1.)*
-- [ ] 2.1b Render the F3 frame-stats overlay (p50/p95, instance counts) on screen, reusing the
+- [x] 2.1b Render the F3 frame-stats overlay (p50/p95, instance counts) on screen, reusing the
       glyph atlas built in 2.5/2.7 rather than a one-off text renderer. Depends on 2.7; do not
       start before it lands.
+      *(2026-07-19: implemented — new `render::stats_overlay` (pure: `StatsOverlay` plain-data
+      input, `format_lines`, `pack_overlay_instances`), a small `StatsOverlayLayer` in
+      `renderer.rs` built by **cloning** `LabelLayer`'s already-built text pipeline/atlas
+      bind group/quad mesh/screen-params bind group (all cheap `Arc`-backed `wgpu` handles) —
+      no second SDF atlas texture or pipeline. Fixed top-left HUD, 4 lines (`FPS n` /
+      `P50 nMS  P95 nMS` / `WORST nMS` / `N n`), deliberately kept inside label_atlas's existing
+      39-character set (ALL CAPS, whole numbers, no new glyphs) rather than growing the atlas for
+      a debug overlay. `Renderer::render` gained a trailing `stats: Option<StatsOverlay>` param;
+      `None` (F3 off) builds/uploads nothing. Drawn last, after the label pass — docs/01's draw
+      order is now implemented end to end. `app::window` gained `last_stats_summary` (persists
+      the once-a-second `FrameStats::record` result so the HUD doesn't blank between reports) and
+      builds `StatsOverlay` from it each frame the same numbers the existing log line already
+      uses. Delegated to the renderer-agent (GPU pipeline/atlas reuse, its stated remit), briefed
+      with the exact character-set constraint and reuse-don't-duplicate call already made.
+      Independently re-verified: every changed/new file read in full, fresh
+      `fmt`/`clippy --all-targets -D warnings`/`test --workspace` matched the agent's own count
+      exactly — **486 passed, 5 ignored, 0 failed** (+9 over 2.7b's 477, all in
+      `render::stats_overlay`/`color`). **Live-verified independently**: launched the built
+      binary directly, screenshotted with F3 off (no HUD) and on (HUD present), cropped/4x
+      nearest-neighbor-upscaled the HUD region — legible cyan stroke-font text reading `FPS 47`,
+      `P50 9MS  P95 17MS`, `WORST 60MS`, `N 9102` against a live whole-world OpenSky feed;
+      aircraft glyphs/labels/trails all still rendered correctly alongside it. Clean `WM_CLOSE`;
+      scratch `look_above.db` deleted after per 1.12/1.13's convention. DECISION_LOG 2.1b. M2
+      checklist items remaining: **2.8** (selection), 2.9 (smoke test/CI), 2.10 (gate).)*
 - [x] 2.2a Base map data: fetch Natural Earth 1:50m land + coastlines and bundle as GeoJSON in
       `crates/render/assets/basemap/` (no runtime fetch — `render` stays network-free, ADR-002).
       *(Split 2026-07-18, self-approved same-session: the checklist's "bundled as GeoJSON"

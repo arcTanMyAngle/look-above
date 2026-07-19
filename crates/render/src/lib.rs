@@ -11,7 +11,9 @@ mod glyph_atlas;
 mod label;
 mod label_atlas;
 mod renderer;
+mod stats_overlay;
 mod trail;
 
 pub use error::RenderError;
 pub use renderer::{FrameOutcome, Renderer, camera_view_proj};
+pub use stats_overlay::StatsOverlay;

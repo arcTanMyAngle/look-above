@@ -145,6 +145,17 @@ pub fn label_leader_color(format: wgpu::TextureFormat) -> [f32; 4] {
     color
 }
 
+/// Stats-overlay (F3 HUD) text color (M2 item 2.1b), authored as nonlinear sRGB (`#8FE3FF`) — a
+/// pale cyan, deliberately distinct from [`LABEL_TEXT_SRGB`]'s warm near-white so the debug HUD
+/// reads as its own separate layer rather than another aircraft label.
+const STATS_OVERLAY_TEXT_SRGB: [u8; 3] = [0x8F, 0xE3, 0xFF];
+
+/// The stats-overlay text color as shader-ready, opaque linear RGBA (same linearize-if-`srgb`
+/// reasoning as [`label_text_color`]).
+pub fn stats_overlay_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    layer_color(STATS_OVERLAY_TEXT_SRGB, format)
+}
+
 /// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
 /// `renderer.rs` (the colors never change frame to frame, only which bucket applies), so the
 /// per-instance packing path (`aircraft::pack_instance`) is a plain array lookup rather than
@@ -303,6 +314,30 @@ mod tests {
             "leader line must not outshine the label text"
         );
         assert!(leader[3] < 1.0, "leader line must be semi-transparent");
+    }
+
+    // ---- Stats-overlay color (M2 item 2.1b) --------------------------------------------------
+
+    #[test]
+    fn stats_overlay_text_is_opaque_and_distinguishable_from_label_text() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let overlay = stats_overlay_text_color(format);
+        let text = label_text_color(format);
+        assert!(
+            (overlay[3] - 1.0).abs() < 1e-6,
+            "overlay text must be opaque"
+        );
+        assert_ne!(
+            overlay, text,
+            "the overlay must use a visually distinct color from label text"
+        );
+    }
+
+    #[test]
+    fn stats_overlay_text_darkens_on_an_srgb_surface() {
+        let srgb = stats_overlay_text_color(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let plain = stats_overlay_text_color(wgpu::TextureFormat::Bgra8Unorm);
+        assert!(srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2]);
     }
 
     // ---- Altitude-bucket tint (M2 item 2.5) --------------------------------------------------
