@@ -308,8 +308,73 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       bug) were found still running afterward and closed the same way before the scratch
       `look_above.db` was deleted per 1.12/1.13's convention. DECISION_LOG 2.5. Next: **2.6**,
       trails.)*
-- [ ] 2.6 Trails (in-memory, last 5 min): per-aircraft ring buffer → triangle-strip ribbons,
-      taper width/alpha, altitude-ramp coloring.
+- [x] 2.6a `core::sim` trail ring buffer: per-`Track` ring buffer of *displayed* positions
+      (post-blend, post-clamp — same values the glyph shows), sampled at ≥ 1 Hz, retained 5 min;
+      `RenderFeed` gains `trails: Vec<TrailVertex>` (flat centerline samples, altitude-bucket
+      per vertex, grouped contiguously by aircraft in the same address-sorted order as
+      `aircraft`). No ribbon geometry (offsetting/tapering into a mesh needs the camera's
+      `meters_per_pixel`, which `core` doesn't have — that's 2.6b, on the render side, the same
+      way 2.5's `glyph_scale_normalized` kept zoom-dependent sizing out of `core`). No I/O, no
+      app/render wiring. Unit tests per docs/10 §1.
+      *(Split 2026-07-19, self-approved same-session, same shape as every prior M2 item
+      (2.1/2.1b, 2.2a/2.2b, 2.3a/2.3b, 2.4a/2.4b): the checklist bundles the pure ring-buffer/
+      sampling math with the render-side ribbon tessellation and WGSL pipeline, but those are two
+      lanes — nothing on the render side can honestly be written against a `RenderFeed.trails`
+      shape that doesn't exist yet, and the ribbon-widening math is inherently render's problem
+      (it needs live zoom, which `core::sim` never has). 2.6b is the render half.)*
+      *(2026-07-19: implemented — `Track` gained a `VecDeque<TrailSample>` ring buffer
+      (`TrailSample { pos, alt_m, alt_known, on_ground, t_s }`, private) and
+      `last_trail_sample_s`; two new consts, `TRAIL_DURATION_S`(300) and
+      `TRAIL_SAMPLE_INTERVAL_S`(1.0) — the skill's "last 5 min .. sampled at ≥ 1 Hz". Sampling
+      happens inside `Track::advance`, throttled to at most one push per `TRAIL_SAMPLE_INTERVAL_S`
+      and only when the instance is actually visible this frame (`alpha > 0`) — an aircraft that
+      isn't shown has no "displayed position" to record, so a stale-faded gap simply leaves a
+      hole in the trail rather than recording a phantom point; eviction (`front().t_s` older than
+      `TRAIL_DURATION_S`) runs every call regardless. Recorded from `self.display` (the
+      post-blend, post-no-backward-clamp position) rather than the raw fix, per the skill's
+      "ring buffer of the last 5 min of *displayed* positions (so trails inherit smoothness)" —
+      a teleport's fade-hidden midpoint snap is therefore never recorded either, since sampling
+      is gated on `alpha > 0` and the teleport dip can (briefly) reach exactly the same invisible
+      state stale-fade uses. New `TrailVertex { icao24, position: MercatorXy, altitude_bucket,
+      age_s }` — `age_s` (0 at the aircraft, up to `TRAIL_DURATION_S` at the tail) is what 2.6b's
+      render-side ribbon pass will derive width/alpha taper from, kept as a raw age rather than a
+      pre-normalized `0..1` fraction so a partially-filled trail (an aircraft tracked < 5 min)
+      still taper-maps correctly against the full 5 min scale, not its own shorter history.
+      `altitude_bucket` is classified from *that sample's own* recorded altitude/on-ground state,
+      not the track's current one — the skill's "colored by the altitude ramp" per vertex, so a
+      climbing aircraft's trail shows its actual historical bands, not one repeated current-band
+      color. `Simulator::advance_all` now collects `(AircraftInstance, Vec<TrailVertex>)` pairs
+      over the `rayon` `par_iter_mut`, sorts the pairs by address (same ordering key as before),
+      then splits into `aircraft`/`trails` — trails stay contiguous per aircraft in that same
+      sorted order (2.6b's render-side grouping depends on this: a run of same-`icao24`
+      `TrailVertex`es with no interleaving is what lets it build one ribbon per aircraft without
+      needing an explicit run-length or index buffer in the feed itself). 7 new unit tests:
+      sample-interval throttling (advances faster than 1 Hz don't duplicate samples, computing
+      each probed time fresh from the base rather than accumulating with `+=`, so the assertion
+      doesn't depend on floating-point drift), 5-minute eviction (a sample older than
+      `TRAIL_DURATION_S` is dropped, the trail stays bounded), no sampling while invisible (a
+      stale-faded gap leaves a real gap — reacquisition adds exactly one new sample, not a
+      phantom one for the invisible interval), per-vertex altitude bucket reflecting a sample's
+      own historical altitude (a climbing track's oldest trail vertex classifies into a lower
+      band than its newest), trail contiguity/order matching the sorted aircraft list, and a
+      track past `DROP_AFTER_S` carrying no trail into the feed (same visibility gating as the
+      instance itself). Also required dropping `Track`'s `Copy` derive (kept `Clone`) — the new
+      `VecDeque<TrailSample>` ring buffer field owns a heap allocation, and nothing in the module
+      actually needed to duplicate a whole `Track` by value. `cargo fmt --check`/`clippy
+      --workspace --all-targets -D warnings`/`test --workspace` all green — **427 passed, 5
+      ignored, 0 failed** (+7 over 2.5's 420, all in `sim.rs`). No live run: pure library math,
+      no runtime surface until 2.6b wires a consumer (2.4a's own precedent for the same reason).
+      DECISION_LOG 2.6a. Next:
+      **2.6b**, the render-side ribbon tessellation + WGSL trail pipeline.)*
+- [ ] 2.6b Trails render: `render` tessellates each frame's `RenderFeed.trails` into
+      triangle-strip ribbons (CPU packing on the render thread, same pattern as 2.5's
+      `pack_instance` — the per-vertex perpendicular offset needs the camera's current
+      `meters_per_pixel` to keep the taper a constant screen-space width, which only the render
+      side has), tapering width (3px → 0.5px) and alpha (0.8 → 0) from front (the aircraft) to
+      tail, altitude-ramp colored per vertex from 2.6a's `altitude_bucket`. New trail WGSL
+      pipeline, drawn in docs/01's order (map → map lines → **trails** → aircraft → labels → UI —
+      before the aircraft glyphs, so a glyph never gets occluded by its own trail). Depends on
+      2.6a.
 - [ ] 2.7 Labels: glyph-atlas text (callsign + FL + kt), CPU collision culling with priority
       (docs/01), leader-line when displaced.
 - [ ] 2.8 Selection: cursor hit-test against glyph quads (CPU, spatial index), white outline,

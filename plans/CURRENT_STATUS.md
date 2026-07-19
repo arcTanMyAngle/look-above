@@ -6,10 +6,11 @@
 ## Now (updated 2026-07-19)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5
-  done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.6** — trails (in-memory, last 5 min): per-aircraft ring buffer →
-  triangle-strip ribbons, taper width/alpha, altitude-ramp coloring.
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b, 2.5,
+  2.6a done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **M2 item 2.6b** — trails render: render-side ribbon tessellation (CPU
+  packing on the render thread, camera-zoom-aware taper) + WGSL trail pipeline, consuming
+  2.6a's `RenderFeed.trails`.
 - **⚠ Flagged, not yet its own item: LOD tiers.** 2.5 draws every aircraft as one fixed-size
   L2-style glyph at any zoom; no M2 checklist item (2.1–2.10) implements L0/L1 tier switching,
   and docs/13 §L2-core's zoom-out-to-globe check is part of the M2 gate (2.10) — a future
@@ -190,6 +191,42 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.6a: the `core::sim` trail ring buffer. Split 2.6 into 2.6a/2.6b
+  first (same shape as every prior M2 item): the checklist bundles the pure ring-buffer/sampling
+  math with the render-side ribbon tessellation and WGSL pipeline, but the ribbon-widening math
+  needs the camera's live `meters_per_pixel` to keep the taper a constant screen-space width, and
+  `core` has no camera (2.3a deliberately kept it in `app`) — so that half is 2.6b's problem, the
+  same way 2.5 kept the glyph's zoom-dependent on-screen sizing out of `core` entirely. Each
+  `Track` gained a `VecDeque<TrailSample>` ring buffer (private), sampled inside `advance` at ≥
+  1 Hz (throttled via a new `last_trail_sample_s`, since `advance` itself runs at render cadence)
+  and evicted past a new `TRAIL_DURATION_S` (300 s) — the skill's "last 5 min .. sampled at
+  ≥ 1 Hz". Sampling only happens while the instance is actually visible (`alpha > 0`): an
+  aircraft not shown this frame has no "displayed position" to record, so a stale-fade gap in the
+  trail is real, not filled in. Samples are recorded from `self.display` — the post-blend,
+  post-no-backward-clamp position — per the skill's "ring buffer of the last 5 min of *displayed*
+  positions (so trails inherit smoothness)". New `RenderFeed.trails: Vec<TrailVertex>`
+  (`icao24`, projected `position`, `altitude_bucket` classified from *that sample's own*
+  historical altitude/on-ground state — not the track's current one, so a climbing aircraft's
+  trail shows its real historical bands — and `age_s`, the raw seconds since recording that
+  2.6b will derive width/alpha taper from). `Simulator::advance_all` now collects
+  `(AircraftInstance, Vec<TrailVertex>)` pairs over the `rayon` pass, sorts by address, then
+  splits into `aircraft`/`trails` — trails stay contiguous per aircraft in that same sorted
+  order, which is what lets 2.6b build one ribbon per aircraft without an explicit run-length or
+  index in the feed. Dropped `Track`'s `Copy` derive (kept `Clone`): the new ring-buffer field
+  owns a heap allocation, and nothing in the module actually copied a whole `Track` by value.
+  Done directly, not delegated — this session had already read all of `sim.rs`, `geo.rs`, and
+  `types.rs` while orienting on the M2 plan and the visualization skill, so a cold subagent would
+  only re-derive them (2.4a's own precedent for the same call). 7 new unit tests (sample-interval
+  throttling using freshly-computed probe times rather than accumulated ones, so the assertion
+  doesn't ride on floating-point drift; 5-minute eviction; no sampling while invisible, with
+  reacquisition adding exactly one new sample rather than a phantom one for the gap; per-vertex
+  altitude bucket reflecting a sample's own historical altitude; trail contiguity/order matching
+  the sorted aircraft list; a track past `DROP_AFTER_S` carrying no trail into the feed).
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all green
+  — **427 passed, 5 ignored, 0 failed** (+7 over 2.5's 420, all in `sim.rs`). No live run: pure
+  library math with no runtime surface until 2.6b wires a consumer (2.4a's own precedent). Next:
+  **2.6b**, the render-side ribbon tessellation + WGSL trail pipeline. DECISION_LOG 2.6a.
 
 - **2026-07-19** — M2 item 2.5: the aircraft glyph pipeline — the first item to actually draw a
   live aircraft. New `render::glyph_atlas`: docs/01 asks for an "SDF glyph atlas" but no

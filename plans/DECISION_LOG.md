@@ -1823,3 +1823,62 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   window instances turned up afterward from this session's own earlier failed screenshot-script
   launch attempts (not an app bug); closed the same way before the scratch `look_above.db` was
   deleted per 1.12/1.13's convention. Next: **2.6**, trails.
+
+## 2026-07-19 — M2 item 2.6a (`core::sim` trail ring buffer)
+
+- **Split 2.6 into 2.6a/2.6b before writing anything**, same shape as every prior M2 item. The
+  checklist bundles the pure ring-buffer/sampling math with the render-side ribbon tessellation
+  and WGSL pipeline, but the ribbon-widening (perpendicular offset, screen-constant taper) needs
+  the camera's live `meters_per_pixel`, and `core` has no camera by design (2.3a deliberately
+  kept it in `app`, ADR-002's dependency direction) — so that half can only honestly be written
+  render-side, the same way 2.5 kept the glyph's zoom-dependent on-screen sizing
+  (`aircraft::glyph_scale_normalized`) out of `core` entirely.
+- **Trail vertices are flat centerline samples, not pre-widened ribbon geometry.** `TrailVertex`
+  carries a projected `position`, a per-sample `altitude_bucket`, and a raw `age_s` — no width or
+  screen-space offset. Deferring the perpendicular-offset math to 2.6b (which will pack it on the
+  render thread, the same pattern 2.5's `pack_instance` already established for per-frame CPU
+  work that isn't heavy simulation) keeps `core` free of any render-specific convention, matching
+  `AircraftInstance`'s own `f64`/`Copy`-only shape.
+- **Trail samples are recorded from `Track::display` (the post-blend, post-no-backward-clamp
+  position), not the raw fix** — the skill's explicit "ring buffer of the last 5 min of
+  *displayed* positions (so trails inherit smoothness)". A teleport's fade-hidden midpoint snap
+  is therefore never recorded either, since sampling is gated on the instance being visible
+  (`alpha > 0`) and the teleport dip can (briefly) reach the same invisible state the stale fade
+  uses.
+- **Sampling only happens while the instance is visible this frame.** An aircraft not shown has
+  no "displayed position" to record; recording anyway during an invisible stale-fade gap would
+  fabricate a trail point for a moment nothing was actually drawn. This means a reacquisition
+  after a fade leaves a real gap in the trail rather than a phantom straight segment across the
+  gap — accepted as correct per the skill's wording, not chased further (2.6b's ribbon build
+  will simply start a new run rather than bridging it).
+- **Altitude bucket is classified per-sample from that sample's own recorded altitude/on-ground
+  state, not the track's current one.** The skill says trails are "colored by the altitude
+  ramp" per vertex; storing only the track's live bucket at each `advance_all` call would make a
+  climbing aircraft's whole trail repaint to its current color every frame instead of showing
+  its actual historical bands. `TrailSample` therefore keeps `alt_m`/`alt_known`/`on_ground`
+  alongside the position so `AltitudeBucket::classify` can be re-run per sample at emission time.
+- **`Simulator::advance_all` collects `(AircraftInstance, Vec<TrailVertex>)` pairs, sorts by
+  address, then splits** — rather than collecting `aircraft` and `trails` as two independent
+  parallel passes. This is what guarantees `RenderFeed.trails` stays contiguous per aircraft in
+  the same order as `RenderFeed.aircraft` without an explicit run-length or index field: 2.6b's
+  render-side ribbon build can assume "a run of identical `icao24` is exactly one aircraft's
+  trail" and never needs to search for boundaries.
+- **Dropped `Track`'s `Copy` derive, kept `Clone`.** The new `VecDeque<TrailSample>` ring-buffer
+  field owns a heap allocation, so `Copy` no longer applies; nothing in the module ever
+  duplicated a whole `Track` by value (only mutated it in place through the tracks `HashMap`), so
+  this cost nothing.
+- **Done directly, not delegated** — this session had already read all of `sim.rs`, `geo.rs`,
+  and `types.rs` in full while orienting on the M2 plan and the visualization skill before
+  writing any code, so handing the lane to a cold subagent would only force it to re-read files
+  already in this session's context (2.4a's own precedent for the same call, per the
+  token-managed-implementation skill's delegation rule).
+- **7 new unit tests, all in `sim.rs`**: sample-interval throttling (computing each probed time
+  fresh from the same base rather than accumulating with `+=`, so the assertion doesn't depend on
+  floating-point drift staying under the 1 Hz threshold); 5-minute eviction; no sampling while
+  invisible (reacquisition adds exactly one new sample, never a phantom one for the gap);
+  per-vertex altitude bucket reflecting a sample's own historical altitude; trail contiguity/
+  order matching the sorted aircraft list; a track past `DROP_AFTER_S` carrying no trail into the
+  feed. `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` all
+  green — **427 passed, 5 ignored, 0 failed** (+7 over 2.5's 420). No live run: pure library math
+  with no runtime surface until 2.6b wires a consumer, same as 2.4a. Next: **2.6b**, the
+  render-side ribbon tessellation + WGSL trail pipeline.

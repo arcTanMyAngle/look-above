@@ -24,6 +24,7 @@
 //! wildly; the blend clamps its own progress to `[0, 1]`.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 
 use rayon::prelude::*;
@@ -55,6 +56,16 @@ const TELEPORT_FADE_S: f64 = 0.3;
 /// `STALE_AFTER_S + FADE_DURATION_S` (65 s); the track itself is retained (invisible) until
 /// [`DROP_AFTER_S`] so a reacquisition inside that window blends rather than pops back in.
 pub const FADE_DURATION_S: f64 = 5.0;
+
+/// How long a trail's ring buffer retains displayed positions, in seconds — the skill's "last
+/// 5 min of displayed positions" (M2 item 2.6a).
+pub const TRAIL_DURATION_S: f64 = 300.0;
+
+/// Minimum spacing between retained trail samples, in seconds — the skill's "sampled at ≥ 1 Hz".
+/// [`Simulator::advance_all`] runs far faster than this (render cadence, tens of Hz); this
+/// throttles how often a new point is actually pushed onto the ring buffer, bounding a full
+/// track's trail to at most `TRAIL_DURATION_S / TRAIL_SAMPLE_INTERVAL_S` (300) points.
+pub const TRAIL_SAMPLE_INTERVAL_S: f64 = 1.0;
 
 /// Feet per metre, for the altitude-bucket thresholds (which the skill states in feet).
 const FT_PER_M: f64 = 3.280_839_895;
@@ -133,11 +144,36 @@ pub struct AircraftInstance {
     pub anonymous: bool,
 }
 
+/// One point along an aircraft's trail (M2 item 2.6a) — a flat centerline sample, not yet
+/// widened into a ribbon: that needs the camera's current `meters_per_pixel` to keep the taper a
+/// constant screen-space width, and `core` has no camera (2.3a keeps it in `app`) — so the
+/// perpendicular-offset/tessellation math is 2.6b's render-side problem, the same way 2.5 kept
+/// the glyph's zoom-dependent on-screen sizing (`aircraft::glyph_scale_normalized`) out of
+/// `core` entirely.
+///
+/// [`RenderFeed::trails`] groups these contiguously per aircraft in the same address-sorted
+/// order as [`RenderFeed::aircraft`] (see [`Simulator::advance_all`]), so the render side can
+/// build one ribbon per aircraft without needing an explicit run-length or index into the feed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrailVertex {
+    pub icao24: Icao24,
+    /// Displayed position at the time this sample was recorded, projected to Web Mercator
+    /// metres — same projection convention as [`AircraftInstance::position`].
+    pub position: MercatorXy,
+    /// This sample's *own* altitude band at the time it was recorded, not the track's current
+    /// one — the skill's "colored by the altitude ramp" per vertex, so a climbing aircraft's
+    /// trail shows its real historical bands rather than one repeated current color.
+    pub altitude_bucket: AltitudeBucket,
+    /// Seconds since this sample was recorded: 0 at the aircraft, up to [`TRAIL_DURATION_S`] at
+    /// the tail. The render side derives width/alpha taper from this.
+    pub age_s: f64,
+}
+
 /// What the CPU pipeline hands the renderer each frame (docs/09).
 ///
 /// Flat and pre-sorted; the render thread swaps to it and never blocks on production (the
-/// double-buffering itself is 2.4b's job). Trails and labels (docs/09's full shape) are appended
-/// by their own milestone items — 2.6 and 2.7 — rather than defined empty ahead of need.
+/// double-buffering itself is 2.4b's job). Labels (docs/09's full shape) are the remaining gap,
+/// appended by their own milestone item (2.7) rather than defined empty ahead of need.
 #[derive(Debug, Clone, Default)]
 pub struct RenderFeed {
     /// Frame time, wall-clock seconds — the `now_s` the feed was advanced to.
@@ -145,6 +181,9 @@ pub struct RenderFeed {
     /// Drawable aircraft, sorted deterministically by address (a real draw-priority order —
     /// altitude, then selection — arrives with the glyph/selection work in 2.5/2.8).
     pub aircraft: Vec<AircraftInstance>,
+    /// Trail centerline samples (M2 item 2.6a) — flat, grouped contiguously per aircraft in the
+    /// same address-sorted order as [`RenderFeed::aircraft`].
+    pub trails: Vec<TrailVertex>,
 }
 
 /// The interpolation engine: one [`Track`] per aircraft, advanced to render time on demand.
@@ -185,21 +224,31 @@ impl Simulator {
     ///
     /// Parallel over the track table: each track advances independently of the others.
     pub fn advance_all(&mut self, now_s: f64) -> RenderFeed {
-        let mut aircraft: Vec<AircraftInstance> = self
+        let mut frames: Vec<(AircraftInstance, Vec<TrailVertex>)> = self
             .tracks
             .par_iter_mut()
             .filter_map(|(_, track)| track.advance(now_s))
             .collect();
 
         // Deterministic order for a stable feed and reproducible tests; true draw-priority
-        // ordering is 2.5/2.8's concern.
-        aircraft.sort_unstable_by_key(|instance| instance.icao24.as_bytes());
+        // ordering is 2.5/2.8's concern. Trails are flattened in this same order below, which is
+        // what keeps each aircraft's samples contiguous in the flat `trails` list (2.6b's
+        // render-side ribbon build depends on that contiguity).
+        frames.sort_unstable_by_key(|(instance, _)| instance.icao24.as_bytes());
 
         self.tracks.retain(|_, track| !track.expired(now_s));
+
+        let mut aircraft = Vec::with_capacity(frames.len());
+        let mut trails = Vec::new();
+        for (instance, trail) in frames {
+            aircraft.push(instance);
+            trails.extend(trail);
+        }
 
         RenderFeed {
             frame_ts: now_s,
             aircraft,
+            trails,
         }
     }
 
@@ -215,7 +264,11 @@ impl Simulator {
 }
 
 /// One aircraft's evolving state between fixes.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy` (unlike its own fields' individual types): the trail ring buffer is a `VecDeque`,
+/// which owns a heap allocation — nothing in this module ever needs to duplicate a whole
+/// `Track` by value, only mutate it in place through the tracks table.
+#[derive(Debug, Clone)]
 struct Track {
     icao24: Icao24,
     /// The authoritative fix currently dead-reckoned from.
@@ -229,6 +282,13 @@ struct Track {
     last_fix_ts: f64,
     /// PIA/blocked (privacy rule 2.2), carried from the fix onto the instance.
     anonymous: bool,
+    /// Ring buffer of displayed positions sampled at ≥ 1 Hz over the last [`TRAIL_DURATION_S`]
+    /// (M2 item 2.6a) — the skill's "last 5 min of displayed positions" trail. Oldest first.
+    trail: VecDeque<TrailSample>,
+    /// Wall-clock time (seconds) the last trail sample was recorded, or `None` before the first
+    /// one — throttles [`Track::record_trail_sample`] to [`TRAIL_SAMPLE_INTERVAL_S`] even though
+    /// [`Track::advance`] itself runs at render cadence, far faster than 1 Hz.
+    last_trail_sample_s: Option<f64>,
 }
 
 impl Track {
@@ -246,6 +306,8 @@ impl Track {
             blend: None,
             last_fix_ts: fix.t0,
             anonymous: state.anonymous,
+            trail: VecDeque::new(),
+            last_trail_sample_s: None,
         }
     }
 
@@ -278,10 +340,10 @@ impl Track {
         });
     }
 
-    /// Advances to `now_s`, updating [`Track::display`] and returning the drawable instance —
-    /// `None` once the stale fade has reached zero (the track lingers for reacquisition but is
-    /// not drawn).
-    fn advance(&mut self, now_s: f64) -> Option<AircraftInstance> {
+    /// Advances to `now_s`, updating [`Track::display`] and returning the drawable instance plus
+    /// its current trail vertices — `None` once the stale fade has reached zero (the track
+    /// lingers for reacquisition but is not drawn, and records no trail sample while invisible).
+    fn advance(&mut self, now_s: f64) -> Option<(AircraftInstance, Vec<TrailVertex>)> {
         let prev = self.display;
         let mut alpha_mul = 1.0;
 
@@ -346,7 +408,7 @@ impl Track {
         }
 
         let alt_known = self.fix.alt_m.is_some();
-        Some(AircraftInstance {
+        let instance = AircraftInstance {
             icao24: self.icao24,
             position: web_mercator_forward(self.display.pos),
             heading_deg: self.display.heading_deg,
@@ -359,7 +421,63 @@ impl Track {
             alpha,
             on_ground: self.fix.on_ground,
             anonymous: self.anonymous,
-        })
+        };
+
+        // Only recorded while the instance is actually visible this frame — an aircraft that
+        // isn't shown has no "displayed position" to sample, so a stale-faded gap leaves a real
+        // hole in the trail rather than recording a phantom point (the skill's ring buffer is of
+        // *displayed* positions).
+        self.record_trail_sample(now_s, alt_known);
+        let trail = self.trail_vertices(now_s);
+
+        Some((instance, trail))
+    }
+
+    /// Appends a trail sample for the position just shown, throttled to at most one push per
+    /// [`TRAIL_SAMPLE_INTERVAL_S`] even though [`Track::advance`] itself runs at render cadence,
+    /// then evicts anything older than [`TRAIL_DURATION_S`] (run every call regardless of
+    /// whether a new sample was pushed, so a track that stops moving still ages its trail out).
+    fn record_trail_sample(&mut self, now_s: f64, alt_known: bool) {
+        let should_sample = match self.last_trail_sample_s {
+            None => true,
+            Some(last) => now_s - last >= TRAIL_SAMPLE_INTERVAL_S,
+        };
+        if should_sample {
+            self.trail.push_back(TrailSample {
+                pos: self.display.pos,
+                alt_m: self.display.alt_m,
+                alt_known,
+                on_ground: self.fix.on_ground,
+                t_s: now_s,
+            });
+            self.last_trail_sample_s = Some(now_s);
+        }
+        while let Some(front) = self.trail.front() {
+            if now_s - front.t_s > TRAIL_DURATION_S {
+                self.trail.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// This track's current trail, projected to Web Mercator and classified per-sample — the
+    /// skill's "colored by the altitude ramp" (each vertex reflects *that sample's own*
+    /// historical altitude, not the track's current one).
+    fn trail_vertices(&self, now_s: f64) -> Vec<TrailVertex> {
+        self.trail
+            .iter()
+            .map(|sample| TrailVertex {
+                icao24: self.icao24,
+                position: web_mercator_forward(sample.pos),
+                altitude_bucket: AltitudeBucket::classify(
+                    sample.on_ground,
+                    sample.alt_known,
+                    sample.alt_m,
+                ),
+                age_s: now_s - sample.t_s,
+            })
+            .collect()
     }
 
     /// Enforces the skill's invariant: a moving aircraft never slides *backwards* along its own
@@ -423,6 +541,22 @@ struct Display {
     pos: LatLon,
     heading_deg: f64,
     alt_m: f64,
+}
+
+/// One recorded trail point. Carries enough of the sample's own state (altitude, on-ground) to
+/// reclassify its altitude bucket at emission time — the skill colors each vertex by *its own*
+/// historical altitude, not the track's current one, so this can't just store the bucket and
+/// throw the rest away.
+#[derive(Debug, Clone, Copy)]
+struct TrailSample {
+    pos: LatLon,
+    alt_m: f64,
+    alt_known: bool,
+    on_ground: bool,
+    /// Wall-clock seconds this sample was recorded. [`TrailVertex::age_s`] is derived from this
+    /// relative to the emitting frame's `now_s`, not stored directly, so a sample's reported age
+    /// is always relative to *now*, not to whenever it happened to be pushed.
+    t_s: f64,
 }
 
 /// A transition toward a freshly installed fix.
@@ -819,6 +953,173 @@ mod tests {
         s.anonymous = true;
         sim.ingest(&[s], 1_000.0);
         assert!(sim.advance_all(1_000.0).aircraft[0].anonymous);
+    }
+
+    // ---- Trails (M2 item 2.6a) ------------------------------------------------------------------
+
+    /// This aircraft's trail vertices in the feed, in whatever order `advance_all` emitted them.
+    fn trail_of(feed: &RenderFeed, icao: &str) -> Vec<TrailVertex> {
+        feed.trails
+            .iter()
+            .copied()
+            .filter(|v| v.icao24 == hex(icao))
+            .collect()
+    }
+
+    #[test]
+    fn a_first_sighting_records_exactly_one_trail_sample_at_zero_age() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        let feed = sim.advance_all(1_000.0);
+        let trail = trail_of(&feed, "3c6444");
+        assert_eq!(trail.len(), 1);
+        assert!((trail[0].age_s - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trail_sampling_is_throttled_to_the_sample_interval() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST)], 1_000.0);
+
+        // Several advances within one second must not each push a new sample. Each `t` is
+        // computed fresh from the same base rather than accumulated with `+=`, so this doesn't
+        // depend on floating-point drift staying under the 1 Hz throttle threshold.
+        let mut feed = sim.advance_all(1_000.0);
+        for step in 1..=9 {
+            let t = 1_000.0 + f64::from(step) * 0.1;
+            feed = sim.advance_all(t);
+        }
+        assert_eq!(
+            trail_of(&feed, "3c6444").len(),
+            1,
+            "sub-interval advances must not add extra samples"
+        );
+
+        // Once the interval has elapsed, the next advance adds a second sample.
+        let feed = sim.advance_all(1_000.0 + TRAIL_SAMPLE_INTERVAL_S);
+        assert_eq!(trail_of(&feed, "3c6444").len(), 2);
+    }
+
+    #[test]
+    fn trail_evicts_samples_older_than_the_retention_window() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+
+        // Sample once a second for a while, well past the 5-minute retention window.
+        let mut t = 1_000.0;
+        let mut feed = sim.advance_all(t);
+        while t < 1_000.0 + TRAIL_DURATION_S + 10.0 {
+            t += TRAIL_SAMPLE_INTERVAL_S;
+            feed = sim.advance_all(t);
+        }
+
+        let trail = trail_of(&feed, "3c6444");
+        assert!(
+            trail.iter().all(|v| v.age_s <= TRAIL_DURATION_S + 1e-6),
+            "a sample older than the retention window survived: {trail:?}"
+        );
+        // Bounded to roughly one sample per second over the 300 s retention window (301
+        // literal, not derived from the consts, to sidestep an f64->usize cast for a bound this
+        // test only needs a generous ceiling on), not growing unboundedly with how long the
+        // track has existed.
+        assert!(
+            trail.len() <= 301,
+            "trail grew past its retention bound: {} samples",
+            trail.len()
+        );
+    }
+
+    #[test]
+    fn no_trail_sample_is_recorded_while_the_instance_is_invisible() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        let before_fade = trail_of(&sim.advance_all(1_060.0), "3c6444").len();
+
+        // Fully faded (past STALE_AFTER_S + FADE_DURATION_S = 65 s): not in the feed at all, so
+        // no trail either.
+        let feed = sim.advance_all(1_065.0);
+        assert!(feed.aircraft.is_empty());
+        assert!(trail_of(&feed, "3c6444").is_empty());
+
+        // Reacquire before the drop horizon: the trail resumes (a new sample at the reacquired
+        // position), rather than having grown a phantom sample during the invisible gap.
+        sim.ingest(&[state("3c6444", 1_075, 0.0, 0.0, 0.0, EAST)], 1_075.0);
+        let feed = sim.advance_all(1_075.0);
+        let after_reacquire = trail_of(&feed, "3c6444").len();
+        assert_eq!(
+            after_reacquire,
+            before_fade + 1,
+            "exactly one new sample on reacquisition, none during the invisible gap"
+        );
+    }
+
+    #[test]
+    fn a_track_past_the_drop_horizon_carries_no_trail_into_the_feed() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST)], 1_000.0);
+        let _ = sim.advance_all(1_000.0);
+
+        let feed = sim.advance_all(1_090.0); // past DROP_AFTER_S: the track is forgotten
+        assert_eq!(sim.len(), 0);
+        assert!(trail_of(&feed, "3c6444").is_empty());
+    }
+
+    #[test]
+    fn trail_vertex_altitude_bucket_reflects_its_own_recorded_altitude() {
+        let mut sim = Simulator::new();
+        // Climbing through the 2,000 ft boundary: below at t0, above a bit later.
+        let mut climb = state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST);
+        climb.baro_alt_m = Some(300.0); // ~984 ft, Below2000Ft
+        climb.vert_rate_ms = Some(10.0); // climbs fast enough to cross 2,000 ft within a minute
+        sim.ingest(&[climb], 1_000.0);
+
+        let _ = sim.advance_all(1_000.0); // oldest sample: still low
+        let feed = sim.advance_all(1_000.0 + TRAIL_SAMPLE_INTERVAL_S * 60.0); // newest: climbed
+        let trail = trail_of(&feed, "3c6444");
+
+        let oldest = trail
+            .iter()
+            .max_by(|a, b| a.age_s.total_cmp(&b.age_s))
+            .expect("a sample");
+        let newest = trail
+            .iter()
+            .min_by(|a, b| a.age_s.total_cmp(&b.age_s))
+            .expect("a sample");
+        assert_eq!(oldest.altitude_bucket, AltitudeBucket::Below2000Ft);
+        assert_eq!(newest.altitude_bucket, AltitudeBucket::To10000Ft);
+    }
+
+    #[test]
+    fn trails_stay_grouped_per_aircraft_in_the_feeds_sorted_order() {
+        let mut sim = Simulator::new();
+        sim.ingest(
+            &[
+                state("4b1815", 1_000, 0.0, 0.0, 0.0, EAST),
+                state("3c6444", 1_000, 0.0, 0.0, 0.0, EAST),
+            ],
+            1_000.0,
+        );
+        let feed = sim.advance_all(1_000.0);
+
+        // The trail list's icao24 sequence must not interleave the two aircraft — each run is
+        // contiguous, in the same address-sorted order as `aircraft` (2.6b's render-side ribbon
+        // build depends on this).
+        let order: Vec<_> = feed.trails.iter().map(|v| v.icao24).collect();
+        let mut seen_change = false;
+        let mut previous = order[0];
+        for icao in &order[1..] {
+            if *icao != previous {
+                assert!(
+                    !seen_change,
+                    "an aircraft's trail samples were not contiguous"
+                );
+                seen_change = true;
+                previous = *icao;
+            }
+        }
+        let aircraft_order: Vec<_> = feed.aircraft.iter().map(|a| a.icao24).collect();
+        assert_eq!(aircraft_order, vec![hex("3c6444"), hex("4b1815")]);
+        assert_eq!(order, vec![hex("3c6444"), hex("4b1815")]);
     }
 
     // ---- Altitude buckets -----------------------------------------------------------------------
