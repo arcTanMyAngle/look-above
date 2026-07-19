@@ -9,6 +9,7 @@
 //! (`core::merge`) lands in M1 item 1.9, and the interpolation pipeline
 //! (`core::sim`) in M2.
 
+pub mod camera;
 pub mod contracts;
 pub mod error;
 pub mod geo;

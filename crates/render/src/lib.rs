@@ -9,4 +9,4 @@ mod error;
 mod renderer;
 
 pub use error::RenderError;
-pub use renderer::{FrameOutcome, Renderer};
+pub use renderer::{FrameOutcome, Renderer, camera_view_proj};

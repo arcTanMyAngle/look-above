@@ -6,11 +6,23 @@
 ## Now (updated 2026-07-18)
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b done. Plan:
+  open, see below — same shape as M0→M1). Items 2.1, 2.2a, 2.2b, 2.3a done. Plan:
   [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **M2 item 2.3** — the regional camera: Web Mercator pan (drag) + zoom
-  (wheel, cursor-anchored) with inertia; viewport→bbox exposed to the poller. Replaces 2.2b's
-  placeholder fit-to-window matrix with a real view-proj transform.
+- **Next action:** **M2 item 2.3b** — viewport→bbox exposed to the poller: a retarget API on
+  `ingest::poller` (today's `Poller` takes one fixed `RegionQuery` at construction and has no
+  way to change it while running) and wiring window mode to run the live ingest pipeline for
+  the first time (today only `--headless` does), retargeting on camera settle debounced 2 s.
+- **2.3a landed:** the regional camera — new `core::camera::Camera` (pure pan/drag/cursor-
+  anchored-zoom/inertia math, no wgpu/winit) plus `render::camera_view_proj` and `app::window`
+  wiring (mouse drag/wheel → camera, `camera.update(dt)` once per frame) replace 2.2b's
+  placeholder fit-to-window matrix with a real view-proj transform. Scoped to the regional Web
+  Mercator camera only — zoom-out is clamped at the "whole world visible, letterboxed" fit
+  (there is no L0 globe view yet). Delegated as two sequential, lane-scoped pieces (geo-math-
+  agent for `core::camera`, renderer-agent for the render/app wiring against that finished
+  API), independently re-verified both times: fmt/clippy/test green (**369 passed, 5 ignored**,
+  +20 over 2.2b), every file read in full, and a scripted live Win32 drive (drag, inertia,
+  cursor-anchored zoom in/out round-tripping to the same view, resize, clean `WM_CLOSE`) — no
+  seams/cracks/distortion at any step. DECISION_LOG 2.3a.
 - **2.2b landed:** the base map now actually draws — `crates/render/src/basemap.rs` tessellates
   2.2a's bundled `GeoJSON` (`lyon`: `FillTessellator`/`NonZero` for land, `StrokeTessellator`
   for coastlines) into static GPU buffers once at startup, reusing `core::geo::web_mercator_forward`
@@ -91,6 +103,49 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-18** — M2 item 2.3a: the regional camera. Split 2.3 into 2.3a/2.3b first (same
+  shape as 2.1/2.1b and 2.2a/2.2b): the checklist bundles the camera with exposing its viewport
+  to the poller, but those are different lanes and 2.3b (a new `ingest::poller` retarget API,
+  plus running the live pipeline from window mode for the first time) can't be honestly written
+  until 2.3a's camera exists. New `core::camera::Camera` — pure pan/drag/cursor-anchored-zoom/
+  inertia math, no wgpu or winit, living in `core` because it's ordinary `f64` arithmetic
+  reusable by both `render` and `app` without a new cross-dependency. State is tracked as
+  `meters_per_pixel` rather than a unitless zoom level, which turns cursor-anchored zoom into a
+  few lines of "solve for the center that keeps one world point's screen position fixed" and the
+  zoom-out ceiling into one formula (`2 * WEB_MERCATOR_EXTENT_M / min(width_px, height_px)`) that
+  also happens to reproduce 2.2b's placeholder fit-to-window matrix exactly — **deliberately
+  clamped there because there is no L0 globe view yet**; zooming out further would show empty
+  space with nothing to render into it. "Inertia" was interpreted as pan-momentum-on-release
+  (EMA-sampled drag velocity, exponential-friction decay) plus *eased*, not literal-momentum,
+  zoom — docs/01's real requirement is smoothness, and no mainstream map keeps zooming after the
+  wheel stops. New `render::camera_view_proj` (replacing the deleted `fit_to_window_matrix`)
+  re-derives the scale from the camera and re-divides by `WEB_MERCATOR_EXTENT_M` to match
+  `basemap.rs`'s pre-normalized static vertices, keeping that division in the one place that
+  owns the mesh rather than teaching `core::camera` a render-specific convention.
+  `Renderer::set_view_proj` is now the view-proj buffer's only writer (the camera lives in
+  `app`, which needs winit events; `render` stays winit-free per ADR-002), and `reconfigure` no
+  longer touches that buffer on resize — the app's `Resized` handler calls `Camera::resize` +
+  `set_view_proj` synchronously before the next frame, so nothing stale is ever presented.
+  **Delegated in two sequential, lane-scoped pieces**: geo-math-agent for `core::camera` first
+  (nothing else could be honestly written against an API that didn't exist yet), then
+  renderer-agent for the render/app wiring, briefed with the first agent's actual finished
+  method signatures. One real ambiguity in this session's own brief was caught and correctly
+  resolved by the first agent rather than silently picked one way: the prose said shrinking a
+  window must not zoom past the new ceiling, backwards from the actual formula (shrinking
+  *raises* the ceiling) — the agent implemented the formula as given (a safe, direction-agnostic
+  `.min(max_mpp)` re-clamp) and flagged the prose error explicitly. Both pieces independently
+  re-verified by this session, not trusted: `cargo fmt --check`/`clippy --workspace
+  --all-targets -D warnings`/`test --workspace` re-run fresh after each (**369 passed, 5
+  ignored, 0 failed** — +14 `core::camera` tests, +6 `render` matrix tests over 2.2b's 349),
+  every changed/new file read in full. **Live-verified with a scripted Win32 drive**
+  (`SetCursorPos`/`mouse_event`/`PostMessage`, DPI-aware per 2.2b's own recorded lesson): a drag
+  pan followed the cursor correctly on both axes, inertia coasted a short distance further after
+  release and decayed to a stop without reversing, eight wheel notches in then eight back out
+  round-tripped to the same view (no drift), a resize reflowed without distortion, and a clean
+  `WM_CLOSE` exit (code 0) — six screenshots showed no seams, cracks, or missing polygons at any
+  step (docs/13's L2-core pan/zoom-inertia line). DECISION_LOG 2.3a. Next: **2.3b**, viewport→
+  bbox exposed to the poller.
 
 - **2026-07-18** — M2 item 2.2b: base map render. New `crates/render/src/basemap.rs`: embeds
   2.2a's bundled `land.geojson`/`coastline.geojson` via `include_str!` (render stays

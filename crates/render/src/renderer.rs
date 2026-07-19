@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use look_above_core::camera::Camera;
+use look_above_core::geo::WEB_MERCATOR_EXTENT_M;
 use wgpu::util::DeviceExt as _;
 use wgpu::{CurrentSurfaceTexture, DisplayAndWindowHandle};
 
@@ -76,12 +78,14 @@ pub struct Renderer {
     msaa_view: wgpu::TextureView,
     /// The uniform both base-map pipelines read their `view_proj` matrix from (`@group(0)`).
     ///
-    /// M2 2.2b's contents are a placeholder aspect-correcting fit-to-window matrix (see
-    /// [`fit_to_window_matrix`]) — it exists only so a non-square window doesn't stretch the
-    /// world, there is no pan/zoom yet. Rewritten in [`Renderer::reconfigure`] exactly the way
-    /// `msaa_view` already is: same seam, same reason, it must always match the current surface
-    /// size. M2 2.3 replaces the *contents* this buffer is written with (a real camera
-    /// transform); the buffer and its bind group do not change.
+    /// M2 2.3a: the camera itself lives in `app` (it needs winit input events, and `render`
+    /// must stay winit-free — ADR-002/M0's dependency-direction check), so this crate no longer
+    /// computes this buffer's contents on its own. [`Renderer::set_view_proj`] is the only
+    /// writer now; the caller is expected to call it once per frame (after advancing its
+    /// `Camera`) and again after every [`Renderer::resize`]. [`Renderer::new`] seeds it with
+    /// [`camera_view_proj`] of a freshly-constructed default [`Camera`] so there is a correct
+    /// matrix in place before the app ever calls `set_view_proj` — see that function's doc
+    /// comment for why this exactly matches what the app's own first call produces.
     basemap_view_proj_buffer: wgpu::Buffer,
     basemap_view_proj_bind_group: wgpu::BindGroup,
     basemap_land: BasemapLayer,
@@ -225,6 +229,20 @@ impl Renderer {
         self.config.format
     }
 
+    /// Uploads a freshly computed view-proj matrix for the base-map passes to read this frame.
+    ///
+    /// The camera itself lives in `app` (see the field doc on `basemap_view_proj_buffer`);
+    /// build `matrix` with [`camera_view_proj`] and call this once per frame, and again after
+    /// every [`Renderer::resize`] (a resize can change the camera's zoom ceiling, so the matrix
+    /// must be rebuilt, not just left alone — see [`Renderer::reconfigure`]).
+    pub fn set_view_proj(&mut self, matrix: [[f32; 4]; 4]) {
+        self.queue.write_buffer(
+            &self.basemap_view_proj_buffer,
+            0,
+            bytemuck::bytes_of(&matrix),
+        );
+    }
+
     /// Follow the window to a new size.
     ///
     /// A zero-sized window (minimized, on Windows) is ignored rather than configured: the
@@ -315,15 +333,21 @@ impl Renderer {
     }
 
     /// Rebuild the swapchain from the current config, and everything tied to the surface size
-    /// alongside it — the MSAA target and the base map's aspect-correcting view-proj matrix.
+    /// alongside it — just the MSAA target now.
+    ///
+    /// M2 2.2b's placeholder camera lived here too (this function used to rewrite the
+    /// view-proj buffer with a fresh aspect-correcting fit on every resize). Now that the
+    /// camera lives in `app`, this crate has nothing to compute that matrix from on its own —
+    /// `App::window_event`'s `Resized` handler calls `Camera::resize` and
+    /// `Renderer::set_view_proj` back-to-back, synchronously, before the next `RedrawRequested`
+    /// (winit delivers `Resized` and redraw as separate events; no frame is drawn in between),
+    /// so leaving the buffer untouched here never presents a stale-but-wrong matrix — the last
+    /// value written (either the seed in `build_basemap_resources` or the app's most recent
+    /// `set_view_proj`) stays valid until the app's own resize handler overwrites it a moment
+    /// later.
     fn reconfigure(&mut self) {
         self.surface.configure(&self.device, &self.config);
         self.msaa_view = create_msaa_view(&self.device, &self.config);
-        self.queue.write_buffer(
-            &self.basemap_view_proj_buffer,
-            0,
-            bytemuck::bytes_of(&fit_to_window_matrix(self.config.width, self.config.height)),
-        );
     }
 }
 
@@ -390,9 +414,15 @@ fn build_basemap_resources(
         immediate_size: 0,
     });
 
+    // Seed with a freshly-constructed default `Camera`'s matrix rather than leaving the buffer
+    // uninitialized: there is a gap between `Renderer::new` returning and `App::start`
+    // constructing its own `Camera` and calling `set_view_proj` for the first time, and this
+    // avoids a one-frame flash of a wrong transform in that gap. It's guaranteed to match what
+    // the app immediately overwrites it with — same `Camera::new(width, height)` call, same
+    // result (see `camera_view_proj`'s doc comment).
     let view_proj_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("look-above basemap view-proj uniform"),
-        contents: bytemuck::bytes_of(&fit_to_window_matrix(width, height)),
+        contents: bytemuck::bytes_of(&camera_view_proj(&Camera::new(width, height))),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let view_proj_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -603,34 +633,166 @@ fn create_basemap_pipeline(
     })
 }
 
-/// A placeholder aspect-correcting fit-to-window transform.
+/// Builds the base map's `view_proj` uniform from a [`Camera`]'s current state.
 ///
-/// `basemap::tessellate`'s normalized coordinates are already close to `[-1, 1]` on both axes
-/// *ignoring aspect* (see its doc comment) — this only needs to keep a non-square window from
-/// stretching the world, by shrinking whichever axis has more pixels per world-unit. There is
-/// no pan/zoom camera yet (M2 item 2.3); the buffer/bind-group plumbing this matrix travels
-/// through does not change when 2.3 replaces what gets written here.
+/// `basemap::tessellate`'s static mesh is pre-normalized by dividing every Web Mercator metre
+/// coordinate by [`WEB_MERCATOR_EXTENT_M`] (see that module's doc comment) — this matrix must
+/// therefore operate on that already-divided plane, not on raw metres, which is why
+/// `center_plane_*` below re-divides the camera's center by the same extent before use.
 ///
-/// Column-major, matching WGSL's `mat4x4<f32>` convention — worth stating because this one
-/// happens to be diagonal, where row- and column-major would look identical.
-fn fit_to_window_matrix(width: u32, height: u32) -> [[f32; 4]; 4] {
-    // Widths/heights are window dimensions in pixels — far below where `f32` would round an
-    // integer of this magnitude (`2^24`), so the pedantic lint's concern does not apply here.
-    #[allow(clippy::cast_precision_loss)]
-    let aspect = width as f32 / (height.max(1) as f32);
+/// Derivation: a camera viewport spans `meters_per_pixel * width_px` world metres across, so a
+/// point `EXTENT` metres from the camera center should land exactly at the clip-space edge
+/// (`+1`/`-1`) when it is `width_px / 2` pixels from the viewport center — giving
+/// `scale = EXTENT / (meters_per_pixel * width_px / 2)`. The translation recenters the plane
+/// on the camera before that scale is applied, in the same pre-normalized units.
+///
+/// Continuity with the old placeholder: for a freshly-constructed `Camera::new(w, h)` (centered
+/// on the origin, framed to contain the whole projected world — see [`Camera`]'s own doc
+/// comment), this produces exactly the aspect-correcting "contain" fit the M2 2.2b placeholder
+/// (`fit_to_window_matrix`, since removed) used to hardcode — pinned by this module's tests.
+///
+/// Column-major, matching WGSL's `mat4x4<f32>` convention.
+pub fn camera_view_proj(camera: &Camera) -> [[f32; 4]; 4] {
+    let center = camera.center_m();
+    let mpp = camera.meters_per_pixel();
+    let width_px = camera.width_px();
+    let height_px = camera.height_px();
 
-    // Whichever axis has more pixels per world-unit gets scaled down so both axes end up with
-    // the same pixels-per-world-unit — the classic "fit inside, do not stretch" correction.
-    let (scale_x, scale_y) = if aspect >= 1.0 {
-        (1.0 / aspect, 1.0)
-    } else {
-        (1.0, aspect)
-    };
+    let scale_x = WEB_MERCATOR_EXTENT_M / (mpp * width_px / 2.0);
+    let scale_y = WEB_MERCATOR_EXTENT_M / (mpp * height_px / 2.0);
+    let center_plane_x = center.x_m / WEB_MERCATOR_EXTENT_M;
+    let center_plane_y = center.y_m / WEB_MERCATOR_EXTENT_M;
+    let tx = -center_plane_x * scale_x;
+    let ty = -center_plane_y * scale_y;
 
+    // `scale_x`/`scale_y`/`tx`/`ty` are ordinary `f64` results of division/multiplication, not
+    // integer casts, so `clippy::cast_precision_loss` (which only fires on int-to-float casts)
+    // does not apply here; `f64 as f32` is exactly the intended narrowing to the uniform's
+    // storage type; and the standard reduced `f32` precision at these magnitudes is well within
+    // sub-pixel visual tolerance.
+    #[allow(clippy::cast_possible_truncation)]
     [
-        [scale_x, 0.0, 0.0, 0.0],
-        [0.0, scale_y, 0.0, 0.0],
+        [scale_x as f32, 0.0, 0.0, 0.0],
+        [0.0, scale_y as f32, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
+        [tx as f32, ty as f32, 0.0, 1.0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use look_above_core::geo::MAX_MERCATOR_LAT_DEG;
+
+    use super::*;
+
+    /// Generous next to `1.0`, tight next to what an `f32` roundtrip through this matrix could
+    /// visibly shift a point by at ordinary window sizes.
+    const EPS: f32 = 1e-5;
+
+    #[track_caller]
+    fn assert_close(actual: f32, expected: f32, eps: f32) {
+        assert!(
+            (actual - expected).abs() <= eps,
+            "expected {expected}, got {actual} (difference {}, tolerance {eps})",
+            (actual - expected).abs()
+        );
+    }
+
+    // --- Continuity with the old fit_to_window_matrix placeholder --------------
+
+    #[test]
+    fn default_camera_on_a_wide_window_matches_the_old_placeholder_fit() {
+        let matrix = camera_view_proj(&Camera::new(2000, 1000));
+        let aspect = 2000.0_f32 / 1000.0;
+        assert_close(matrix[0][0], 1.0 / aspect, EPS);
+        assert_close(matrix[1][1], 1.0, EPS);
+        assert_close(matrix[3][0], 0.0, EPS);
+        assert_close(matrix[3][1], 0.0, EPS);
+    }
+
+    #[test]
+    fn default_camera_on_a_tall_window_matches_the_old_placeholder_fit() {
+        let matrix = camera_view_proj(&Camera::new(800, 1600));
+        let aspect = 800.0_f32 / 1600.0;
+        assert_close(matrix[0][0], 1.0, EPS);
+        assert_close(matrix[1][1], aspect, EPS);
+        assert_close(matrix[3][0], 0.0, EPS);
+        assert_close(matrix[3][1], 0.0, EPS);
+    }
+
+    #[test]
+    fn default_camera_on_a_square_window_scales_both_axes_identically() {
+        let matrix = camera_view_proj(&Camera::new(1000, 1000));
+        assert_close(matrix[0][0], 1.0, EPS);
+        assert_close(matrix[1][1], 1.0, EPS);
+    }
+
+    // --- Panned/zoomed camera: pin against the hand-derived formula -------------
+
+    // Same narrowing as `camera_view_proj` itself: the hand-derived expectations below are
+    // ordinary `f64` arithmetic results, not integer casts, so `cast_possible_truncation` is
+    // the applicable (and expected) lint, exactly as clippy flags in the function under test —
+    // allowed here for the same reason. `expected_translate_x`/`_y` are also long enough that
+    // the similar-names heuristic's single-character-suffix trigger has no real confusion risk.
+    #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
+    #[test]
+    fn panned_camera_translates_the_plane_opposite_its_center() {
+        let mut camera = Camera::new(1000, 800);
+        camera.pan_by_pixels(100.0, 0.0);
+        camera.pan_by_pixels(0.0, 50.0);
+
+        let matrix = camera_view_proj(&camera);
+        let center = camera.center_m();
+        let mpp = camera.meters_per_pixel();
+
+        let expected_scale_x = (WEB_MERCATOR_EXTENT_M / (mpp * camera.width_px() / 2.0)) as f32;
+        let expected_scale_y = (WEB_MERCATOR_EXTENT_M / (mpp * camera.height_px() / 2.0)) as f32;
+        let expected_translate_x =
+            (-(center.x_m / WEB_MERCATOR_EXTENT_M) * f64::from(expected_scale_x)) as f32;
+        let expected_translate_y =
+            (-(center.y_m / WEB_MERCATOR_EXTENT_M) * f64::from(expected_scale_y)) as f32;
+
+        assert_close(matrix[0][0], expected_scale_x, EPS);
+        assert_close(matrix[1][1], expected_scale_y, EPS);
+        assert_close(matrix[3][0], expected_translate_x, EPS);
+        assert_close(matrix[3][1], expected_translate_y, EPS);
+
+        // A pan away from the origin must move the translation off zero, or this test would
+        // pass vacuously.
+        assert!(matrix[3][0].abs() > EPS);
+        assert!(matrix[3][1].abs() > EPS);
+    }
+
+    #[test]
+    fn zoomed_in_camera_scales_up_relative_to_the_default_fit() {
+        let default_matrix = camera_view_proj(&Camera::new(1000, 800));
+
+        let mut camera = Camera::new(1000, 800);
+        camera.zoom_by_notches(10.0, 500.0, 400.0);
+        for _ in 0..500 {
+            camera.update(1.0 / 60.0);
+        }
+        let zoomed_matrix = camera_view_proj(&camera);
+
+        assert!(zoomed_matrix[0][0] > default_matrix[0][0]);
+        assert!(zoomed_matrix[1][1] > default_matrix[1][1]);
+    }
+
+    /// A camera panned near the Mercator latitude limit still produces a finite, sane matrix —
+    /// guards against the plane-normalization arithmetic blowing up at the projection's edges.
+    #[test]
+    fn camera_near_the_mercator_latitude_limit_stays_finite() {
+        let mut camera = Camera::new(1000, 800);
+        let far_north = look_above_core::geo::web_mercator_forward(
+            look_above_core::geo::LatLon::new(MAX_MERCATOR_LAT_DEG - 1.0, 0.0),
+        );
+        camera.pan_by_pixels(0.0, -(far_north.y_m / camera.meters_per_pixel()));
+
+        let matrix = camera_view_proj(&camera);
+        for column in matrix {
+            for value in column {
+                assert!(value.is_finite());
+            }
+        }
+    }
 }

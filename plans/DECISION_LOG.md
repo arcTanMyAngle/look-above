@@ -1406,3 +1406,75 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   own `FindWindow`/`MainWindowHandle` breadcrumb for any future scripted visual QA on this
   machine. Render crate: 5 → 12 tests. Next: **2.3**, the regional camera (pan/zoom, the real
   view-proj matrix this item's placeholder hands off to).
+
+## 2026-07-18 — M2 item 2.3a (regional camera: pan/drag, cursor-anchored zoom, inertia)
+
+- **Split 2.3 into 2.3a/2.3b before writing any code**, same shape as 2.1/2.1b and 2.2a/2.2b:
+  the checklist's one line bundles the camera itself with exposing its viewport to the poller,
+  but those are different lanes doing genuinely different things — pure `core`/`render`/input
+  math here, versus a new `ingest::poller` retarget API and running the live network pipeline
+  from window mode for the first time (only `--headless` does today) in 2.3b. 2.3b cannot be
+  meaningfully written or tested without 2.3a's `Camera` to feed it, so the order is fixed.
+- **Camera state lives in `core::camera`, not `render` or `app`.** It is pure arithmetic on
+  `f64`s (pan/zoom/inertia math), a natural fit for `core`'s "types, geo-math" charter and
+  reusable by both `render` (to build the GPU matrix) and `app` (to drive it from winit events)
+  without a new cross-dependency. It imports nothing but `core::geo`'s existing `MercatorXy`/
+  `WEB_MERCATOR_EXTENT_M` — no wgpu, no winit, no bytemuck.
+- **Meters-per-pixel, not a unitless "zoom level"**, is the state variable. It makes the two
+  hard parts fall out of ordinary arithmetic instead of needing lookup tables: cursor-anchored
+  zoom is "solve for the new center that keeps one world point's screen position fixed as scale
+  changes" (a few lines of algebra), and the zoom-out ceiling is "the world's fixed metre extent
+  divided by the smaller pixel dimension" — the same formula that reproduces 2.2b's placeholder
+  fit-to-window matrix exactly, so the camera's initial framing needed no separate case.
+- **The zoom-out ceiling doubles as the initial framing, and neither is arbitrary: there is no
+  L0 globe/orthographic view yet.** `max_meters_per_pixel = 2 * WEB_MERCATOR_EXTENT_M /
+  min(width_px, height_px)` is the "whole projected world visible, letterboxed" fit; zooming out
+  past it would show empty space with nothing to render into it, since only the regional Web
+  Mercator camera exists (L0/L1 tier switching is 2.5+, not this item). Revisit this clamp when
+  the globe view lands — it will need to hand off to an orthographic camera around this same
+  threshold rather than just raising the ceiling.
+- **"Inertia" was interpreted as pan-momentum-on-release plus eased (not momentum) zoom**, not
+  literal continued zooming after the wheel stops. No mainstream map product keeps zooming after
+  you stop scrolling; docs/01's actual requirement is smoothness ("no visible teleporting...
+  during pan/zoom"), which an eased approach to a wheel-set target delivers without the odd feel
+  of a zoom that outlives the input. Pan genuinely coasts and decays (drag velocity is sampled
+  via an EMA during the drag, then integrated with exponential friction after release) because
+  that is standard, expected map-drag feel and the checklist explicitly names it for pan.
+- **`render::camera_view_proj` re-derives the scale from the camera's `meters_per_pixel` and
+  divides by `WEB_MERCATOR_EXTENT_M` again**, rather than having `core::camera` produce
+  pre-divided "plane units" itself. `basemap.rs`'s static vertices are already baked in that
+  divided form (2.2b), so the alternative would mean either `core::camera` importing a
+  render-flavored normalization convention it has no other reason to know about, or `render`
+  trusting a second crate to have silently pre-divided its state correctly. Keeping the division
+  in one place (`render`, right next to the vertices it must agree with) means there is exactly
+  one spot that can get the constant wrong, and it is the spot that already owns the mesh.
+- **`Renderer::reconfigure` stopped writing the view-proj buffer on resize.** It used to
+  rewrite the placeholder matrix on every resize because it was the only thing that could — the
+  camera now lives in `app`, which calls `Camera::resize` then `Renderer::set_view_proj`
+  synchronously in its own `Resized` handler, before winit ever delivers the next
+  `RedrawRequested`. A stale buffer is therefore never presented; a neutral fallback would have
+  been unreachable dead code guarding against a sequencing winit doesn't allow.
+- **Delegated in two lane-scoped, sequential pieces**: geo-math-agent for `core::camera` (pure
+  math, run first since nothing else can be honestly written against an API that doesn't exist
+  yet), then renderer-agent for the render/app wiring, briefed with the first agent's *actual*
+  finished method signatures rather than the original spec, since a mismatch would not compile.
+  Both independently re-verified rather than trusted: `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run fresh after each
+  (**369 passed, 5 ignored, 0 failed** final — +14 `core::camera` tests, +6 `render` matrix
+  tests over 2.2b's 349), every changed/new file read in full. One real ambiguity surfaced and
+  resolved correctly by the first agent despite an imprecise brief: the task's prose said
+  "shrinking a window must not leave the camera zoomed out past the new ceiling," which is
+  backwards from the actual formula (shrinking *raises* the ceiling; growing lowers it) — the
+  agent implemented the formula as specified (an unconditional `.min(max_mpp)` re-clamp, correct
+  regardless of which direction the ceiling moves) and flagged the prose error explicitly rather
+  than silently picking one, which is exactly the right call when code and English disagree.
+- **Live-verified with a scripted Win32 drive** (`SetCursorPos`/`mouse_event`/`PostMessage`,
+  DPI-aware per 2.2b's own recorded lesson — `SetThreadDpiAwarenessContext(-4)` before any
+  window-geometry call): a drag pan followed the cursor correctly on both axes (verified against
+  the derived sign convention, not just "something moved"), inertia coasted a short distance
+  further after release and decayed to a stop without reversing, eight wheel notches in then
+  eight back out round-tripped to the same view (no drift), a resize reflowed without distortion
+  or a crash, and `WM_CLOSE` exited cleanly (code 0). Six screenshots confirmed no seams, cracks,
+  or missing polygons at any step — docs/13's L2-core pan/zoom-inertia line. Next: **2.3b**,
+  viewport→bbox exposed to the poller (retarget API + wiring window mode to the live pipeline
+  for the first time).

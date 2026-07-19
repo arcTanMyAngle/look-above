@@ -104,9 +104,58 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       itself (see DECISION_LOG 2.2b) before confirming a correct, symmetric, aspect-preserving
       world map across three window sizes and a clean `WM_CLOSE` exit. DECISION_LOG 2.2b.
       Next: **2.3**, the regional camera.)*
-- [ ] 2.3 Camera (regional): Web Mercator, pan (drag) + zoom (wheel, cursor-anchored) with
-      inertia; viewport→bbox exposed to the poller (M1 poller re-targets on camera settle,
-      debounced 2 s).
+- [x] 2.3a Camera (regional): Web Mercator, pan (drag) + zoom (wheel, cursor-anchored) with
+      inertia, replacing 2.2b's placeholder fit-to-window matrix with a real view-proj
+      transform. Window mode only (headless has no camera).
+      *(Split 2026-07-18, self-approved same-session, same shape as 2.1/2.1b and 2.2a/2.2b:
+      the checklist bundles the camera itself with exposing its viewport to the poller, but
+      those are two different lanes — pure `core`/`render`/input-handling math here, vs. a new
+      `ingest::poller` retarget API and, for the first time, running the live network pipeline
+      from window mode (today only `--headless` does) for 2.3b. Nothing in 2.3b can be
+      meaningfully written or tested until 2.3a's camera exists to feed it, so the order is
+      fixed, not arbitrary.)*
+      *(2026-07-18: implemented — new `core::camera::Camera` (pure state/math, no wgpu/winit):
+      pan (`pan_by_pixels`, immediate 1:1), drag lifecycle + EMA-sampled inertia velocity
+      (`begin_drag`/`drag_to`/`end_drag`, exponential friction decay in `update`), cursor-
+      anchored wheel zoom (`zoom_by_notches` sets a target + clip-space anchor, `update` eases
+      `meters_per_pixel` toward it while re-centering to keep the anchored world point fixed).
+      **Scope is deliberately the regional Web Mercator camera only**: `meters_per_pixel` is
+      clamped at a zoom-out ceiling — `2 * WEB_MERCATOR_EXTENT_M / min(width_px, height_px)`,
+      the same "contain, whole world visible, letterboxed" fit 2.2b's placeholder hardcoded —
+      because there is no L0 globe/orthographic view yet; zooming out further would show empty
+      space with nothing to fill it. That ceiling formula is also `Camera::new`'s starting
+      framing, so construction reproduces the old placeholder's exact initial view (pinned by
+      tests, and the actual reason there's no visual jump at startup). New
+      `render::camera_view_proj(&Camera) -> [[f32;4];4]` (replacing the deleted
+      `fit_to_window_matrix`) re-derives the scale from `meters_per_pixel`/viewport pixels and
+      folds in the same `/ WEB_MERCATOR_EXTENT_M` pre-normalization `basemap.rs`'s static
+      vertices already carry, so the matrix and the mesh agree on units without either
+      duplicating the other's constant. `Renderer::set_view_proj` is now the buffer's only
+      writer — the camera itself lives in `app` (it needs winit events; `render` stays
+      winit-free per ADR-002/M0's dependency-direction check), so `Renderer::reconfigure` no
+      longer touches the view-proj buffer at all on resize (the app's `Resized` handler calls
+      `Camera::resize` + `set_view_proj` synchronously, before the next frame, so nothing stale
+      is ever presented). `app::window`'s `App` gained a `Camera`, drag/wheel handling
+      (`CursorMoved`/`MouseInput`/`MouseWheel`), and per-frame `dt_s` tracking so `Camera::update`
+      runs once per presented frame before the matrix is rebuilt and handed to the renderer.
+      Delegated in two lane-scoped pieces (geo-math-agent for `core::camera`, renderer-agent for
+      the render/app wiring, the second briefed with the first's finished API rather than
+      running in parallel, since it depends on exact method signatures) and independently
+      re-verified both: `cargo fmt --check`/`clippy --workspace --all-targets -D
+      warnings`/`test --workspace` re-run fresh after each (**369 passed, 5 ignored, 0 failed**
+      final total, +20 from 2.2b's 349 — 14 new `core::camera` tests, 6 new `render` matrix
+      tests), every changed/new file read in full, and a live run driven independently: a
+      scripted Win32 drive (`SetCursorPos`/`mouse_event`, DPI-aware per 2.2b's own lesson)
+      exercised a drag pan, inertia coasting to a stop, cursor-anchored zoom in then back out
+      (round-tripped to the same view, confirming no drift), a resize, and a clean `WM_CLOSE`
+      exit (code 0) — six screenshots confirmed the map follows the drag direction correctly on
+      both axes, no seams/cracks/missing polygons at any point (docs/13's L2-core pan/zoom-
+      inertia line), and the resize reflowed without distortion. DECISION_LOG 2.3a. Next:
+      **2.3b**, viewport→bbox exposed to the poller.)*
+- [ ] 2.3b Viewport→bbox exposed to the poller: `ingest::poller` gains a way to retarget its
+      `RegionQuery` while running; window mode (currently render-only, no ingest pipeline at
+      all) starts the poller against the camera's current viewport bbox and retargets on
+      camera settle, debounced 2 s. Depends on 2.3a.
 - [ ] 2.4 `core::sim`: interpolation/dead-reckoning worker — rayon over the live aircraft
       table at render cadence; destination-point advance from last fix (speed/track/vert
       rate); ease-out correction blend (≤ 2 s) on new fix; stale fade (60 s + 5 s); writes
