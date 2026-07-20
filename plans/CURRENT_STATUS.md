@@ -7,12 +7,26 @@
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
   open, see below — same shape as M0→M1). Items 2.1, 2.1b, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b,
-  2.5, 2.6a, 2.6b, 2.7a, 2.7b, 2.8a, 2.8b done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **2.9** (renderer smoke test, headless, wired into CI) — or the flagged
-  trail-buffer crash below, which should land before 2.10's live-run-over-a-busy-hub line is
-  attempted at whole-world zoom. Neither started; owner's call. Selection (2.8/2.8a/2.8b) is now
-  fully done — only 2.9/2.10 remain on the M2 checklist.
-- **⚠ Still open, higher-priority than 2.9/2.10: the reproducible trail-buffer crash** found live
+  2.5, 2.6a, 2.6b, 2.7a, 2.7b, 2.8a, 2.8b, 2.9 done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action: 2.10, the M2 gate** — the only item left on the checklist. The flagged
+  trail-buffer crash below should land first (or at least be addressed) before 2.10's
+  live-run-over-a-busy-hub line is attempted at whole-world zoom, since that's exactly the
+  condition that reproduces it; owner's call on order.
+- **2.9 landed:** the headless renderer smoke test (docs/10 §4), wired into CI by simply being
+  part of `cargo test --workspace` (no separate CI job needed). `Renderer` gained a private
+  `Target` enum (`Windowed` vs a `#[cfg(test)]`-only `Offscreen`) so a new
+  `Renderer::new_headless` can request a fallback adapter with no window/surface and render into
+  a plain offscreen texture — the pass-recording itself was extracted into
+  `record_draw_passes`, shared unchanged by both the windowed and headless paths, so they can't
+  drift apart. The new test renders a fixed-seed synthetic 1,000-aircraft `RenderFeed` headless
+  and asserts the non-background pixel delta over a bare-basemap baseline lands in a
+  measured-then-loosened band; `Err(RenderError::NoAdapter(_))` skips with a warning rather than
+  failing, per docs/10's own contract. `ci.yml`'s stale "no test opens ... a GPU adapter" comment
+  was corrected; no apt/Mesa step was added — both CI runners are allowed to just skip. Delegated
+  to the renderer-agent, independently re-verified (full diff read, fresh fmt/clippy/test) —
+  **515 passed, 5 ignored, 0 failed** (render 112→113, +1 over 2.8b's 514); the new test was
+  confirmed to actually *run* (not skip) on this machine via DX12 WARP. DECISION_LOG 2.9.
+- **⚠ Still open, higher-priority than 2.10: the reproducible trail-buffer crash** found live
   at 2.8a (not a selection-path bug, not touched by 2.8b either). Running window mode at
   whole-world zoom for ~2–2.5 minutes panics: `wgpu` rejects the trail vertex buffer at ~279 MiB
   against this adapter's 256 MiB `max_buffer_size`. This is the already-flagged 2.5/2.6b LOD gap
@@ -325,6 +339,64 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.9: headless renderer smoke test (docs/10 §4), wired into CI. The
+  checklist item required a headless (fallback-adapter) render of a synthetic 1,000-aircraft
+  `RenderFeed` to an offscreen texture, asserting pipeline creation/draw submission succeed and a
+  non-background pixel count lands in an expected band — skipped, not failed, when no adapter is
+  available. `Renderer`'s previously-plain `surface: wgpu::Surface<'static>`/
+  `config: wgpu::SurfaceConfiguration` fields became a private `Target` enum (`Windowed` — the
+  only variant outside test builds — or a new `#[cfg(test)]`-only `Offscreen`), since every
+  `build_*_resources` free function (basemap/trail/aircraft/label/stats-overlay/info-card) already
+  took only `&device`/`&queue`/a format/a size and never touched the surface — the windowed and
+  headless paths share pipeline construction unchanged. The one real duplication risk was the draw
+  *pass sequence* itself, solved by extracting `Renderer::record_draw_passes` (encoder + resolve
+  target in, docs/01's full pass order recorded) so both `render` (windowed, behavior/tests
+  untouched) and the new `render_headless` (`#[cfg(test)]`, returns `FrameOutcome` directly — no
+  swapchain lost/outdated/occluded states to report) draw the identical sequence with nothing to
+  drift apart. `resize`/`reconfigure`/`format`/`render` now `match` on `Target` rather than
+  `let`-`else` (clippy correctly flags a `let`-`else` as always-taken/dead in a non-test build,
+  where `Target` has exactly one variant). New `Renderer::new_headless(width, height)` requests a
+  *fallback* adapter (`force_fallback_adapter: true`, `compatible_surface: None` — never opens a
+  window) and renders into a plain `RENDER_ATTACHMENT | COPY_SRC` texture (`Rgba8Unorm`, fixed —
+  no surface to pick a format from); `read_offscreen_pixels` maps the copied-out readback buffer,
+  blocking on `device.poll(PollType::wait_indefinitely())` since test code has no event loop to
+  drive the map callback otherwise, and strips `copy_texture_to_buffer`'s required row padding.
+  The test itself builds a fixed-seed 1,000-aircraft `RenderFeed` from a hand-rolled splitmix64
+  PRNG (no `rand` dependency anywhere in this workspace, and a smoke fixture needs reproducibility,
+  not real randomness — not worth adding one for this), spread across 80% of the Web Mercator
+  extent with varied altitude buckets/categories/sources/headings and a short synthetic trail per
+  aircraft; renders it headless against an empty-feed baseline and asserts the non-background
+  pixel delta lands in `(20_000, 250_000)` of 480,000 total pixels — a band set from an actual
+  measured run on this machine's DX12 WARP fallback adapter (`aircraft_non_background = 86,817`),
+  loosened ~4x below/~3x above to absorb a different fallback adapter's AA/rounding while still
+  catching "renders nothing"/"renders garbage everywhere" outside it. `Err(RenderError::NoAdapter(_))`
+  is treated as skip (`eprintln!` + early `return`, deliberately not `#[ignore]` — the spec wants
+  the adapter attempted every run, only conditionally skipped). `.github/workflows/ci.yml`'s stale
+  comment claiming "no test opens a window or a GPU adapter" was corrected to explain the new
+  test's headless-fallback-adapter attempt and its graceful skip — **no apt/Mesa/lavapipe step was
+  added**: the simpler, correct reading of "skip-if-no-adapter" is that CI is allowed to just skip
+  (expected on `ubuntu-latest`, which has no Vulkan ICD without an apt step this job deliberately
+  doesn't take), not that CI must be given a software driver so the test runs for real; either
+  outcome (`windows-latest` may or may not expose DX12 WARP depending on the runner image) is a
+  passing CI run under this contract. "Wired into CI" needed no separate job: the test runs as
+  part of the existing `cargo test --workspace` step already in `ci.yml`. Delegated to the
+  renderer-agent (the `Target`/offscreen split is core wgpu pipeline plumbing, its stated remit).
+  **Independently re-verified rather than trusted**: both changed files (`renderer.rs`, `ci.yml` —
+  nothing else touched, confirmed via `git diff --stat`) read in full, fresh `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` all green — **515 passed, 5
+  ignored, 0 failed** (render crate 112 → 113, +1 over 2.8b's 514), matching the agent's own
+  reported count exactly. Went further than trusting the agent's own report of a real (not skipped)
+  run: re-ran the full suite fresh on this machine and confirmed
+  `renderer::tests::renderer_smoke_test_headless_1000_aircraft ... ok` with no "SKIP" line in the
+  output, i.e. it found a real adapter (DX12 WARP, `AdapterInfo { name: "Microsoft Basic Render
+  Driver", device_type: Cpu, backend: Dx12 }`) and exercised the entire headless pipeline for real
+  — adapter request → device → offscreen texture → all six draw passes → copy → map → readback —
+  not just compiled. No live network run needed (a pure offscreen/synthetic-data test, no
+  `credentials.json` involved); no credit spend. Did not touch the flagged trail-buffer crash
+  (2.8a) or start item 2.10 (the M2 gate), as scoped going in. DECISION_LOG 2.9. M2 checklist now
+  has only **2.10** (the gate) left — next: 2.10, or the trail-buffer crash first, owner's call
+  (the crash is directly relevant to 2.10's own live-run-at-whole-world-zoom line).
 
 - **2026-07-19** — M2 item 2.8b: selection render (white outline + info card), closing out
   selection (2.8/2.8a/2.8b — the M2 checklist now has only 2.9/2.10 left). **Outline**: a second,

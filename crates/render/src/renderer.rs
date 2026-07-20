@@ -698,6 +698,48 @@ impl InfoCardLayer {
     }
 }
 
+/// Where a frame's color output goes: a window's swapchain (the only path outside test code),
+/// or — behind `#[cfg(test)]`, built only by [`Renderer::new_headless`] for the renderer smoke
+/// test (docs/10 §4) — a plain offscreen texture with no presentation step at all.
+///
+/// Every `build_*_resources` free function below already takes only `&device`/`&queue`/a
+/// `format`/a size, never the surface itself, so pulling the surface/config pair out into its
+/// own type here is purely about `render`'s own frame-acquire/present step: the windowed path
+/// keeps its exact current behavior (see [`Renderer::render`]), and the offscreen path (see
+/// [`Renderer::render_headless`]) records the identical sequence of passes
+/// ([`Renderer::record_draw_passes`]) into a texture instead.
+#[derive(Debug)]
+enum Target {
+    Windowed {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
+    /// Test-only: see [`Renderer::new_headless`].
+    #[cfg(test)]
+    Offscreen(OffscreenTarget),
+}
+
+/// The renderer smoke test's offscreen color target and everything needed to read it back to
+/// the CPU after a frame — see [`Renderer::new_headless`]/[`Renderer::render_headless`].
+#[cfg(test)]
+#[derive(Debug)]
+struct OffscreenTarget {
+    /// The single-sampled color target the MSAA target resolves onto — `render_headless` copies
+    /// this into `readback_buffer` after the pass, instead of presenting it.
+    texture: wgpu::Texture,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    /// Sized for one full `width` × `height` RGBA8 frame, its rows padded to
+    /// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`] (`copy_texture_to_buffer`'s own requirement) —
+    /// see `padded_bytes_per_row`.
+    readback_buffer: wgpu::Buffer,
+    /// `width * 4` (RGBA8) rounded up to a multiple of
+    /// [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`] — computed once at construction since `width`
+    /// never changes for a headless renderer (there is no window to resize it from).
+    padded_bytes_per_row: u32,
+}
+
 /// Owns the GPU device and a window's swapchain, and paints the map.
 ///
 /// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), 2.5
@@ -708,10 +750,9 @@ impl InfoCardLayer {
 /// labels → UI overlay") now exists.
 #[derive(Debug)]
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    target: Target,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
     clear_color: wgpu::Color,
     adapter_info: wgpu::AdapterInfo,
     /// The 4x-multisampled color target every pass renders into. `render` resolves it onto the
@@ -801,7 +842,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let clear_color = color::clear_color(config.format);
-        let msaa_view = create_msaa_view(&device, &config);
+        let msaa_view = create_msaa_view(&device, config.width, config.height, config.format);
 
         // Shared by both the base-map pipelines and the aircraft pipeline's own `@group(0)`:
         // built once here so every pipeline layout is created from the *same* `BindGroupLayout`
@@ -829,10 +870,141 @@ impl Renderer {
         let info_card = build_info_card_resources(&device, &label, config.format);
 
         Ok(Self {
-            surface,
+            target: Target::Windowed { surface, config },
             device,
             queue,
-            config,
+            clear_color,
+            adapter_info: adapter.get_info(),
+            msaa_view,
+            basemap_view_proj_buffer: basemap_resources.view_proj_buffer,
+            basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
+            basemap_land: basemap_resources.land,
+            basemap_coastline: basemap_resources.coastline,
+            trail,
+            aircraft,
+            label,
+            stats_overlay,
+            info_card,
+        })
+    }
+
+    /// Headless construction for the renderer smoke test (docs/10 §4) only — never called
+    /// outside `#[cfg(test)]`. Requests a *fallback* adapter (`force_fallback_adapter: true`: a
+    /// software/CPU implementation — WARP on the DX12 backend, an LLVMpipe-class ICD on Vulkan
+    /// when one happens to be registered) with no compatible surface, so this never opens a
+    /// window and never depends on a real GPU being present — exactly the "headless wgpu
+    /// (fallback adapter)" docs/10 asks for. `Err(RenderError::NoAdapter(_))` is the *expected*
+    /// outcome on a CI runner with no fallback adapter registered (there is no dependable
+    /// software Vulkan ICD preinstalled on `ubuntu-latest`, and `force_fallback_adapter`'s WARP
+    /// path on `windows-latest` is not guaranteed either — see this crate's own CI decision log
+    /// entry); the smoke test itself treats exactly that error as "skip", per docs/10's own
+    /// "skipped, not failed" wording, not any other error this can return.
+    ///
+    /// Deviation worth documenting: `force_fallback_adapter` is filtered in `wgpu-core` by
+    /// `DeviceType::Cpu` (see that crate's `Instance::request_adapter`), which is honored
+    /// identically by every backend wgpu-core drives (DX12/Vulkan/Metal) — there is no
+    /// backend-specific divergence to work around here, just the practical point above that
+    /// *whether a CPU-type adapter exists at all* varies by runner/OS.
+    ///
+    /// Renders into a plain offscreen texture (`RENDER_ATTACHMENT | COPY_SRC`, fixed at
+    /// [`wgpu::TextureFormat::Rgba8Unorm`] — there is no surface to pick a format from, and a
+    /// non-sRGB format keeps the smoke test's own pixel readback simple: `color.rs`'s
+    /// `layer_color`/`clear_color` already pass values through unlinearized for a non-sRGB
+    /// format, so the raw bytes read back match the authored hex colors directly, no transfer
+    /// function to invert first) instead of a swapchain — see [`Renderer::render_headless`].
+    #[cfg(test)]
+    fn new_headless(width: u32, height: u32) -> Result<Self, RenderError> {
+        const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            force_fallback_adapter: true,
+            compatible_surface: None,
+            ..Default::default()
+        }))?;
+
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("look-above headless device"),
+                ..Default::default()
+            }))?;
+
+        // Same guard as `Renderer::new`'s own MSAA check, against the same docs/01 requirement
+        // — a fallback adapter is exactly the kind that might genuinely lack it.
+        let msaa_features = adapter.get_texture_format_features(FORMAT).flags;
+        if !msaa_features.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4)
+            || !msaa_features.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE)
+        {
+            return Err(RenderError::UnsupportedMsaa {
+                adapter: adapter.get_info().name.clone(),
+                format: FORMAT,
+            });
+        }
+
+        // Zero-sized textures are invalid, same floor `Renderer::new` holds for the surface.
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("look-above headless color target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // `copy_texture_to_buffer` requires each row's buffer offset to land on
+        // `COPY_BYTES_PER_ROW_ALIGNMENT` — round the true (4 bytes/pixel) row size up to it, and
+        // over-allocate the buffer to match; `read_offscreen_pixels` strips the padding back out
+        // per row when it reads this back.
+        let unpadded_bytes_per_row = width * 4;
+        let padded_bytes_per_row = unpadded_bytes_per_row
+            .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("look-above headless readback buffer"),
+            size: wgpu::BufferAddress::from(padded_bytes_per_row)
+                * wgpu::BufferAddress::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let clear_color = color::clear_color(FORMAT);
+        let msaa_view = create_msaa_view(&device, width, height, FORMAT);
+
+        let view_proj_layout = create_uniform_bind_group_layout(
+            &device,
+            wgpu::ShaderStages::VERTEX,
+            "look-above shared view-proj bind group layout",
+        );
+        let basemap_resources =
+            build_basemap_resources(&device, &view_proj_layout, FORMAT, width, height);
+        let trail = build_trail_resources(&device, &view_proj_layout, FORMAT);
+        let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, FORMAT);
+        let label = build_label_resources(&device, &queue, FORMAT);
+        let stats_overlay = build_stats_overlay_resources(&device, &label, FORMAT);
+        let info_card = build_info_card_resources(&device, &label, FORMAT);
+
+        Ok(Self {
+            target: Target::Offscreen(OffscreenTarget {
+                texture,
+                format: FORMAT,
+                width,
+                height,
+                readback_buffer,
+                padded_bytes_per_row,
+            }),
+            device,
+            queue,
             clear_color,
             adapter_info: adapter.get_info(),
             msaa_view,
@@ -916,7 +1088,11 @@ impl Renderer {
 
     /// The surface texture format the swapchain settled on.
     pub fn format(&self) -> wgpu::TextureFormat {
-        self.config.format
+        match &self.target {
+            Target::Windowed { config, .. } => config.format,
+            #[cfg(test)]
+            Target::Offscreen(offscreen) => offscreen.format,
+        }
     }
 
     /// Uploads a freshly computed view-proj matrix for the base-map passes to read this frame.
@@ -942,12 +1118,23 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
-        if (width, height) == (self.config.width, self.config.height) {
+        // Only the windowed path is ever resized (a headless renderer, test-only, is never
+        // handed to `app::window`'s resize handler). A `match` rather than a `let`-`else`: in a
+        // non-test build `Target` has only the one `Windowed` variant, and clippy correctly
+        // treats a `let`-`else` whose pattern cannot actually fail as a bug (an always-taken
+        // `else` block) — a `match` naturally stays exhaustive (and lint-clean) whether `Target`
+        // has one variant or two, so this needs no `#[cfg(test)]` of its own.
+        let config = match &mut self.target {
+            Target::Windowed { config, .. } => config,
+            #[cfg(test)]
+            Target::Offscreen(_) => return,
+        };
+        if (width, height) == (config.width, config.height) {
             return;
         }
 
-        self.config.width = width;
-        self.config.height = height;
+        config.width = width;
+        config.height = height;
         self.reconfigure();
     }
 
@@ -977,8 +1164,20 @@ impl Renderer {
         stats: Option<StatsOverlay>,
         info_card: Option<&InfoCardContent>,
     ) -> Result<FrameOutcome, RenderError> {
-        let meters_per_pixel = camera.meters_per_pixel();
-        let (frame, stale) = match self.surface.get_current_texture() {
+        // `match`, not `let`-`else` — see `Renderer::resize`'s own comment on why: in a
+        // non-test build `Target` has only the one `Windowed` variant, which would make a
+        // `let`-`else` here an always-taken (and clippy-denied) `else` block.
+        let surface = match &self.target {
+            Target::Windowed { surface, .. } => surface,
+            // Only `Renderer::new` (windowed) is ever reachable outside test code; the headless
+            // constructor (`Renderer::new_headless`, `#[cfg(test)]`-only) draws through
+            // `render_headless` instead, which never calls this method.
+            #[cfg(test)]
+            Target::Offscreen(_) => {
+                unreachable!("Renderer::render called on a non-windowed renderer")
+            }
+        };
+        let (frame, stale) = match surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             // Usable, but the swapchain no longer matches the window. Draw it anyway —
             // one imperfect frame beats a dropped one — and reconfigure after presenting,
@@ -996,6 +1195,153 @@ impl Renderer {
             CurrentSurfaceTexture::Lost => return Err(RenderError::SurfaceLost),
             CurrentSurfaceTexture::Validation => return Err(RenderError::SurfaceValidation),
         };
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("look-above frame"),
+            });
+        self.record_draw_passes(&mut encoder, &view, feed, camera, stats, info_card);
+
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+
+        if stale {
+            self.reconfigure();
+        }
+
+        Ok(FrameOutcome::Presented)
+    }
+
+    /// Draws one frame into the offscreen target built by [`Renderer::new_headless`] and copies
+    /// the resolved color attachment into its readback buffer — the offscreen analog of
+    /// [`Renderer::render`]'s frame-acquire/submit/present, minus the "present" (there is no
+    /// swapchain) and plus the copy (there is no compositor to hand the texture to instead).
+    /// [`Renderer::read_offscreen_pixels`] maps and actually reads the copied bytes back on the
+    /// CPU; kept as a separate call so a test can render, then read, without paying for a map
+    /// it might not need every frame.
+    ///
+    /// Returns `FrameOutcome` directly, not `Result<FrameOutcome, RenderError>` like
+    /// [`Renderer::render`]: unlike a swapchain frame, an offscreen texture has no
+    /// lost/outdated/occluded states to report, so — this being the one caller — there is no
+    /// error path here for a `Result` to carry.
+    #[cfg(test)]
+    fn render_headless(&mut self, feed: &RenderFeed, camera: &Camera) -> FrameOutcome {
+        let Target::Offscreen(offscreen) = &self.target else {
+            unreachable!("render_headless called on a windowed renderer");
+        };
+        // Cloning `Texture`/`Buffer` is cheap (both are `Arc`-backed handles — see e.g.
+        // `build_stats_overlay_resources`'s own doc comment on the same point for
+        // `RenderPipeline`/`BindGroup`), and doing it here ends the immutable borrow of
+        // `self.target` before `record_draw_passes` below needs `&mut self`.
+        let texture = offscreen.texture.clone();
+        let view = offscreen
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let (width, height, padded_bytes_per_row) = (
+            offscreen.width,
+            offscreen.height,
+            offscreen.padded_bytes_per_row,
+        );
+        let readback_buffer = offscreen.readback_buffer.clone();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("look-above headless frame"),
+            });
+        self.record_draw_passes(&mut encoder, &view, feed, camera, None, None);
+
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(Some(encoder.finish()));
+
+        FrameOutcome::Presented
+    }
+
+    /// Maps [`OffscreenTarget::readback_buffer`] and copies it into a flat, row-major, per-pixel
+    /// RGBA `Vec` (padding stripped) — call only after [`Renderer::render_headless`] has actually
+    /// run the copy for the frame being read.
+    ///
+    /// Blocks on `self.device.poll` with an indefinite wait: this is test-only code with no
+    /// event loop to drive the map callback otherwise (see [`wgpu::Buffer::map_async`]'s own doc
+    /// comment on what has to poll it).
+    #[cfg(test)]
+    fn read_offscreen_pixels(&self) -> Vec<[u8; 4]> {
+        let Target::Offscreen(offscreen) = &self.target else {
+            unreachable!("read_offscreen_pixels called on a windowed renderer");
+        };
+        let (width, height, padded_bytes_per_row) = (
+            offscreen.width,
+            offscreen.height,
+            offscreen.padded_bytes_per_row,
+        );
+
+        let slice = offscreen.readback_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            // The receiver always outlives this callback (it is not dropped until after
+            // `device.poll` returns below), so a failed send would mean wgpu invoked the
+            // callback twice — a wgpu bug, not something this test needs to handle gracefully.
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("polling the headless device for the readback map");
+        rx.recv()
+            .expect("map_async's callback ran before device.poll returned")
+            .expect("the readback buffer mapped successfully");
+
+        let mapped = slice
+            .get_mapped_range()
+            .expect("the buffer is mapped at this point");
+        let mut pixels = Vec::with_capacity((width * height) as usize);
+        for row in 0..height {
+            let row_start = (row * padded_bytes_per_row) as usize;
+            for col in 0..width {
+                let px = row_start + (col * 4) as usize;
+                pixels.push([mapped[px], mapped[px + 1], mapped[px + 2], mapped[px + 3]]);
+            }
+        }
+        drop(mapped);
+        offscreen.readback_buffer.unmap();
+        pixels
+    }
+
+    /// Uploads this frame's dynamic GPU state (glyph scale, trail/aircraft/label geometry, the
+    /// optional F3 HUD and info-card text) and records docs/01's full draw order — background
+    /// clear, base map, trails, aircraft, labels, HUD, info card — into `encoder`, resolving onto
+    /// `resolve_target`. Shared by [`Renderer::render`] (the windowed swapchain path) and
+    /// [`Renderer::render_headless`] (the renderer smoke test's offscreen path, `#[cfg(test)]`)
+    /// so the two draw exactly the same pass sequence with nothing duplicated to drift apart.
+    fn record_draw_passes(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        resolve_target: &wgpu::TextureView,
+        feed: &RenderFeed,
+        camera: &Camera,
+        stats: Option<StatsOverlay>,
+        info_card: Option<&InfoCardContent>,
+    ) {
+        let meters_per_pixel = camera.meters_per_pixel();
 
         // Both writes below are queue uploads, not render-pass work — they must land before the
         // pass's draw call reads them, which the queue's own call-order guarantee satisfies as
@@ -1023,69 +1369,50 @@ impl Renderer {
         };
         let info_card_count = self.info_card.upload(&self.device, &self.queue, info_card);
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("look-above frame"),
-            });
+        // The pass renders into the 4x MSAA target and resolves onto `resolve_target` on submit
+        // — plumbing the aircraft, trail, and label passes 2.4+ hang off this same attachment.
+        // The multisampled contents themselves are never read back, hence `Discard`; only the
+        // resolved view needs to survive (to present, in `render`; to be copied out, in
+        // `render_headless`).
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("background + base map"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.msaa_view,
+                depth_slice: None,
+                resolve_target: Some(resolve_target),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.clear_color),
+                    store: wgpu::StoreOp::Discard,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
 
-        {
-            // The pass renders into the 4x MSAA target and resolves onto the swapchain view on
-            // submit — plumbing the aircraft, trail, and label passes 2.4+ hang off this same
-            // attachment. The multisampled contents themselves are never read back, hence
-            // `Discard`; only the resolved swapchain view needs to survive to present.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("background + base map"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    depth_slice: None,
-                    resolve_target: Some(&view),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
-            // glyphs (2.5; a selected one's own outline instance is packed first among them —
-            // 2.8b), then labels (2.7b), then the F3 debug HUD (2.1b), then the selected-aircraft
-            // info card (2.8b) last of all, on top of everything else.
-            self.basemap_land
-                .draw(&mut pass, &self.basemap_view_proj_bind_group);
-            self.basemap_coastline
-                .draw(&mut pass, &self.basemap_view_proj_bind_group);
-            self.trail.draw(
-                &mut pass,
-                &self.basemap_view_proj_bind_group,
-                trail_vertex_count,
-            );
-            self.aircraft.draw(
-                &mut pass,
-                &self.basemap_view_proj_bind_group,
-                instance_count,
-            );
-            self.label
-                .draw(&mut pass, label_text_count, label_leader_count);
-            self.stats_overlay.draw(&mut pass, stats_overlay_count);
-            self.info_card.draw(&mut pass, info_card_count);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
-
-        if stale {
-            self.reconfigure();
-        }
-
-        Ok(FrameOutcome::Presented)
+        // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
+        // glyphs (2.5; a selected one's own outline instance is packed first among them —
+        // 2.8b), then labels (2.7b), then the F3 debug HUD (2.1b), then the selected-aircraft
+        // info card (2.8b) last of all, on top of everything else.
+        self.basemap_land
+            .draw(&mut pass, &self.basemap_view_proj_bind_group);
+        self.basemap_coastline
+            .draw(&mut pass, &self.basemap_view_proj_bind_group);
+        self.trail.draw(
+            &mut pass,
+            &self.basemap_view_proj_bind_group,
+            trail_vertex_count,
+        );
+        self.aircraft.draw(
+            &mut pass,
+            &self.basemap_view_proj_bind_group,
+            instance_count,
+        );
+        self.label
+            .draw(&mut pass, label_text_count, label_leader_count);
+        self.stats_overlay.draw(&mut pass, stats_overlay_count);
+        self.info_card.draw(&mut pass, info_card_count);
     }
 
     /// Rebuild the swapchain from the current config, and everything tied to the surface size
@@ -1101,28 +1428,41 @@ impl Renderer {
     /// value written (either the seed in `build_basemap_resources` or the app's most recent
     /// `set_view_proj`) stays valid until the app's own resize handler overwrites it a moment
     /// later.
+    ///
+    /// Windowed-only, like `resize` itself — see that method's own comment on why this is a
+    /// `match`, not a `let`-`else`.
     fn reconfigure(&mut self) {
-        self.surface.configure(&self.device, &self.config);
-        self.msaa_view = create_msaa_view(&self.device, &self.config);
+        let (surface, config) = match &self.target {
+            Target::Windowed { surface, config } => (surface, config),
+            #[cfg(test)]
+            Target::Offscreen(_) => return,
+        };
+        surface.configure(&self.device, config);
+        self.msaa_view = create_msaa_view(&self.device, config.width, config.height, config.format);
     }
 }
 
-/// Build the multisampled color target `render` draws into for one swapchain configuration.
+/// Build the multisampled color target `render`/`render_headless` draw into, for one target
+/// size/format — a plain `(width, height, format)` triple rather than a whole
+/// `&wgpu::SurfaceConfiguration` so [`Renderer::new_headless`] (which has no surface, and so no
+/// `SurfaceConfiguration`) can build one too.
 fn create_msaa_view(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
 ) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("look-above msaa color target"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: SAMPLE_COUNT,
         dimension: wgpu::TextureDimension::D2,
-        format: config.format,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -2202,5 +2542,235 @@ mod tests {
                 assert!(value.is_finite());
             }
         }
+    }
+
+    // --- Renderer smoke test (docs/10 §4, M2 item 2.9) ------------------------------------------
+
+    use look_above_core::contracts::AircraftCategory;
+    use look_above_core::geo::MercatorXy;
+    use look_above_core::sim::AltitudeBucket;
+    use look_above_core::types::{CallSign, SourceId};
+
+    const SMOKE_TEST_WIDTH: u32 = 800;
+    const SMOKE_TEST_HEIGHT: u32 = 600;
+    const SMOKE_TEST_AIRCRAFT_COUNT: usize = 1_000;
+
+    /// A tiny deterministic PRNG (splitmix64) for the synthetic feed below. This workspace has
+    /// no `rand` dependency (`CLAUDE.md`'s "no new dependency for something this small"), and a
+    /// fixed-seed reproducible spread is all a smoke test's synthetic fixture needs — not
+    /// statistically rigorous randomness.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// A pseudo-random value in `[0, 1)`, the top 53 bits of [`Lcg::next_u64`] as an exact
+        /// `f64` fraction.
+        fn next_unit(&mut self) -> f64 {
+            // `next_u64() >> 11` is exactly 53 bits, and `1u64 << 53` is an exact power of two
+            // — both fit `f64`'s 53-bit mantissa exactly, so this narrowing loses nothing.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "both operands are exact integers within f64's 53-bit mantissa range"
+            )]
+            {
+                (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+            }
+        }
+
+        fn next_range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + self.next_unit() * (hi - lo)
+        }
+    }
+
+    /// Builds a fixed-seed, deterministic 1,000-aircraft [`RenderFeed`] spread across a
+    /// plausible Web Mercator range, with varied altitude buckets/headings/categories/sources and
+    /// a handful of trail vertices per aircraft (so the trail pass isn't trivially empty) —
+    /// docs/10 §4's synthetic fixture for the renderer smoke test below.
+    fn synthetic_render_feed() -> RenderFeed {
+        const ALTITUDE_BUCKETS: [AltitudeBucket; 6] = [
+            AltitudeBucket::Ground,
+            AltitudeBucket::Below2000Ft,
+            AltitudeBucket::To10000Ft,
+            AltitudeBucket::To28000Ft,
+            AltitudeBucket::To40000Ft,
+            AltitudeBucket::Above40000Ft,
+        ];
+        const CATEGORIES: [AircraftCategory; 6] = [
+            AircraftCategory::Jet,
+            AircraftCategory::Turboprop,
+            AircraftCategory::Piston,
+            AircraftCategory::Heli,
+            AircraftCategory::Glider,
+            AircraftCategory::Unknown,
+        ];
+        const SOURCES: [SourceId; 3] = [
+            SourceId::OpenSky,
+            SourceId::AirplanesLive,
+            SourceId::AdsbLol,
+        ];
+        // A short synthetic trail history per aircraft, near its own current position — enough
+        // real geometry for the ribbon pass to tessellate, not a literal replay of `sim`'s own
+        // dead-reckoning (out of scope for a renderer-only fixture).
+        const TRAIL_AGES_S: [f64; 5] = [0.0, 10.0, 20.0, 30.0, 40.0];
+
+        // Comfortably inside the Mercator square, not right at its edge (where a "contain"-fit
+        // default camera would clip) — a realistic spread, not an edge case.
+        let position_extent_m = WEB_MERCATOR_EXTENT_M * 0.8;
+
+        let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+        let mut aircraft = Vec::with_capacity(SMOKE_TEST_AIRCRAFT_COUNT);
+        let mut trails = Vec::with_capacity(SMOKE_TEST_AIRCRAFT_COUNT * TRAIL_AGES_S.len());
+
+        for i in 0..SMOKE_TEST_AIRCRAFT_COUNT {
+            // Zero-padded hex, ascending with `i` — already in the address-sorted order
+            // `core::sim::RenderFeed`'s own doc comment documents `aircraft`/`trails` as kept
+            // in, so this needs no separate sort.
+            let icao24 = Icao24::from_hex(&format!("{i:06x}")).expect("valid synthetic ICAO24");
+            let bucket = ALTITUDE_BUCKETS[i % ALTITUDE_BUCKETS.len()];
+            let category = CATEGORIES[i % CATEGORIES.len()];
+            let source = SOURCES[i % SOURCES.len()];
+
+            let x_m = rng.next_range(-position_extent_m, position_extent_m);
+            let y_m = rng.next_range(-position_extent_m, position_extent_m);
+            let heading_deg = rng.next_range(0.0, 360.0);
+            let altitude_ft = rng.next_range(0.0, 45_000.0);
+            let ground_speed_kt = rng.next_range(80.0, 550.0);
+
+            aircraft.push(AircraftInstance {
+                icao24,
+                position: MercatorXy::new(x_m, y_m),
+                heading_deg,
+                altitude_bucket: bucket,
+                category,
+                alpha: 1.0,
+                on_ground: bucket == AltitudeBucket::Ground,
+                anonymous: false,
+                callsign: CallSign::new(&format!("TST{i:04}")),
+                altitude_ft: Some(altitude_ft),
+                ground_speed_kt: Some(ground_speed_kt),
+                selected: i == 0,
+                source,
+            });
+
+            for &age_s in &TRAIL_AGES_S {
+                let offset_m = (age_s / 10.0) * 400.0;
+                trails.push(TrailVertex {
+                    icao24,
+                    position: MercatorXy::new(x_m - offset_m, y_m - offset_m * 0.5),
+                    altitude_bucket: bucket,
+                    age_s,
+                });
+            }
+        }
+
+        RenderFeed {
+            frame_ts: 1_700_000_000.0,
+            aircraft,
+            trails,
+        }
+    }
+
+    /// `color`'s channels as the `u8` bytes an `Rgba8Unorm` surface actually stores them as
+    /// (the headless smoke test's fixed offscreen format — see [`Renderer::new_headless`]) —
+    /// used to recognize "background" pixels in the readback below.
+    fn color_bytes(color: wgpu::Color) -> [u8; 4] {
+        // Every channel `color::clear_color` produces is already in `[0, 1]` by construction
+        // (an authored sRGB byte divided by 255) — the same narrowing `color.rs`'s own
+        // `layer_color` does down to `f32`, just one step further to the GPU's actual 8-bit
+        // storage.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "each channel is clamped to [0, 1] before scaling by 255, so the rounded \
+                      result always fits u8"
+        )]
+        let channel = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [
+            channel(color.r),
+            channel(color.g),
+            channel(color.b),
+            channel(color.a),
+        ]
+    }
+
+    fn count_non_background(pixels: &[[u8; 4]], background: [u8; 4]) -> usize {
+        pixels.iter().filter(|&&pixel| pixel != background).count()
+    }
+
+    /// docs/10 §4's renderer smoke test: a headless (fallback-adapter) render of a synthetic
+    /// 1,000-aircraft [`RenderFeed`] to an offscreen texture, asserting pipeline creation
+    /// succeeds, `render_headless` reports a drawn frame (not an error), and the pixel count the
+    /// aircraft/trails/labels add over the bare base map falls within an expected band — wide
+    /// enough not to be flaky, tight enough to still catch "renders nothing" (≈0 added) and
+    /// "renders garbage everywhere" (≈the whole frame added).
+    ///
+    /// Skips (with a warning, not a failure) when no fallback adapter is available — the expected
+    /// outcome on most CI runners today (see [`Renderer::new_headless`]'s own doc comment and
+    /// this crate's CI decision log entry).
+    #[test]
+    fn renderer_smoke_test_headless_1000_aircraft() {
+        let mut renderer = match Renderer::new_headless(SMOKE_TEST_WIDTH, SMOKE_TEST_HEIGHT) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(error)) => {
+                eprintln!(
+                    "SKIP renderer_smoke_test_headless_1000_aircraft: no fallback GPU adapter \
+                     available ({error}) — see docs/10 §4's \"skipped, not failed\" wording"
+                );
+                return;
+            }
+            Err(error) => panic!("headless renderer setup failed: {error}"),
+        };
+
+        let camera = Camera::new(SMOKE_TEST_WIDTH, SMOKE_TEST_HEIGHT);
+        let background = color_bytes(color::clear_color(renderer.format()));
+
+        // Baseline: the base map alone (background + land + coastline), no aircraft — this
+        // isolates what the 1,000-aircraft feed itself adds below, rather than needing to
+        // predict the (static, real-world-coastline-derived) base map's own pixel footprint.
+        let empty_feed = RenderFeed {
+            frame_ts: 0.0,
+            ..RenderFeed::default()
+        };
+        let baseline_outcome = renderer.render_headless(&empty_feed, &camera);
+        assert_eq!(baseline_outcome, FrameOutcome::Presented);
+        let baseline_pixels = renderer.read_offscreen_pixels();
+        let baseline_non_background = count_non_background(&baseline_pixels, background);
+
+        let feed = synthetic_render_feed();
+        let outcome = renderer.render_headless(&feed, &camera);
+        assert_eq!(outcome, FrameOutcome::Presented);
+        let pixels = renderer.read_offscreen_pixels();
+        let expected_pixel_count = (SMOKE_TEST_WIDTH * SMOKE_TEST_HEIGHT) as usize;
+        assert_eq!(pixels.len(), expected_pixel_count);
+        let non_background = count_non_background(&pixels, background);
+
+        // Band chosen from an actual run of this test on the DX12 WARP fallback adapter
+        // (`AdapterInfo { name: "Microsoft Basic Render Driver", device_type: Cpu, backend: \
+        // Dx12, .. }`), which measured `aircraft_non_background = 86,817` (of 480,000 total,
+        // `baseline_non_background = 146,868`) — see this crate's own CI decision log entry.
+        // `[20_000, 250_000)` keeps roughly a 4x margin below that measurement and a 3x margin
+        // above it: loose enough to absorb a different fallback adapter's own AA/rounding
+        // behavior, tight enough that "renders nothing" (≈0) and "renders garbage everywhere"
+        // (≈333,132, the frame's non-baseline pixels) both land clearly outside it.
+        let aircraft_non_background = non_background.saturating_sub(baseline_non_background);
+        assert!(
+            aircraft_non_background > 20_000,
+            "1,000 aircraft painted implausibly few pixels ({aircraft_non_background}) over the \
+             base map alone ({baseline_non_background} of {expected_pixel_count}) — looks like \
+             \"renders nothing\""
+        );
+        assert!(
+            aircraft_non_background < 250_000,
+            "1,000 aircraft painted implausibly many pixels ({aircraft_non_background}) over the \
+             base map alone ({baseline_non_background} of {expected_pixel_count}) — looks like \
+             \"renders garbage everywhere\""
+        );
     }
 }

@@ -32,9 +32,20 @@ jobs:
 
       # No apt step: winit/wgpu reach X11, Wayland and Vulkan through dlopen, and x11-dl's
       # build script treats a missing pkg-config entry as "probe later". Nothing here links
-      # a system windowing library at build time, and no test opens a window or a GPU
-      # adapter, so the runner needs no display stack. If that changes, this is the step
-      # that has to come back.
+      # a system windowing library at build time, and no test opens a window, so the runner
+      # needs no display stack.
+      #
+      # One test (crates/render's renderer smoke test, docs/10 §4) does attempt to open a
+      # headless *fallback* GPU adapter (`force_fallback_adapter: true`, no window/surface) —
+      # but it is written to skip itself, with a warning rather than a failure, whenever
+      # `request_adapter` finds none (see `Renderer::new_headless`'s own doc comment). Neither
+      # runner is guaranteed one: `ubuntu-latest` has no Vulkan ICD registered at all without an
+      # apt step this job deliberately doesn't take (there is nothing here to add a software one
+      # like Mesa's lavapipe, so it skips); `windows-latest` may or may not expose the DX12 WARP
+      # software adapter depending on the runner image, so it either runs for real or skips too
+      # — either way is a passing CI run, per docs/10 §4's own "skipped, not failed" contract, so
+      # there is no apt step to add here just to force it to run instead of skip. If a test ever
+      # needs a *window* (not just a headless adapter), that is what would bring this step back.
       - name: Install pinned toolchain
         # Reads rust-toolchain.toml: channel + rustfmt/clippy.
         run: rustup toolchain install

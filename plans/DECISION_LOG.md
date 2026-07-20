@@ -2308,3 +2308,63 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   whole-world poll cycle each, 4 credits/cycle per 2.4b/2.5's own figures — 8 total this item),
   plus the isolated synthetic harness (no network, 0 credits). Scratch `look_above.db` deleted
   after each per 1.12/1.13's convention.
+
+## 2026-07-19 — M2 item 2.9: headless renderer smoke test, wired into CI
+
+- **`Renderer`'s `surface`/`config` fields became a private `Target` enum** (`Windowed` — the
+  only variant outside test builds — or a `#[cfg(test)]`-only `Offscreen`) rather than adding a
+  second, parallel renderer type: every `build_*_resources` free function already took only
+  `&device`/`&queue`/a format/a size, never the surface, so the windowed and headless paths
+  share pipeline construction unchanged, and the only real duplication risk was the *draw pass
+  sequence* — solved by extracting `Renderer::record_draw_passes` (shared by `render` and the
+  new `render_headless`) so the two can never drift apart on docs/01's draw order. `resize`/
+  `reconfigure`/`render`/`format` all match on `Target` rather than `let`-`else`: in a non-test
+  build `Target` has exactly one variant, and clippy correctly flags a `let`-`else` there as an
+  always-taken (dead) `else` branch — `match` stays exhaustive and lint-clean regardless of how
+  many variants exist.
+- **`Renderer::new_headless(width, height)`** (`#[cfg(test)]`, crate-private) requests a
+  *fallback* adapter (`force_fallback_adapter: true`, `compatible_surface: None`) — docs/10 §4's
+  own "headless wgpu (fallback adapter)" wording — never opening a window, and renders into a
+  plain `RENDER_ATTACHMENT | COPY_SRC` texture (`Rgba8Unorm`, fixed — there is no surface to pick
+  a format from) instead of a swapchain. `render_headless` returns `FrameOutcome` directly, not
+  `Result`, since an offscreen texture has none of a swapchain's lost/outdated/occluded states to
+  report. `read_offscreen_pixels` maps the copied-out readback buffer and blocks on
+  `device.poll(PollType::wait_indefinitely())` (test-only code, no event loop to drive the map
+  callback otherwise), stripping `copy_texture_to_buffer`'s required row padding back out.
+- **The smoke test** (`renderer::tests::renderer_smoke_test_headless_1000_aircraft`) builds a
+  fixed-seed, deterministic 1,000-aircraft `RenderFeed` (splitmix64 PRNG hand-rolled inline —
+  this workspace has no `rand` dependency, and a reproducible spread is all a smoke fixture
+  needs, not real randomness; per CLAUDE.md, not worth a new dependency for this) spread across
+  80% of the Web Mercator extent with varied altitude buckets/categories/sources/headings and a
+  short synthetic trail per aircraft (so the trail pass isn't trivially empty), renders it
+  headless against an empty-feed baseline, and asserts the non-background pixel delta the 1,000
+  aircraft add lands in `(20_000, 250_000)` of 480,000 total pixels (800×600) — the band is from
+  an actual measured run on this machine's DX12 WARP fallback adapter (`aircraft_non_background =
+  86,817`), kept loose (~4x margin below, ~3x above) to absorb a different fallback adapter's own
+  AA/rounding behavior while still catching "renders nothing" (≈0) or "renders garbage
+  everywhere" (≈the whole non-baseline frame) outside the band. `Err(RenderError::NoAdapter(_))`
+  is treated as skip (`eprintln!` + early `return`), per docs/10's own "skipped, not failed"
+  wording — deliberately not `#[ignore]`, since the spec wants the adapter attempted every run
+  and only conditionally skipped, not permanently excluded.
+- **`.github/workflows/ci.yml`'s comment updated, no apt step added.** The prior comment claimed
+  "no test opens a window or a GPU adapter" to justify the runner needing no display stack; that
+  became false the moment this test exists, so the comment was corrected to explain the new test
+  attempts a headless fallback adapter but is written to skip itself (not fail) when none is
+  found — the simpler, correct reading of "skip-if-no-adapter" is that CI is allowed to just
+  skip, not that CI must be given a software Vulkan ICD (e.g. Mesa lavapipe) so the test can run
+  for real. Concrete finding: `ubuntu-latest` has no Vulkan ICD registered without an apt step
+  this job deliberately doesn't take, so it is expected to skip; `windows-latest` may or may not
+  expose DX12 WARP depending on the runner image, so it either runs for real or skips too —
+  either outcome is a passing CI run under this contract.
+- Delegated to the renderer-agent (the `Target`/offscreen split is core wgpu pipeline plumbing,
+  its stated remit). Independently re-verified rather than trusted: both changed files
+  (`renderer.rs`, `ci.yml` — nothing else touched) read in full, fresh `cargo fmt --check`/
+  `clippy --workspace --all-targets -D warnings`/`test --workspace` re-run — **515 passed, 5
+  ignored, 0 failed** (render crate 112 → 113, +1 over 2.8b's 514), matching the agent's own
+  reported count. The new test was independently confirmed to actually *run*, not skip, on this
+  machine (DX12 WARP fallback adapter found — `AdapterInfo { name: "Microsoft Basic Render
+  Driver", device_type: Cpu, backend: Dx12 }`), so the whole headless pipeline (adapter → device
+  → offscreen texture → all six passes → copy → map → readback) was exercised for real, not just
+  compiled. No live network run needed (a pure offscreen/synthetic-data test); no credit spend.
+  The flagged trail-buffer crash (2.8a) and item 2.10 (the M2 gate) were both left untouched, as
+  scoped. M2 checklist now has only **2.10** (the gate) left.

@@ -630,7 +630,38 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       white ring around only the selected glyph. Raw lat/lon "position data" text for an anonymous
       card is deferred (would need to widen `label_atlas::CHARSET`), flagged for the M2 gate
       (2.10) to check against docs/13 directly. DECISION_LOG 2.8b.)*
-- [ ] 2.9 Renderer smoke test (headless, per docs/10 §4) wired into CI (skip-if-no-adapter).
+- [x] 2.9 Renderer smoke test (headless, per docs/10 §4) wired into CI (skip-if-no-adapter).
+      *(2026-07-19: implemented — `Renderer` gained a private `Target` enum (`Windowed` vs a
+      `#[cfg(test)]`-only `Offscreen`) replacing its plain `surface`/`config` fields, and a
+      `#[cfg(test)]` `Renderer::new_headless(width, height)` that requests a *fallback* adapter
+      (`force_fallback_adapter: true`, `compatible_surface: None` — never opens a window) and
+      renders into a plain `RENDER_ATTACHMENT | COPY_SRC` texture instead of a swapchain. Every
+      `build_*_resources` free function already took only `&device`/`&queue`/format/size, never
+      the surface, so the windowed and headless paths share them unchanged; the actual
+      pass-recording was extracted into `Renderer::record_draw_passes` so both `render`
+      (windowed) and the new `render_headless` draw the identical docs/01 pass sequence with
+      nothing duplicated to drift apart — the windowed path's own behavior/tests are untouched.
+      The smoke test itself (`renderer::tests::renderer_smoke_test_headless_1000_aircraft`)
+      builds a fixed-seed (splitmix64 PRNG, no new `rand` dependency), 1,000-aircraft
+      `RenderFeed` spread across the Mercator extent with varied altitude/category/source and
+      trail history, renders it headless, and asserts the non-background pixel count it adds
+      over a bare-basemap baseline lands in `(20_000, 250_000)` of 480,000 total pixels — wide
+      enough not to be flaky, tight enough to catch "renders nothing"/"renders garbage
+      everywhere". `Err(RenderError::NoAdapter(_))` from `new_headless` is treated as skip
+      (`eprintln!` + early `return`, not `#[ignore]`), per docs/10's own "skipped, not failed"
+      wording. `.github/workflows/ci.yml`'s stale "no test opens ... a GPU adapter" comment
+      (above the deliberately-absent apt step) was corrected to explain the new test attempts a
+      headless fallback adapter but skips itself gracefully when none is found — no apt/Mesa/
+      lavapipe step was added; `ubuntu-latest` is expected to skip, `windows-latest` may or may
+      not find DX12 WARP depending on the runner image, and either outcome is a passing CI run.
+      Delegated to the renderer-agent (the headless/offscreen `Target` split is core wgpu
+      pipeline plumbing, its stated remit), independently re-verified: full diff read
+      (`renderer.rs`, `ci.yml` — only two files changed), fresh `cargo fmt --check`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace` all green —
+      **515 passed, 5 ignored, 0 failed** (render crate 112 → 113, +1 over 2.8b's 514), and the
+      new test was independently confirmed to actually *run* (not skip) on this machine — DX12
+      WARP fallback adapter found, real render/readback executed end to end, not just compiled.
+      DECISION_LOG 2.9.)*
 - [ ] 2.10 Gate: live run over a busy hub; visual QA §L2-core; frame-stats evidence; human review.
 
 ## Design notes
