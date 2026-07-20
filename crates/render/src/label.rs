@@ -88,10 +88,48 @@ const SELECTED_PRIORITY_WEIGHT: f64 = 1.0e12;
 
 // ---- Content (M2 item 2.7a → 2.7b) -----------------------------------------------------------
 
+/// Flight level: hundreds of feet, rounded — the skill's "FL350" for 35,000 ft (and,
+/// deliberately, "FL0" for 0 ft while on the ground, since that is real data too).
+///
+/// `pub(crate)`, not private: [`crate::info_card`] (M2 item 2.8b) reuses this exact formatting for
+/// the selected-aircraft info card's altitude line rather than duplicating it.
+pub(crate) fn format_flight_level(altitude_ft: f64) -> String {
+    let flight_level = (altitude_ft / 100.0).round().max(0.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "flight_level is a rounded, non-negative value derived from a real-world \
+                  altitude (at most tens of thousands of feet); far inside i64's range"
+    )]
+    let flight_level = flight_level as i64;
+    format!("FL{flight_level}")
+}
+
+/// Ground speed, whole knots — see [`format_flight_level`]'s own doc comment on why this is
+/// `pub(crate)` (shared with [`crate::info_card`]).
+pub(crate) fn format_speed_kt(ground_speed_kt: f64) -> String {
+    let rounded = ground_speed_kt.round().max(0.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded is a non-negative, real-world ground speed in knots; far inside i64's \
+                  range"
+    )]
+    let rounded = rounded as i64;
+    format!("{rounded}kt")
+}
+
 /// Builds a label's text from `instance`'s 2.7a content fields, or `None` if it should not be
-/// labeled at all: an anonymous (PIA/blocked) target is never labeled, no exception (privacy rule
-/// 2.2 — there is no selection yet to except it into "Unidentified", that wiring is 2.8's job),
-/// and an instance with nothing known (no callsign, altitude, or speed) has no content to show.
+/// labeled at all.
+///
+/// An anonymous (PIA/blocked) target is never labeled *unless selected*: privacy rule 2.2 permits
+/// searching for and selecting a specific aircraft of interest (`selection::hit_test`'s own doc
+/// comment), and once selected, the skill's own content spec has an exception — "anonymous
+/// targets get no label unless selected → 'Unidentified'". Rule 2.2 itself caps what a selected
+/// anonymous target may show ("position/altitude only"): no callsign (it never really has one —
+/// this branch does not even look at `instance.callsign`, so an upstream glitch that somehow
+/// attached one still cannot leak through here) and no speed, only altitude if known. An instance
+/// with nothing known at all (no callsign, altitude, or speed) has no content to show.
 ///
 /// Present fields join with the skill's two-space separator (`"CALLSIGN  FL350  450kt"`);
 /// unknown fields are omitted entirely, never printed as a placeholder. Altitude is still shown
@@ -99,7 +137,14 @@ const SELECTED_PRIORITY_WEIGHT: f64 = 1.0e12;
 /// unknown) — this is the one place that distinction actually matters for display.
 pub fn format_label_text(instance: &AircraftInstance) -> Option<String> {
     if instance.anonymous {
-        return None;
+        if !instance.selected {
+            return None;
+        }
+        let mut pieces = vec!["UNIDENTIFIED".to_owned()];
+        if let Some(altitude_ft) = instance.altitude_ft {
+            pieces.push(format_flight_level(altitude_ft));
+        }
+        return Some(pieces.join("  "));
     }
 
     let mut pieces: Vec<String> = Vec::new();
@@ -107,26 +152,10 @@ pub fn format_label_text(instance: &AircraftInstance) -> Option<String> {
         pieces.push(callsign.as_str().to_owned());
     }
     if let Some(altitude_ft) = instance.altitude_ft {
-        // Flight level: hundreds of feet, rounded — the skill's "FL350" for 35,000 ft (and,
-        // deliberately, "FL0" for 0 ft while on the ground, since that is real data too).
-        let flight_level = (altitude_ft / 100.0).round().max(0.0);
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "flight_level is a rounded, non-negative value derived from a real-world \
-                      altitude (at most tens of thousands of feet); far inside i64's range"
-        )]
-        pieces.push(format!("FL{}", flight_level as i64));
+        pieces.push(format_flight_level(altitude_ft));
     }
     if let Some(ground_speed_kt) = instance.ground_speed_kt {
-        let rounded = ground_speed_kt.round().max(0.0);
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "rounded is a non-negative, real-world ground speed in knots; far inside \
-                      i64's range"
-        )]
-        pieces.push(format!("{}kt", rounded as i64));
+        pieces.push(format_speed_kt(ground_speed_kt));
     }
 
     if pieces.is_empty() {
@@ -682,6 +711,7 @@ mod tests {
 
     use look_above_core::contracts::AircraftCategory;
     use look_above_core::sim::AltitudeBucket;
+    use look_above_core::types::SourceId;
 
     use super::*;
 
@@ -705,6 +735,7 @@ mod tests {
             altitude_ft: Some(35_000.0),
             ground_speed_kt: Some(450.0),
             selected: false,
+            source: SourceId::OpenSky,
         }
     }
 
@@ -769,6 +800,31 @@ mod tests {
         let mut instance = full_instance();
         instance.anonymous = true;
         assert_eq!(format_label_text(&instance), None);
+    }
+
+    #[test]
+    fn a_selected_anonymous_target_is_labeled_unidentified_with_altitude_only() {
+        let mut instance = full_instance();
+        instance.anonymous = true;
+        instance.selected = true;
+        assert_eq!(
+            format_label_text(&instance).as_deref(),
+            Some("UNIDENTIFIED  FL350"),
+            "privacy rule 2.2: a selected anonymous target shows only its altitude, never its \
+             callsign or speed"
+        );
+    }
+
+    #[test]
+    fn a_selected_anonymous_target_with_no_known_altitude_shows_only_unidentified() {
+        let mut instance = full_instance();
+        instance.anonymous = true;
+        instance.selected = true;
+        instance.altitude_ft = None;
+        assert_eq!(
+            format_label_text(&instance).as_deref(),
+            Some("UNIDENTIFIED")
+        );
     }
 
     // ---- Projection -------------------------------------------------------------------------

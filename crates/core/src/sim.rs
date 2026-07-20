@@ -35,7 +35,7 @@ use crate::geo::{
     normalize_bearing_deg, web_mercator_forward,
 };
 use crate::merge::{DROP_AFTER_S, STALE_AFTER_S};
-use crate::types::{CallSign, Icao24, StateVector};
+use crate::types::{CallSign, Icao24, SourceId, StateVector};
 
 /// The correction-blend window, in seconds — the skill's `min(2 s, …)` cap. We do not know the
 /// exact time to the next fix (it depends on the budget-driven poll cadence), so the cap is used
@@ -171,6 +171,10 @@ pub struct AircraftInstance {
     /// speed > proximity", docs/01) — `render::label::label_priority` hardcoded this to `false`
     /// with a doc comment pointing here until this field existed.
     pub selected: bool,
+    /// Which authorized feed the current fix came from (M2 item 2.8b — the info card's `SRC`
+    /// line). Not sticky, unlike [`AircraftInstance::callsign`]: a failover mid-track is real,
+    /// current information the card should reflect, not paper over.
+    pub source: SourceId,
 }
 
 /// One point along an aircraft's trail (M2 item 2.6a) — a flat centerline sample, not yet
@@ -333,6 +337,9 @@ struct Track {
     /// Last known callsign (M2 item 2.7a). Sticky across fixes that omit it — see
     /// [`Track::apply_fix`].
     callsign: Option<CallSign>,
+    /// Which feed the current fix came from (M2 item 2.8b), carried onto
+    /// [`AircraftInstance::source`]. Not sticky — see that field's own doc comment.
+    source: SourceId,
     /// Ring buffer of displayed positions sampled at ≥ 1 Hz over the last [`TRAIL_DURATION_S`]
     /// (M2 item 2.6a) — the skill's "last 5 min of displayed positions" trail. Oldest first.
     trail: VecDeque<TrailSample>,
@@ -358,6 +365,7 @@ impl Track {
             last_fix_ts: fix.t0,
             anonymous: state.anonymous,
             callsign: state.callsign.clone(),
+            source: state.source,
             trail: VecDeque::new(),
             last_trail_sample_s: None,
         }
@@ -373,6 +381,7 @@ impl Track {
         self.fix = new_fix;
         self.last_fix_ts = new_fix.t0;
         self.anonymous = state.anonymous;
+        self.source = state.source;
         // Sticky: a fix that omits the callsign (a protocol framing gap — identification
         // messages arrive separately from position ones) must not blank out a previously known
         // one, or the label would flicker in and out with every other poll cycle.
@@ -490,6 +499,7 @@ impl Track {
             altitude_ft: alt_known.then_some(self.display.alt_m * FT_PER_M),
             ground_speed_kt: self.fix.speed_ms.map(|v| v * KT_PER_MS),
             selected,
+            source: self.source,
         };
 
         // Only recorded while the instance is actually visible this frame — an aircraft that
@@ -1154,6 +1164,38 @@ mod tests {
                 .as_ref()
                 .map(CallSign::as_str),
             Some("UAL456")
+        );
+    }
+
+    #[test]
+    fn a_first_sighting_carries_its_source_onto_the_instance() {
+        let mut sim = Simulator::new();
+        let mut s = state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST);
+        s.source = SourceId::AirplanesLive;
+        sim.ingest(&[s], 1_000.0);
+        assert_eq!(
+            sim.advance_all(1_000.0).aircraft[0].source,
+            SourceId::AirplanesLive
+        );
+    }
+
+    #[test]
+    fn a_later_fix_from_a_different_source_updates_it_unlike_the_sticky_callsign() {
+        let mut sim = Simulator::new();
+        sim.ingest(&[state("3c6444", 1_000, 0.0, 0.0, 200.0, EAST)], 1_000.0); // OpenSky
+        assert_eq!(
+            sim.advance_all(1_000.0).aircraft[0].source,
+            SourceId::OpenSky
+        );
+
+        // A failover mid-track is real, current information (2.8b's info card) — unlike
+        // callsign, this must not stay sticky to the first-seen source.
+        let mut second = state("3c6444", 1_010, 0.0, 0.0, 200.0, EAST);
+        second.source = SourceId::AdsbLol;
+        sim.ingest(&[second], 1_010.0);
+        assert_eq!(
+            sim.advance_all(1_010.0).aircraft[0].source,
+            SourceId::AdsbLol
         );
     }
 

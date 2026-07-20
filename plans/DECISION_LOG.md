@@ -2224,3 +2224,87 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   calling process itself declares `SetProcessDPIAware()` first — the same pitfall 2.2b's own
   screenshot tooling hit, re-encountered and re-fixed here rather than assumed already known by
   a fresh script.
+
+## 2026-07-19 — M2 item 2.8b (selection render: white outline + info card)
+
+- **Outline is a second, scaled-up instance packed into the same aircraft instance buffer, not a
+  second shader pass or an SDF-threshold shrink.** `AircraftLayer`'s pass has no depth test
+  (alpha-blended, painter's-algorithm draw order — same as every other M2 pass), so
+  `aircraft::pack_instances` prepends one solid-white, `SELECTION_OUTLINE_SCALE_MUL`-scaled copy
+  of the selected aircraft's own instance (same position/heading/category, so the silhouette
+  matches exactly) before the ordinary per-aircraft instances, all in one draw call. A new
+  per-instance `InstanceRaw::scale_mul: f32` (`1.0` for ordinary glyphs) multiplies
+  `aircraft.wgsl`'s existing per-frame `glyph_params.x` scale for just that one instance.
+  Considered and rejected: shrinking the SDF's `0.5`-edge threshold inward by
+  `SELECTION_OUTLINE_WIDTH_PX` worth of local-glyph-space units, which would give a true
+  uniform-width ring — but `glyph_atlas::SPREAD` is deliberately tuned tight (so adjacent atlas
+  tiles never bleed under bilinear filtering) and has no distance gradient left that far inside a
+  silhouette to threshold against; widening `SPREAD` to support it was out of scope for this item.
+  The scaled-copy approach is not a true uniform-width offset (a dart's nose scales out further
+  than its waist) but reads clearly as a highlight ring in practice — confirmed live (see below).
+- **`SELECTION_OUTLINE_SCALE_MUL` is derived at compile time from `AIRCRAFT_GLYPH_PX` and
+  `SELECTION_OUTLINE_WIDTH_PX` (2 px, the skill's own number)**, not a bare literal — Rust's
+  const float arithmetic (stable since well before this workspace's edition-2024 toolchain floor)
+  makes `((AIRCRAFT_GLYPH_PX + 2.0 * SELECTION_OUTLINE_WIDTH_PX) / AIRCRAFT_GLYPH_PX) as f32` a
+  `const`, so the two numbers can never silently drift apart if the glyph size ever changes.
+- **`core::sim` gained `AircraftInstance::source: SourceId`** (and `Track::source`, updated from
+  every fix, deliberately *not* sticky like `callsign` — a mid-track source failover is real,
+  current information the info card should reflect, not paper over) — needed because the M2
+  checklist's own 2.8b wording specifies the card's content as "callsign/alt/speed/source", and
+  no field carrying which feed a fix came from existed on the render-facing type before this item;
+  `StateVector::source` already existed (`positions.source`, docs/08) but stopped at `core::merge`.
+- **Info card content formatting lives in a new `render::info_card` module**, reusing
+  `label::format_flight_level`/`format_speed_kt` (widened from private to `pub(crate)` for
+  exactly this reuse) rather than duplicating the `FLnnn`/`nnnkt` formatting a second time, and
+  reusing `stats_overlay::pack_overlay_instances` directly for GPU packing (already generic over
+  an arbitrary line list/origin/color — the card's own shape, not a new packer). `InfoCardLayer`
+  in `renderer.rs` is *cloned* from `LabelLayer`'s pipeline/atlas/mesh/screen-params bind group,
+  the identical "one SDF text atlas, one text pipeline in the whole crate" reuse `StatsOverlayLayer`
+  established at 2.1b — only the instance buffer/scratch/color are new state. Fixed origin
+  `(10, 80)`, below the F3 HUD's own 4-line block, so the two never overlap regardless of whether
+  F3 is toggled.
+- **Privacy rule 2.2's anonymous exception is wired in `label::format_label_text` itself, not
+  duplicated in `info_card`**: an anonymous target is still never labeled *unless selected*, in
+  which case the label (and, separately, the card) show `"UNIDENTIFIED"` plus altitude only (rule
+  2.2's literal "position/altitude only") — never callsign (there isn't a real one) or speed, and
+  the check does not even read `instance.callsign`, so an upstream glitch that somehow attached
+  one still cannot leak it. This was explicitly flagged as "2.8's job" in both 2.7a's and 2.7b's
+  own doc comments/decision-log entries; closed here.
+- **Raw position (lat/lon) text for an anonymous card is deferred, not silently dropped**: docs/13's
+  fuller acceptance line asks for "position data" on an anonymous card, but no numeric
+  lat/lon-to-text formatting exists anywhere in `render` yet, and adding it would mean widening
+  `label_atlas::CHARSET` (a decimal point, a minus sign) for a feature this item's own checklist
+  wording ("callsign/alt/speed/source") does not name. Flagged for the M2 gate (2.10) to verify
+  against docs/13 directly rather than assumed satisfied here.
+- **Enrichment fields (type/operator/route) are M3's job**, per the checklist's own parenthetical
+  — `info_card` documents this in its module doc comment rather than leaving the gap implicit.
+- **Live-verified two ways, not one, after the first attempt was ambiguous.** A window-mode run
+  against the owner's real `credentials.json` (whole-world OpenSky) produced, for the first time
+  in this project's history, an actual live click landing on a *real* tracked aircraft
+  (`selected=Some(Icao24([13, 16, 120]))` — every one of 2.8a's own four attempts had missed): the
+  info card appeared with real callsign/altitude/speed/`SRC OPENSKY` content matching the clicked
+  target, and a before/after pair confirmed no card at all before the click (`info_card: None`'s
+  own path). The outline, however, was not visually distinguishable in that screenshot — the
+  click happened to land in a very dense whole-world cluster (dozens of overlapping glyphs), and a
+  programmatic scan for near-pure-white pixels near the click found none, either because the thin
+  (2 px) ring was occluded by other, unrelated aircraft glyphs drawn after it in the same instance
+  buffer (address-sorted order, not selection-aware), or simply lost in the cluster's own visual
+  noise. Rather than guess, built a second, isolated check: a throwaway (uncommitted, deleted
+  after use) `winit`/`Renderer` harness driving a synthetic two-aircraft `RenderFeed` — one
+  selected, one not, positioned with no overlap — through the real `Renderer::render`. That
+  screenshot showed a crisp white outline ring around exactly the selected glyph and none around
+  the other, plus a card reading `SMOKE01` / `FL350` / `450kt` / `SRC OPENSKY` matching the
+  synthetic data exactly. Recorded honestly as two-part evidence (real click + real data on one
+  axis, isolated visual proof of the outline on the other) rather than either overclaiming the
+  live run caught the outline or dismissing the outline as unverified.
+- **Scripting note**: `FindWindow(null, title)` returned `0` even though the window definitely
+  existed (confirmed via `EnumWindows` finding it immediately) — a P/Invoke marshaling issue with
+  passing a literal `$null` string argument from PowerShell, not a real absence. Switched to an
+  `EnumWindows`-based title search (matching by exact `GetWindowText`) for both this item's
+  verification scripts; a `$using:` closure variable also failed outside a remoting context
+  inside the `EnumWindows` callback and was replaced with a script-scoped variable. Neither is an
+  app bug; recorded so a future session doesn't re-diagnose either from scratch.
+- Credit spend: two real window-mode runs against the owner's real `credentials.json` (one
+  whole-world poll cycle each, 4 credits/cycle per 2.4b/2.5's own figures — 8 total this item),
+  plus the isolated synthetic harness (no network, 0 credits). Scratch `look_above.db` deleted
+  after each per 1.12/1.13's convention.

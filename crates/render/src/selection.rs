@@ -63,6 +63,7 @@ pub fn hit_test(
 mod tests {
     use look_above_core::contracts::AircraftCategory;
     use look_above_core::sim::AltitudeBucket;
+    use look_above_core::types::SourceId;
 
     use super::*;
 
@@ -84,6 +85,7 @@ mod tests {
             altitude_ft: None,
             ground_speed_kt: None,
             selected: false,
+            source: SourceId::OpenSky,
         }
     }
 

@@ -16,6 +16,7 @@ use crate::basemap::{self, MeshData};
 use crate::color;
 use crate::error::RenderError;
 use crate::glyph_atlas;
+use crate::info_card::{self, InfoCardContent};
 use crate::label::{self, LabelPlacement, LeaderVertexRaw, TextInstanceRaw, TextQuadVertex};
 use crate::label_atlas;
 use crate::stats_overlay::{self, StatsOverlay};
@@ -122,20 +123,17 @@ impl AircraftLayer {
         );
     }
 
-    /// Packs `aircraft` into this frame's instance buffer, growing the GPU buffer first if the
-    /// feed has more aircraft than it currently holds. Returns the instance count to draw.
+    /// Packs `aircraft` into this frame's instance buffer (via [`aircraft::pack_instances`],
+    /// which also prepends a selection-outline instance when one aircraft is selected — M2 item
+    /// 2.8b), growing the GPU buffer first if the feed has more instances than it currently
+    /// holds. Returns the instance count to draw.
     fn upload_instances(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         aircraft: &[AircraftInstance],
     ) -> u32 {
-        self.instance_scratch.clear();
-        self.instance_scratch.extend(
-            aircraft
-                .iter()
-                .map(|a| aircraft::pack_instance(a, &self.tint_table)),
-        );
+        aircraft::pack_instances(aircraft, &self.tint_table, &mut self.instance_scratch);
 
         if self.instance_scratch.len() > self.instance_capacity {
             let new_capacity = self
@@ -604,13 +602,110 @@ impl StatsOverlayLayer {
     }
 }
 
+/// The selected-aircraft info card's GPU resources (M2 item 2.8b) — the other half of docs/01's
+/// "Selection: white outline + info card" (the outline itself is
+/// [`aircraft::pack_selection_outline_instance`], packed straight into [`AircraftLayer`]'s own
+/// instance buffer, no separate GPU resources of its own).
+///
+/// Built the same way as [`StatsOverlayLayer`] (see that struct's own doc comment): *cloned* from
+/// [`LabelLayer`]'s already-built text pipeline/atlas/mesh/screen-params bind group rather than a
+/// second SDF atlas or pipeline — only the instance buffer/capacity/scratch and this card's own
+/// (white) text color are new state. Fixed top-left origin below the F3 HUD's own block (see
+/// [`INFO_CARD_ORIGIN_PX`]) so the two never overlap regardless of whether F3 is toggled on.
+#[derive(Debug)]
+struct InfoCardLayer {
+    text_pipeline: wgpu::RenderPipeline,
+    screen_params_bind_group: wgpu::BindGroup,
+    atlas_bind_group: wgpu::BindGroup,
+    quad_vertex_buffer: wgpu::Buffer,
+    quad_index_buffer: wgpu::Buffer,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    /// Reused every frame so packing the card's text never allocates once capacity has warmed up
+    /// (ADR-002) — cleared and refilled by [`stats_overlay::pack_overlay_instances`].
+    instance_scratch: Vec<TextInstanceRaw>,
+    text_color: [f32; 4],
+}
+
+/// Fixed screen-pixel origin for the info-card block — below [`STATS_OVERLAY_ORIGIN_PX`]'s own
+/// 4-line HUD (`(10, 10)` plus 4 lines at `label::LABEL_CHAR_HEIGHT_PX + LINE_LEADING_PX` each) by
+/// a comfortable margin, so the two never overlap whether or not F3 is on.
+const INFO_CARD_ORIGIN_PX: (f64, f64) = (10.0, 80.0);
+
+impl InfoCardLayer {
+    /// Packs `content`'s lines (or nothing, when `content` is `None` — nothing selected) into
+    /// this frame's instance buffer, growing it first if needed. Returns the instance count to
+    /// draw.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        content: Option<&InfoCardContent>,
+    ) -> u32 {
+        match content {
+            Some(content) => {
+                let lines = info_card::format_lines(content);
+                stats_overlay::pack_overlay_instances(
+                    &lines,
+                    INFO_CARD_ORIGIN_PX,
+                    self.text_color,
+                    &mut self.instance_scratch,
+                );
+            }
+            None => self.instance_scratch.clear(),
+        }
+
+        if self.instance_scratch.len() > self.instance_capacity {
+            let new_capacity = self
+                .instance_scratch
+                .len()
+                .max(self.instance_capacity.saturating_mul(2))
+                .max(stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY);
+            self.instance_buffer = create_text_instance_buffer(device, new_capacity);
+            self.instance_capacity = new_capacity;
+        }
+        if !self.instance_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instance_scratch),
+            );
+        }
+
+        // The card is a handful of short lines — nowhere near u32::MAX.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the card's character count is a handful of short lines, far inside u32::MAX"
+        )]
+        {
+            self.instance_scratch.len() as u32
+        }
+    }
+
+    /// Binds the shared text pipeline/atlas and draws the uploaded card instances in one call —
+    /// skipped entirely (0 instances) when nothing is selected.
+    fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>, instance_count: u32) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.text_pipeline);
+        pass.set_bind_group(0, &self.screen_params_bind_group, &[]);
+        pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..6, 0, 0..instance_count);
+    }
+}
+
 /// Owns the GPU device and a window's swapchain, and paints the map.
 ///
 /// M0 drew only the clear; M2 item 2.2b added the base map (land fill, coastline stroke), 2.5
 /// added the aircraft glyph pass, 2.6b added the trail ribbon pass between them, 2.7b added the
-/// label pass (text + leader lines), and 2.1b adds the F3 debug HUD last — every piece of
-/// docs/01's draw order ("map base → map lines → trails → aircraft → labels → UI overlay") now
-/// exists.
+/// label pass (text + leader lines), 2.1b added the F3 debug HUD, and 2.8b adds the selected
+/// aircraft's white glyph outline (packed into the aircraft pass itself) and its info card, drawn
+/// last of all — every piece of docs/01's draw order ("map base → map lines → trails → aircraft →
+/// labels → UI overlay") now exists.
 #[derive(Debug)]
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -654,6 +749,10 @@ pub struct Renderer {
     /// (see [`StatsOverlayLayer`]'s own doc comment); like the label pass it is screen-space
     /// only, not the shared world view-proj matrix.
     stats_overlay: StatsOverlayLayer,
+    /// The selected-aircraft info card (M2 item 2.8b) — drawn last of all, on top of the F3 HUD.
+    /// Reuses [`LabelLayer`]'s pipeline/atlas the same way [`StatsOverlayLayer`] does (see
+    /// [`InfoCardLayer`]'s own doc comment).
+    info_card: InfoCardLayer,
 }
 
 impl Renderer {
@@ -727,6 +826,7 @@ impl Renderer {
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, config.format);
         let label = build_label_resources(&device, &queue, config.format);
         let stats_overlay = build_stats_overlay_resources(&device, &label, config.format);
+        let info_card = build_info_card_resources(&device, &label, config.format);
 
         Ok(Self {
             surface,
@@ -744,6 +844,7 @@ impl Renderer {
             aircraft,
             label,
             stats_overlay,
+            info_card,
         })
     }
 
@@ -851,9 +952,10 @@ impl Renderer {
     }
 
     /// Draw and present one frame: the background clear, the base map (land fill, coastline
-    /// stroke), then `feed`'s trail ribbons, its aircraft glyphs, its labels (text + leader
-    /// lines), and finally (M2 item 2.1b) the F3 debug HUD on top of everything — docs/01's full
-    /// draw order, end to end.
+    /// stroke), then `feed`'s trail ribbons, its aircraft glyphs (a selected one's own outline
+    /// instance drawn first among them — M2 item 2.8b), its labels (text + leader lines), the F3
+    /// debug HUD, and finally the selected-aircraft info card on top of everything — docs/01's
+    /// full draw order, end to end.
     ///
     /// Takes the live `camera` itself (M2 item 2.7b), not just its `meters_per_pixel` scalar as
     /// before: the aircraft/trail passes still only need that scalar (to size glyphs/ribbons a
@@ -865,11 +967,15 @@ impl Renderer {
     ///
     /// `stats` is `Some` only while F3 is on (`app::window::App::stats_visible`); when `None`,
     /// nothing is built or uploaded for the HUD pass at all — see [`StatsOverlayLayer::draw`].
+    /// `info_card` is `Some` only while an aircraft is selected (`app::window::App` looks it up
+    /// in `feed.aircraft` by its held `selected_icao24`); `None` (nothing selected, or the
+    /// selected aircraft left the feed) likewise builds/uploads nothing for the card.
     pub fn render(
         &mut self,
         feed: &RenderFeed,
         camera: &Camera,
         stats: Option<StatsOverlay>,
+        info_card: Option<&InfoCardContent>,
     ) -> Result<FrameOutcome, RenderError> {
         let meters_per_pixel = camera.meters_per_pixel();
         let (frame, stale) = match self.surface.get_current_texture() {
@@ -915,6 +1021,7 @@ impl Renderer {
             }
             None => 0,
         };
+        let info_card_count = self.info_card.upload(&self.device, &self.queue, info_card);
 
         let view = frame
             .texture
@@ -948,8 +1055,9 @@ impl Renderer {
             });
 
             // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
-            // glyphs (2.5), then labels (2.7b), then the F3 debug HUD (2.1b) last, on top of
-            // everything else.
+            // glyphs (2.5; a selected one's own outline instance is packed first among them —
+            // 2.8b), then labels (2.7b), then the F3 debug HUD (2.1b), then the selected-aircraft
+            // info card (2.8b) last of all, on top of everything else.
             self.basemap_land
                 .draw(&mut pass, &self.basemap_view_proj_bind_group);
             self.basemap_coastline
@@ -967,6 +1075,7 @@ impl Renderer {
             self.label
                 .draw(&mut pass, label_text_count, label_leader_count);
             self.stats_overlay.draw(&mut pass, stats_overlay_count);
+            self.info_card.draw(&mut pass, info_card_count);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1726,6 +1835,32 @@ fn build_stats_overlay_resources(
         instance_capacity: stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY,
         instance_scratch: Vec::new(),
         text_color: color::stats_overlay_text_color(format),
+    }
+}
+
+/// Builds the selected-aircraft info card's GPU resources (M2 item 2.8b) the same way
+/// [`build_stats_overlay_resources`] does: *cloning* `label`'s already-built text
+/// pipeline/atlas/mesh/screen-params bind group rather than a second SDF atlas or pipeline (see
+/// [`InfoCardLayer`]'s own doc comment). Runs once, in [`Renderer::new`], after `label` itself has
+/// been built.
+fn build_info_card_resources(
+    device: &wgpu::Device,
+    label: &LabelLayer,
+    format: wgpu::TextureFormat,
+) -> InfoCardLayer {
+    let instance_buffer =
+        create_text_instance_buffer(device, stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY);
+
+    InfoCardLayer {
+        text_pipeline: label.text_pipeline.clone(),
+        screen_params_bind_group: label.screen_params_bind_group.clone(),
+        atlas_bind_group: label.atlas_bind_group.clone(),
+        quad_vertex_buffer: label.quad_vertex_buffer.clone(),
+        quad_index_buffer: label.quad_index_buffer.clone(),
+        instance_buffer,
+        instance_capacity: stats_overlay::MIN_OVERLAY_INSTANCE_CAPACITY,
+        instance_scratch: Vec::new(),
+        text_color: color::info_card_text_color(format),
     }
 }
 

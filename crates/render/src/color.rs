@@ -156,6 +156,18 @@ pub fn stats_overlay_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
     layer_color(STATS_OVERLAY_TEXT_SRGB, format)
 }
 
+/// Selection info-card text color (M2 item 2.8b), pure white (`#FFFFFF`) — docs/01's "Selection:
+/// white outline + info card" ties the card's text to the same white as the glyph outline
+/// (`aircraft::pack_selection_outline_instance`), so the whole selection affordance reads as one
+/// consistent highlight color rather than a third, unrelated one.
+const INFO_CARD_TEXT_SRGB: [u8; 3] = [0xFF, 0xFF, 0xFF];
+
+/// The info-card text color as shader-ready, opaque linear RGBA (same linearize-if-`srgb`
+/// reasoning as [`label_text_color`]).
+pub fn info_card_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    layer_color(INFO_CARD_TEXT_SRGB, format)
+}
+
 /// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
 /// `renderer.rs` (the colors never change frame to frame, only which bucket applies), so the
 /// per-instance packing path (`aircraft::pack_instance`) is a plain array lookup rather than

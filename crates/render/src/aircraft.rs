@@ -19,6 +19,29 @@ use crate::{color, glyph_atlas};
 /// range, not a spec'd exact value.
 pub const AIRCRAFT_GLYPH_PX: f64 = 20.0;
 
+/// The skill's white selection-outline thickness, in on-screen physical pixels ("Selected: white
+/// outline (2 px)") — see [`SELECTION_OUTLINE_SCALE_MUL`]'s own doc comment for how this becomes
+/// a per-instance scale rather than a shader-side offset.
+pub const SELECTION_OUTLINE_WIDTH_PX: f64 = 2.0;
+
+/// Per-instance scale multiplier for [`pack_selection_outline_instance`]'s outline copy of a
+/// glyph. Drawing the *same* silhouette scaled up by this factor, solid white, behind the
+/// normal-size glyph (see [`pack_instances`]'s draw-order doc comment) leaves roughly
+/// [`SELECTION_OUTLINE_WIDTH_PX`] of it visible as a highlight, without a second shader/pipeline.
+///
+/// Not a true uniform-width offset (a non-circular silhouette scaled up shows more of a halo at
+/// points further from its own center, e.g. a dart's nose vs. its waist) — a per-texel SDF
+/// threshold shrink would be exact, but `glyph_atlas`'s `SPREAD` is deliberately tuned tight (so
+/// adjacent atlas tiles never bleed under bilinear filtering) and has no distance gradient left
+/// this far inside a silhouette to threshold against.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a small ratio just above 1.0 (AIRCRAFT_GLYPH_PX and SELECTION_OUTLINE_WIDTH_PX are \
+              both small compile-time literals), far inside f32's precision"
+)]
+const SELECTION_OUTLINE_SCALE_MUL: f32 =
+    ((AIRCRAFT_GLYPH_PX + 2.0 * SELECTION_OUTLINE_WIDTH_PX) / AIRCRAFT_GLYPH_PX) as f32;
+
 /// Starting capacity (in instances) for the GPU instance buffer, before any frame has grown it.
 /// Small enough to cost nothing at startup, large enough that a first busy region rarely forces
 /// an immediate regrow.
@@ -102,6 +125,10 @@ pub struct InstanceRaw {
     /// (see [`pack_instance`]) — the fragment shader multiplies this by the SDF edge alpha, not
     /// the other way around.
     pub tint: [f32; 4],
+    /// Multiplies [`crate::renderer`]'s per-frame `glyph_scale` uniform for *this* instance only
+    /// (M2 item 2.8b). `1.0` for every ordinary glyph; [`SELECTION_OUTLINE_SCALE_MUL`] for a
+    /// selected aircraft's outline copy — see [`pack_selection_outline_instance`].
+    pub scale_mul: f32,
 }
 
 impl InstanceRaw {
@@ -128,6 +155,12 @@ impl InstanceRaw {
                 format: wgpu::VertexFormat::Float32x4,
                 offset: (size_of::<[f32; 2]>() + 2 * size_of::<f32>()) as wgpu::BufferAddress,
                 shader_location: 5,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: (size_of::<[f32; 2]>() + 2 * size_of::<f32>() + size_of::<[f32; 4]>())
+                    as wgpu::BufferAddress,
+                shader_location: 6,
             },
         ],
     };
@@ -241,14 +274,85 @@ pub fn pack_instance(instance: &AircraftInstance, tint_table: &[[f32; 4]; 6]) ->
         heading_rad,
         category_index,
         tint,
+        scale_mul: 1.0,
     }
+}
+
+/// Packs one selected `instance`'s outline copy (M2 item 2.8b): same position/heading/category
+/// (so the silhouette matches exactly), solid white, scaled up by
+/// [`SELECTION_OUTLINE_SCALE_MUL`] — see that constant's doc comment.
+///
+/// `instance.alpha` is folded into the outline's alpha too, the same way [`pack_instance`] folds
+/// it into the tint: a selected aircraft mid-stale-fade should have its outline fade with it,
+/// not stay solid after the glyph itself has faded.
+fn pack_selection_outline_instance(instance: &AircraftInstance) -> InstanceRaw {
+    let world_xy = world_xy_normalized(instance.position);
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a display heading in degrees converts to a bounded radian value; f32 keeps \
+                  ample precision for a glyph's on-screen rotation"
+    )]
+    let heading_rad = instance.heading_deg.to_radians() as f32;
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "category index is one of 6 small integers (0..=5), far inside f32's \
+                  exact-integer range"
+    )]
+    let category_index = glyph_atlas::category_index(instance.category) as f32;
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "core::sim already clamps alpha to (0, 1] before an instance ever reaches the \
+                  feed"
+    )]
+    let alpha = instance.alpha as f32;
+
+    InstanceRaw {
+        world_xy,
+        heading_rad,
+        category_index,
+        tint: [1.0, 1.0, 1.0, alpha],
+        scale_mul: SELECTION_OUTLINE_SCALE_MUL,
+    }
+}
+
+/// Packs every drawable instance for this frame's aircraft pass, appending into `out` (cleared
+/// first, its capacity reused frame to frame per ADR-002 — the same reused-scratch shape as
+/// [`crate::trail::tessellate_trails`]).
+///
+/// Selection outlines (M2 item 2.8b) are packed *first*, ordinary glyphs after: this pass has no
+/// depth test (alpha-blended, painter's-algorithm draw order), so an outline instance must be
+/// earlier in the buffer than the normal-size glyph drawn on top of it, or the larger white copy
+/// would occlude rather than merely peek out from behind. In practice at most one aircraft is
+/// selected at a time ([`look_above_core::sim::Simulator`]'s own `selected: Option<Icao24>`), so
+/// this never packs more than one outline instance — but the loop handles zero or several
+/// (defensively; nothing in this crate requires exactly one) identically.
+pub fn pack_instances(
+    aircraft: &[AircraftInstance],
+    tint_table: &[[f32; 4]; 6],
+    out: &mut Vec<InstanceRaw>,
+) {
+    out.clear();
+    out.extend(
+        aircraft
+            .iter()
+            .filter(|instance| instance.selected)
+            .map(pack_selection_outline_instance),
+    );
+    out.extend(
+        aircraft
+            .iter()
+            .map(|instance| pack_instance(instance, tint_table)),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use look_above_core::contracts::AircraftCategory;
     use look_above_core::sim::AltitudeBucket;
-    use look_above_core::types::Icao24;
+    use look_above_core::types::{Icao24, SourceId};
 
     use super::*;
 
@@ -360,6 +464,7 @@ mod tests {
             altitude_ft: None,
             ground_speed_kt: None,
             selected: false,
+            source: SourceId::OpenSky,
         };
 
         let raw = pack_instance(&instance, &opaque_white_table);
@@ -409,12 +514,123 @@ mod tests {
             altitude_ft: None,
             ground_speed_kt: None,
             selected: false,
+            source: SourceId::OpenSky,
         };
 
         let raw = pack_instance(&instance, &table);
         assert!((raw.tint[0] - 0.5).abs() < 1e-6);
         assert!((raw.tint[1] - 0.6).abs() < 1e-6);
         assert!((raw.tint[2] - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pack_instance_leaves_scale_mul_at_one() {
+        let opaque_white_table = [[1.0_f32; 4]; 6];
+        let instance = AircraftInstance {
+            icao24: some_icao(),
+            position: MercatorXy::new(0.0, 0.0),
+            heading_deg: 0.0,
+            altitude_bucket: AltitudeBucket::To28000Ft,
+            category: AircraftCategory::Unknown,
+            alpha: 1.0,
+            on_ground: false,
+            anonymous: false,
+            callsign: None,
+            altitude_ft: None,
+            ground_speed_kt: None,
+            selected: true,
+            source: SourceId::OpenSky,
+        };
+        assert!((pack_instance(&instance, &opaque_white_table).scale_mul - 1.0).abs() < 1e-9);
+    }
+
+    // ---- Selection outline (M2 item 2.8b) --------------------------------------------------------
+
+    fn selected_instance() -> AircraftInstance {
+        AircraftInstance {
+            icao24: some_icao(),
+            position: MercatorXy::new(500.0, -250.0),
+            heading_deg: 45.0,
+            altitude_bucket: AltitudeBucket::To10000Ft,
+            category: AircraftCategory::Jet,
+            alpha: 0.7,
+            on_ground: false,
+            anonymous: false,
+            callsign: None,
+            altitude_ft: None,
+            ground_speed_kt: None,
+            selected: true,
+            source: SourceId::OpenSky,
+        }
+    }
+
+    #[test]
+    fn pack_selection_outline_instance_is_solid_white_scaled_up_and_matches_position() {
+        let instance = selected_instance();
+        let raw = pack_selection_outline_instance(&instance);
+
+        assert!(raw.tint[0..3].iter().all(|&c| (c - 1.0).abs() < 1e-6));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test-only expectation for a value pack_selection_outline_instance itself \
+                      narrows the same way"
+        )]
+        let expected_alpha = instance.alpha as f32;
+        assert!((raw.tint[3] - expected_alpha).abs() < 1e-6);
+        assert!(
+            raw.scale_mul > 1.0,
+            "the outline must be larger than a normal glyph"
+        );
+
+        let normal = pack_instance(&instance, &[[0.0; 4]; 6]);
+        assert_eq!(raw.world_xy, normal.world_xy);
+        assert!((raw.heading_rad - normal.heading_rad).abs() < 1e-6);
+        assert!((raw.category_index - normal.category_index).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pack_instances_packs_an_outline_before_the_normal_glyph_only_for_selected_aircraft() {
+        let mut plain = selected_instance();
+        plain.selected = false;
+        plain.icao24 = Icao24::from_hex("111111").expect("valid test ICAO24");
+        let selected = selected_instance();
+
+        let table = [[0.2_f32; 4]; 6];
+        let mut out = Vec::new();
+        pack_instances(&[plain, selected], &table, &mut out);
+
+        // One outline (the selected aircraft only) plus two normal glyphs (one per aircraft).
+        assert_eq!(out.len(), 3);
+        assert!(
+            out[0].tint[0..3].iter().all(|&c| (c - 1.0).abs() < 1e-6),
+            "the outline instance must come first"
+        );
+        assert!(out[0].scale_mul > 1.0);
+        assert!(
+            out[1..]
+                .iter()
+                .all(|raw| (raw.scale_mul - 1.0).abs() < 1e-9),
+            "every ordinary glyph instance keeps scale_mul at 1.0"
+        );
+    }
+
+    #[test]
+    fn pack_instances_emits_no_outline_when_nothing_is_selected() {
+        let mut instance = selected_instance();
+        instance.selected = false;
+        let mut out = Vec::new();
+        pack_instances(&[instance], &[[0.0; 4]; 6], &mut out);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].scale_mul - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pack_instances_reuses_the_output_buffer() {
+        let mut out = Vec::new();
+        pack_instances(&[selected_instance()], &[[0.0; 4]; 6], &mut out);
+        assert_eq!(out.len(), 2);
+        pack_instances(&[], &[[0.0; 4]; 6], &mut out);
+        assert!(out.is_empty());
     }
 
     // ---- Static geometry ------------------------------------------------------------------------

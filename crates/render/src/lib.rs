@@ -8,6 +8,7 @@ mod basemap;
 mod color;
 mod error;
 mod glyph_atlas;
+mod info_card;
 mod label;
 mod label_atlas;
 mod renderer;
@@ -16,6 +17,7 @@ mod stats_overlay;
 mod trail;
 
 pub use error::RenderError;
+pub use info_card::InfoCardContent;
 pub use renderer::{FrameOutcome, Renderer, camera_view_proj};
 pub use selection::hit_test;
 pub use stats_overlay::StatsOverlay;

@@ -603,9 +603,33 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       buffer sizing), but real evidence the flagged gap is a crash risk, not just a performance
       concern, and worth prioritizing before the M2 gate (2.10)'s live-run-over-a-busy-hub line.
       DECISION_LOG 2.8a.)*
-- [ ] 2.8b Selection render: white outline on the selected aircraft's glyph (GPU), minimal info
+- [x] 2.8b Selection render: white outline on the selected aircraft's glyph (GPU), minimal info
       card (callsign/alt/speed/source — enrichment fields arrive in M3; anonymous →
       "Unidentified" already enforced here). Depends on 2.8a.
+      *(2026-07-19: implemented — the outline is a second, scaled-up (`InstanceRaw::scale_mul`,
+      new field), solid-white copy of the selected aircraft's own instance, packed *before* the
+      ordinary instances in the same `AircraftLayer` buffer (`aircraft::pack_instances`) so it
+      draws first and peeks out from behind the normal glyph — no depth test on this pass, no
+      second shader/pipeline. New `render::info_card` (content + `format_lines`, reusing
+      `label::format_flight_level`/`format_speed_kt` and `stats_overlay::pack_overlay_instances`
+      directly) and `InfoCardLayer` in `renderer.rs`, built by cloning `LabelLayer`'s pipeline/
+      atlas/mesh the same way `StatsOverlayLayer` does — fixed origin below the F3 HUD so the two
+      never overlap. `core::sim::AircraftInstance` gained `source: SourceId` (not sticky, unlike
+      `callsign`) since the checklist's own card content needs it and nothing carried it past
+      `core::merge` before. Privacy rule 2.2's anonymous-selected exception ("Unidentified" +
+      altitude only, no callsign/speed) is wired into `label::format_label_text` itself — the
+      exact seam 2.7a/2.7b's own doc comments flagged as "2.8's job". 16 new tests (2 `core::sim`
+      source-carries/updates; `render::aircraft` scale_mul/outline packing/draw-order; 2
+      `render::label` selected-anonymous; 7 `render::info_card` content/charset) — **514 passed,
+      5 ignored, 0 failed** (+16 over 2.8a's 498). **Live-verified two ways**: a real window-mode
+      click against the owner's real `credentials.json` landed on an actual tracked aircraft for
+      the first time in this project (2.8a's own four attempts had all missed), and its info card
+      showed real callsign/altitude/speed/`SRC OPENSKY` content — but the outline wasn't visually
+      distinguishable in that click's very dense whole-world cluster, so a second, isolated
+      synthetic `Renderer` harness (two non-overlapping aircraft, one selected) confirmed a crisp
+      white ring around only the selected glyph. Raw lat/lon "position data" text for an anonymous
+      card is deferred (would need to widen `label_atlas::CHARSET`), flagged for the M2 gate
+      (2.10) to check against docs/13 directly. DECISION_LOG 2.8b.)*
 - [ ] 2.9 Renderer smoke test (headless, per docs/10 §4) wired into CI (skip-if-no-adapter).
 - [ ] 2.10 Gate: live run over a busy hub; visual QA §L2-core; frame-stats evidence; human review.
 

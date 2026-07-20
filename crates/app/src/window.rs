@@ -28,7 +28,9 @@ use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::opensky::OpenSkyAuth;
 use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
-use look_above_render::{FrameOutcome, Renderer, StatsOverlay, camera_view_proj, hit_test};
+use look_above_render::{
+    FrameOutcome, InfoCardContent, Renderer, StatsOverlay, camera_view_proj, hit_test,
+};
 use look_above_store::Writer;
 use tokio::sync::watch;
 use winit::application::ApplicationHandler;
@@ -377,7 +379,24 @@ impl App {
             })
             .flatten();
 
-        match renderer.render(&self.current_feed, camera, stats_overlay) {
+        // The selected aircraft's own live instance this frame, if it's still in the feed (M2
+        // item 2.8b) — `None` both when nothing is selected and when the selected `icao24` has
+        // faded out of the feed since, so the card/outline simply stop drawing rather than
+        // showing stale content.
+        let info_card = self.selected_icao24.and_then(|icao24| {
+            self.current_feed
+                .aircraft
+                .iter()
+                .find(|instance| instance.icao24 == icao24)
+                .map(InfoCardContent::from_instance)
+        });
+
+        match renderer.render(
+            &self.current_feed,
+            camera,
+            stats_overlay,
+            info_card.as_ref(),
+        ) {
             Ok(FrameOutcome::Presented) => {
                 if let Some(summary) = self.stats.record(now) {
                     self.last_stats_summary = Some(summary);

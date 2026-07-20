@@ -16,6 +16,13 @@
 // fragment shader `smoothstep`s a `fwidth`-derived band around it for antialiased edges — the
 // "SDF-derived AA" docs/01's quality bar asks for, without a second MSAA-style resolve of its own
 // (this pass still renders into the shared 4x MSAA target like every other pass).
+//
+// Selection outline (M2 item 2.8b): `instance.scale_mul` multiplies the shared per-frame glyph
+// scale for this one instance. `aircraft.rs::pack_instances` packs a selected aircraft's outline
+// as an extra, earlier instance in the same buffer — same silhouette/position/heading, solid
+// white, `scale_mul > 1` — so it draws first (no depth test; alpha-blended painter's-algorithm
+// order) and the normal-size glyph drawn after it on top leaves a white halo peeking out from
+// behind.
 
 struct ViewProj {
     matrix: mat4x4<f32>,
@@ -49,6 +56,7 @@ struct InstanceInput {
     @location(3) heading_rad: f32,
     @location(4) category_index: f32,
     @location(5) tint: vec4<f32>,
+    @location(6) scale_mul: f32,
 };
 
 struct VertexOutput {
@@ -69,7 +77,7 @@ fn vs_main(in: VertexInput, instance: InstanceInput) -> VertexOutput {
         -in.local_pos.x * s + in.local_pos.y * c,
     );
 
-    let world = instance.world_xy + rotated * glyph_params.x;
+    let world = instance.world_xy + rotated * glyph_params.x * instance.scale_mul;
     out.clip_position = view_proj.matrix * vec4<f32>(world, 0.0, 1.0);
 
     let tile_width = 1.0 / CATEGORY_COUNT;

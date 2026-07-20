@@ -7,19 +7,43 @@
 
 - **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
   open, see below — same shape as M0→M1). Items 2.1, 2.1b, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b,
-  2.5, 2.6a, 2.6b, 2.7a, 2.7b, 2.8a done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action:** **2.8b**, selection render (white outline on the selected glyph, minimal info
-  card). Not started. 2.8a (this session) wired the real selection *state* and click hit-test;
-  2.8b/2.9/2.10 remain on the M2 checklist.
-- **⚠ New, higher-priority than 2.8b: a reproducible crash**, found live this session (not a
-  selection-path bug — flagged for prioritization, not fixed here, out of scope for 2.8a).
-  Running window mode at whole-world zoom for ~2–2.5 minutes panics: `wgpu` rejects the trail
-  vertex buffer at ~279 MiB against this adapter's 256 MiB `max_buffer_size`. This is the
-  already-flagged 2.5/2.6b LOD gap (no L0/L1 cross-fade, every aircraft draws a full unbounded
-  5-min trail at any zoom) turning out to be a crash, not just a perf cost, once ~9,800 aircraft
-  each carry a growing trail simultaneously. Reproduced twice independently. A future milestone
-  item (LOD tiers, or a trail-vertex cap as a stopgap) should land before the M2 gate (2.10)'s
-  live-run-over-a-busy-hub line is attempted at whole-world zoom.
+  2.5, 2.6a, 2.6b, 2.7a, 2.7b, 2.8a, 2.8b done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Next action:** **2.9** (renderer smoke test, headless, wired into CI) — or the flagged
+  trail-buffer crash below, which should land before 2.10's live-run-over-a-busy-hub line is
+  attempted at whole-world zoom. Neither started; owner's call. Selection (2.8/2.8a/2.8b) is now
+  fully done — only 2.9/2.10 remain on the M2 checklist.
+- **⚠ Still open, higher-priority than 2.9/2.10: the reproducible trail-buffer crash** found live
+  at 2.8a (not a selection-path bug, not touched by 2.8b either). Running window mode at
+  whole-world zoom for ~2–2.5 minutes panics: `wgpu` rejects the trail vertex buffer at ~279 MiB
+  against this adapter's 256 MiB `max_buffer_size`. This is the already-flagged 2.5/2.6b LOD gap
+  (no L0/L1 cross-fade, every aircraft draws a full unbounded 5-min trail at any zoom) turning out
+  to be a crash, not just a perf cost, once ~9,800 aircraft each carry a growing trail
+  simultaneously. Reproduced twice independently at 2.8a. A future milestone item (LOD tiers, or a
+  trail-vertex cap as a stopgap) should land before the M2 gate (2.10)'s live-run-over-a-busy-hub
+  line is attempted at whole-world zoom.
+- **2.8b landed:** the selected aircraft's white glyph outline and info card, closing out
+  selection (2.8/2.8a/2.8b). The outline is a second, `InstanceRaw::scale_mul`-scaled, solid-white
+  copy of the selected aircraft's own instance, packed *before* the ordinary instances in the same
+  `AircraftLayer` buffer (`aircraft::pack_instances`) — this pass has no depth test, so draw order
+  alone puts the outline behind the normal glyph drawn after it, with no second shader/pipeline.
+  New `render::info_card` (content + `format_lines`, reusing `label::format_flight_level`/
+  `format_speed_kt` and `stats_overlay::pack_overlay_instances` directly rather than duplicating
+  either) and an `InfoCardLayer` in `renderer.rs`, cloned from `LabelLayer`'s pipeline/atlas/mesh
+  the same way `StatsOverlayLayer` does (2.1b's own precedent) — fixed origin below the F3 HUD.
+  `core::sim::AircraftInstance` gained `source: SourceId` (not sticky, unlike `callsign` — a
+  mid-track source failover is real, current information) since the card's own checklist wording
+  needs it. Privacy rule 2.2's anonymous-selected exception ("Unidentified" + altitude only) is
+  wired into `label::format_label_text` itself, the exact seam 2.7a/2.7b flagged as "2.8's job".
+  16 new tests; fmt/clippy/test green — **514 passed, 5 ignored, 0 failed** (+16 over 2.8a's 498).
+  **Live-verified two ways**: a real window-mode click against the owner's real `credentials.json`
+  landed on an actual tracked aircraft for the first time in this project (2.8a's own four
+  attempts had all missed) and its info card showed real matching callsign/altitude/speed/
+  `SRC OPENSKY` content — but the outline wasn't visually distinguishable in that click's very
+  dense whole-world cluster, so a second, isolated synthetic `Renderer` harness (throwaway,
+  deleted after use — two non-overlapping aircraft, one selected) confirmed a crisp white ring
+  around only the selected glyph. Raw lat/lon "position data" text for an anonymous card is
+  deferred (would need to widen `label_atlas::CHARSET`), flagged for the M2 gate (2.10) to check
+  against docs/13 directly. DECISION_LOG 2.8b.
 - **2.8a landed:** `core::sim::AircraftInstance` gained a real `selected: bool` (the signal
   `render::label::label_priority` hardcoded to `false` since 2.7b); `Simulator::set_selected`
   marks the right track each `advance_all`. New `render::selection::hit_test` (pure, linear-scan
@@ -301,6 +325,77 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-19** — M2 item 2.8b: selection render (white outline + info card), closing out
+  selection (2.8/2.8a/2.8b — the M2 checklist now has only 2.9/2.10 left). **Outline**: a second,
+  solid-white instance of the selected aircraft's own glyph, scaled up by a new per-instance
+  `InstanceRaw::scale_mul` (`1.0` for every ordinary glyph, a compile-time-derived
+  `SELECTION_OUTLINE_SCALE_MUL` — `(AIRCRAFT_GLYPH_PX + 2 * SELECTION_OUTLINE_WIDTH_PX) /
+  AIRCRAFT_GLYPH_PX`, the skill's 2 px — for the outline copy), packed *first* in
+  `aircraft::pack_instances`'s output (new, replacing `AircraftLayer::upload_instances`'s inline
+  map) so it draws before the ordinary per-aircraft instances that follow in the same buffer —
+  this pass has no depth test (alpha-blended painter's-algorithm order, like every M2 pass), so
+  draw order alone is what lets the normal-size glyph occlude everything but a ring of the larger
+  white copy behind it. Considered and rejected an SDF-threshold inward shrink (would give a true
+  uniform-width ring): `glyph_atlas::SPREAD` is deliberately tuned tight against tile bleed and
+  has no distance gradient left that far inside a silhouette to threshold against; out of scope to
+  widen it here. **Info card**: new `render::info_card` module (`InfoCardContent`, `format_lines`)
+  reusing `label::format_flight_level`/`format_speed_kt` (widened to `pub(crate)`) and
+  `stats_overlay::pack_overlay_instances` (already generic over lines/origin/color) directly,
+  rather than duplicating either; a new `InfoCardLayer` in `renderer.rs` cloned from `LabelLayer`'s
+  pipeline/atlas/mesh/screen-params bind group, the identical "one SDF text atlas, one text
+  pipeline in the crate" reuse `StatsOverlayLayer` established at 2.1b. Fixed origin `(10, 80)`,
+  below the F3 HUD's own 4-line block, so the two never overlap regardless of F3. `Renderer::render`
+  gained a fifth parameter, `info_card: Option<&InfoCardContent>` (a reference, per clippy's
+  `needless_pass_by_value` — the caller already owns the value); `app::window` builds it each
+  frame by finding `selected_icao24` in the current feed and mapping through
+  `InfoCardContent::from_instance`, `None` both when nothing is selected and when the selected
+  aircraft has left the feed. **`core::sim::AircraftInstance` gained `source: SourceId`**
+  (`Track::source`, updated from every fix — deliberately *not* sticky like `callsign`, since a
+  mid-track source failover is real, current information the card should reflect) — the
+  checklist's own "callsign/alt/speed/source" content needed it and nothing carried
+  `StateVector::source` past `core::merge` before this. **Privacy rule 2.2's anonymous-selected
+  exception** ("Unidentified" + altitude only, never callsign/speed, and the check doesn't even
+  read `instance.callsign`) is wired into `label::format_label_text` itself — the exact seam
+  2.7a's and 2.7b's own doc comments flagged as "2.8's job", closed here rather than duplicated
+  into `info_card` separately. Enrichment fields (type/operator/route) stay M3's job, documented
+  in `info_card`'s own module doc rather than left implicit. Done directly, not delegated (every
+  touched file was already read this session establishing the design, same precedent as every
+  prior M2 item). 16 new tests (2 `core::sim` — source carries onto a first sighting, a later fix
+  from a different source updates it unlike callsign's stickiness; 5 `render::aircraft` — outline
+  tint/scale/position match, draw-order/selected-only packing, buffer reuse, `scale_mul` defaults
+  to 1.0; 2 `render::label` — selected-anonymous shows "Unidentified"+altitude, or just
+  "Unidentified" with no known altitude; 7 `render::info_card` — charset, normal/anonymous/
+  unknown-field content, source always shown). `cargo fmt --check`/`clippy --workspace
+  --all-targets -D warnings`/`test --workspace` all green — **514 passed, 5 ignored, 0 failed**
+  (+16 over 2.8a's 498). **Live-verified two ways, after the first was ambiguous.** A window-mode
+  run against the owner's real `credentials.json` (whole-world OpenSky) produced, for the first
+  time in this project's history, a real click actually landing on a *tracked* aircraft
+  (`selected=Some(Icao24([13, 16, 120]))` — 2.8a's own four attempts had all missed): the info
+  card appeared with real callsign/altitude/speed/`SRC OPENSKY` content matching the clicked
+  target, and a before/after screenshot pair confirmed no card at all before the click. The
+  outline, though, was not visually distinguishable in that screenshot: the click happened to land
+  in a very dense whole-world cluster (dozens of overlapping glyphs), and a programmatic scan for
+  near-pure-white pixels near the click found none — plausibly occluded by other, unrelated
+  aircraft glyphs drawn after it in the same address-sorted instance buffer, or just lost in the
+  cluster's own visual noise. Rather than guess, built a second, isolated check: a throwaway
+  (uncommitted, deleted after use) `winit`/`Renderer` harness driving a synthetic two-aircraft
+  `RenderFeed` (one selected, one not, positioned with no overlap) through the real
+  `Renderer::render`. That screenshot showed a crisp white outline ring around exactly the
+  selected glyph and none around the other, plus a card reading `SMOKE01`/`FL350`/`450kt`/
+  `SRC OPENSKY` matching the synthetic data exactly — conclusive, isolated proof the GPU-side code
+  is correct, on top of (not instead of) the real click's own live data confirmation. Scripting
+  note: `FindWindow(null, title)` returned `0` even though the window definitely existed (confirmed
+  via `EnumWindows`) — a PowerShell P/Invoke `$null`-marshaling issue, not a real absence; switched
+  to an `EnumWindows`-based title search for both this item's scripts. Credit spend: 8 (two
+  real window-mode runs, 4 credits/cycle each); the synthetic harness made no network calls, 0
+  credits. Scratch `look_above.db` deleted after each real run per 1.12/1.13's convention.
+  Raw lat/lon "position data" text for an anonymous card is deferred (would need to widen
+  `label_atlas::CHARSET` — a decimal point, a minus sign — for a feature this item's own checklist
+  wording doesn't name), flagged for the M2 gate (2.10) to check against docs/13 directly rather
+  than assumed satisfied here. The trail-buffer crash flagged at 2.8a remains open, untouched by
+  this item's diff. DECISION_LOG 2.8b. Next: **2.9** (renderer smoke test) or the flagged crash —
+  owner's call.
 
 - **2026-07-19** — M2 item 2.8a: selection state + hit-test (the split-off first half of
   checklist item 2.8; the render half — white outline, info card — is 2.8b, not started).
