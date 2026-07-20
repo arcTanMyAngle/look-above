@@ -60,6 +60,11 @@ fixed or recorded as the exact blocker.
   in `plans/NEXT_ACTIONS.md` or the next session.
 - Last item of a milestone → run the gate per `docs/11_ACCEPTANCE_CRITERIA.md`, record
   evidence in CURRENT_STATUS, and stop for human review.
+- **Starting a different, unrelated task next → `/clear` first**, even mid-conversation.
+  Usage data shows most token spend happens in sessions carried past ~150k context or
+  reused across unrelated tasks — see `docs/05_TOKEN_MANAGEMENT.md` §Usage data. If a
+  single session is running long but still on the *same* item, `/compact` at a verified
+  checkpoint (post-step-4) instead of carrying full history forward.
 
 ## Recovery (compaction / crashed session)
 
