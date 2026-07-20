@@ -38,6 +38,7 @@ adsbdb selection lookups behind the anonymity gate (privacy rule 2.2); selection
 data path.
 **Gate:** selecting an aircraft shows route/type/operator when available; airports render
 with runway outlines; all enrichment failures degrade silently.
+→ [../plans/M3_ENRICHMENT_AND_NON_ADSB.md](../plans/M3_ENRICHMENT_AND_NON_ADSB.md)
 
 ## M4 — Dual-Mode LOD & Interaction
 

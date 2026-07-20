@@ -2451,3 +2451,27 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
 - **Per CLAUDE.md, M3 is not opened here.** The owner decides whether to open it with the 3 open
   M2 lines carried forward (M1's own precedent for a gate that didn't fully pass) or work them
   first.
+
+## 2026-07-20 — M3 opened; M3 plan file written
+
+- **Owner directed "continue with M3"** — read as the explicit gate decision CURRENT_STATUS/
+  2.10 left pending: open M3 with the 3 open M2 lines (heading-in-info-card, `sim::advance_all`
+  perf, antimeridian wrap) and the trail-buffer crash carried forward uncommitted-to-fix, same
+  precedent as M1's token-refresh line carrying into M2.
+- **Found a real gap, not silently worked around**: docs/07 states M3–M6 plan files are "written
+  as part of the preceding milestone's gate" — M2's own gate (2.10) never produced
+  `plans/M3_ENRICHMENT_AND_NON_ADSB.md`. Wrote it now, before any implementation, mirroring the
+  M0/M1/M2 plan-file shape (Goal / constraining docs / Checklist), sourced from docs/07's M3
+  paragraph and docs/11 §M3's 5 acceptance lines (6th checklist item is the gate itself, same
+  pattern as every prior milestone). Linked back from docs/07 (it had no `→ plans/...` line yet,
+  the only milestone missing one).
+- **Recorded a cross-milestone tension explicitly in the new plan file** rather than paper over
+  it: docs/11 §M3's first acceptance line ("airports visible at L1, runway outlines at L2")
+  presumes LOD tier switching, which is M4's deliverable, not M3's — the renderer currently draws
+  everything at one fixed tier (the same gap M2's own gate flagged for aircraft glyphs/trails).
+  3.2 is scoped to the query/data half now (`Store::airports_in_bbox`'s existing `min_size` param)
+  and defers true tier-gated visibility to M4, recorded as an open half at the M3 gate (3.6) the
+  same way M1's token-refresh line and M2's three open lines were carried rather than silently
+  marked done.
+- Checklist order follows docs/07's own M3 sentence order (airports/runways import → rendering →
+  METAR → adsbdb selection lookups → info card wiring → gate), not re-derived from scratch.

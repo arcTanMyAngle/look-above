@@ -5,16 +5,20 @@
 
 ## Now (updated 2026-07-20)
 
-- **Phase: M2's checklist is fully worked (2.1–2.10); the gate ran 2026-07-20 and did not fully
-  pass** — 3 of 6 acceptance §M2 lines pass cleanly, 3 are open (see the gate table and M2 plan
-  2.10 for full per-line evidence). Per CLAUDE.md, **not opening M3 unprompted** — this is the
-  owner's call, same as M0→M1 and M1→M2 were.
-- **Next action: owner decides how to proceed** — options are (a) open M3 with the 3 open M2
-  lines carried forward (same shape as M1's token-refresh line), (b) work the open lines first
-  (heading spot-check needs the info card to expose a heading value it currently doesn't; the
-  `sim::advance_all` gate benchmark exceeds its 2ms/10k-aircraft budget — 3.2–4.3ms measured on
-  this real 16-core machine; antimeridian wrap is unimplemented, not just untested), or (c) open
-  a follow-up item for the label-clutter finding below. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **Phase: M3 opened** (owner directed "continue with M3" — read as the pending gate decision:
+  open with the 3 open M2 lines carried forward, M1's own precedent). M2's checklist stays fully
+  worked (2.1–2.10) with those 3 lines + the trail-buffer crash carried, not re-litigated.
+- **M3 plan file was missing and has been written this session**: docs/07 says M3–M6 plan files
+  land "as part of the preceding milestone's gate", but M2's own gate (2.10) never produced one —
+  found and fixed before any implementation. New
+  [M3_ENRICHMENT_AND_NON_ADSB.md](M3_ENRICHMENT_AND_NON_ADSB.md), sourced from docs/07's M3
+  paragraph + docs/11 §M3's 5 acceptance lines, linked back from docs/07. Records an explicit
+  cross-milestone tension up front: acceptance line 1 ("airports visible at L1, runway outlines
+  at L2") presumes LOD tier switching that is actually M4's deliverable — 3.2 is scoped to the
+  data/query half only, tier-gated visibility stays open into M4, same honest-carry pattern as
+  every prior gate's open lines. DECISION_LOG 2026-07-20 (M3 opened).
+- **Next action:** item 3.1 — OurAirports import (airports.csv/runways.csv → bundled asset →
+  migration 0002 → `Store::airports_in_bbox`). Plan: [M3_ENRICHMENT_AND_NON_ADSB.md](M3_ENRICHMENT_AND_NON_ADSB.md)
 - **New finding at the 2.10 gate, not yet fixed:** the (also-2.10) label legibility fix that
   doubled `LABEL_CHAR_WIDTH_PX`/`LABEL_CHAR_HEIGHT_PX` makes dense regional clusters (150+
   aircraft on screen) read as visually-overlapping clutter — likely still zero *algorithmic*
@@ -335,7 +339,8 @@
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
 | M1 | **gate run 2026-07-18 — 6/7; token-refresh line open, owner-accepted** | M1 plan 1.13 |
 | M2 | **gate run 2026-07-20 — 3/6 acceptance §M2 lines pass cleanly, 3 open** | M2 plan 2.10, DECISION_LOG 2.10 |
-| M3–M6 | not started (plan files written at preceding gates) | — |
+| M3 | **opened 2026-07-20** — checklist in progress (3.1 next) | M3 plan, DECISION_LOG 2026-07-20 |
+| M4–M6 | not started (plan files written at preceding gates) | — |
 
 ### M0 acceptance §M0 — evidence (run 2026-07-15, Windows 11, rustc 1.96.0, Intel Arc / Vulkan)
 
@@ -353,6 +358,13 @@ Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all
 
 ## Session log (newest first)
 
+- **2026-07-20** — M3 opened per owner direction ("continue with M3"), carrying forward M2's 3
+  open gate lines and the trail-buffer crash per M1's own precedent for a gate that didn't fully
+  pass. Wrote the missing M3 plan file (`plans/M3_ENRICHMENT_AND_NON_ADSB.md` — docs/07 says it
+  should have landed at the M2 gate itself; it hadn't), linked it from docs/07, and recorded the
+  L1/L2-tier-vs-M4 tension in both the plan file and here rather than silently working around it.
+  No implementation yet this entry — see the next session log line for item 3.1. DECISION_LOG
+  2026-07-20 (M3 opened).
 - **2026-07-20** — M2 item 2.10: the M2 gate. Ran, did not fully pass — **3 of 6 acceptance §M2
   lines pass cleanly, 3 open** — recorded honestly rather than silently marked done, same shape
   as M0's 6/7 and M1's 6/7. Per-line:
