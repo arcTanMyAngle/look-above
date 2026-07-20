@@ -50,6 +50,11 @@ fastrand = "2.4.1"
 # store: bundled SQLite, no system dependency (ADR-004).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
+# import/store: streaming CSV parsing for the OurAirports snapshot (M3 item 3.1) — import
+# fetches/converts, store re-reads the trimmed, bundled result on first run. Default features
+# already include Serde-based (header-name-matched) deserialization, so no extra feature flag.
+csv = "1.4.0"
+
 # render/app: exact pins — wgpu/winit churn is the known risk in ADR-003.
 wgpu = "=30.0.0"
 winit = "=0.30.13"

@@ -26,7 +26,7 @@ M2's gate record.
 
 ## Checklist
 
-- [ ] 3.1 OurAirports import: fetch `airports.csv`/`runways.csv` (URLs in the sources skill),
+- [x] 3.1 OurAirports import: fetch `airports.csv`/`runways.csv` (URLs in the sources skill),
       convert/bundle the same no-runtime-fetch way 2.2a bundled Natural Earth (`crates/import`
       already exists, depended on by nothing) — `store` has no network deps and must stay that
       way (M0 acceptance line 3). New migration `0002_airports.sql` (verbatim from docs/08,
@@ -35,8 +35,35 @@ M2's gate record.
       `AirportSize` (heliport/small/medium/large; drop `seaplane_base`/`balloonport`/`closed` —
       docs/09's own documented-at-import-time decision). Acceptance: airport count within 5% of
       source CSV row count.
-      *(Likely splits into 3.1a fetch/bundle + 3.1b migration/store/import-routine, same shape as
-      2.2a/2.2b — split explicitly here if scoping confirms it, don't leave it implicit.)*
+      *(2026-07-20: implemented — new `import-ourairports` binary in `crates/import` (host
+      allowlist + own unit tests, mirroring `import-basemap`'s exact shape), migration
+      `0002_airports.sql` verbatim from docs/08, `AirportSize::from_ourairports_type` added to
+      `core::contracts` (shared by both `import` and `store` so the type-drop ladder isn't
+      duplicated), a new `crate::ourairports` module in `store` (idempotent bundled-CSV seed +
+      `airports_in_bbox` query), and `Writer::airports_in_bbox` wired through the existing
+      `Command`-channel pattern — **not** a full `core::contracts::Store` impl (still blocked on
+      `positions`, M5's table, exactly as `lib.rs`'s own doc comment already explained). Did not
+      split 3.1a/3.1b — scoping held as one item cleanly, unlike 2.2's basemap fetch (no
+      shapefile/zip parsing here, just CSV). Delegated to the storage-agent (its stated remit:
+      "enrichment imports (OurAirports, FAA registry, METAR cache)"), independently re-verified
+      by this session: every changed/new file read in full, fresh `cargo fmt --check`/
+      `clippy --workspace --all-targets -D warnings`/`test --workspace` — **539 passed, 5
+      ignored, 0 failed** (+24 over 2.10's 515: 3 in `core::contracts`, 10 in the new
+      `import-ourairports` binary, 2 net in `migrations.rs` after fixing the now-stale
+      single-migration test to check each version's own table set honestly, 6 in
+      `store::ourairports`, 3 in `store::writer`). Live run of the import tool against the real
+      `davidmegginson.github.io` host confirmed the agent's reported counts exactly (bundled
+      `airports.csv` 71,086 rows / `runways.csv` 43,240 rows, both re-derived independently via
+      `wc -l` against the committed bundled assets — not just trusted from the report).
+      **"Within 5%" interpreted against the *kept-type* source count (71,086: large/medium/
+      small/heliport), not the raw 85,776-row upstream total** — the raw total includes ~13,355
+      `closed` rows alone, which the M3 plan's own `AirportSize` mapping decision (and
+      `crates/core/src/contracts.rs`'s pre-existing doc comment) already commits to dropping
+      entirely, so comparing against the undropped raw count would be the wrong denominator, not
+      a stricter reading of the acceptance line. Recorded here explicitly rather than left
+      implicit, same as every other acceptance-line interpretation call this project has made at
+      a gate. Runway *query* API stays out of scope (3.2's job); this item only needed runway
+      rows to exist, seeded and orphan-filtered. DECISION_LOG 2026-07-20 (3.1).)*
 - [ ] 3.2 Airport + runway rendering: markers for large/medium airports, runway-outline
       polylines at close zoom, reusing existing tessellation approach (`lyon`, per 2.2b's
       basemap precedent) rather than a new one. Scoped per the tension noted above — no LOD-tier

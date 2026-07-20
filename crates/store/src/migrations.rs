@@ -22,15 +22,21 @@ struct Migration {
 
 /// Every migration, oldest first.
 ///
-/// Migration 0001 creates only `aircraft` and `source_status` — the pair item 1.11's writer
-/// thread needs. The rest of docs/08's eventual schema (`positions`, `flights`, `airports`,
-/// `runways`, `airlines`, `metars`) is tagged there with its own milestone (M3/M5) and lands
-/// as its own numbered migration when that milestone needs it, rather than being created
-/// ahead of time with nothing to do.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../migrations/0001_init.sql"),
-}];
+/// Migration 0001 creates `aircraft` and `source_status` — the pair item 1.11's writer thread
+/// needs. Migration 0002 adds `airports` and `runways` (M3 item 3.1, the `OurAirports` import).
+/// The rest of docs/08's eventual schema (`positions`, `flights`, `airlines`, `metars`) is
+/// tagged there with its own milestone (M3/M5) and lands as its own numbered migration when
+/// that milestone needs it, rather than being created ahead of time with nothing to do.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../migrations/0002_airports.sql"),
+    },
+];
 
 /// Brings `conn` from whatever `user_version` it is already at up to [`MIGRATIONS`]'s latest.
 ///
@@ -101,6 +107,19 @@ mod tests {
         .expect("sqlite_master query succeeds")
     }
 
+    /// Applies every [`MIGRATIONS`] entry up to and including `max_version`, bypassing the
+    /// public [`apply`]'s "latest" ceiling — the only way to pin an individual migration's own
+    /// table set in a test once more than one migration exists (`apply` always walks to the
+    /// newest, so it cannot itself stop partway through on purpose).
+    fn apply_through(conn: &Connection, max_version: u32) {
+        for migration in MIGRATIONS {
+            if migration.version > max_version {
+                break;
+            }
+            apply_one(conn, migration).expect("migration applies");
+        }
+    }
+
     #[test]
     fn a_fresh_database_starts_at_version_zero() {
         let conn = memory_conn();
@@ -116,16 +135,38 @@ mod tests {
     }
 
     #[test]
-    fn applying_migrations_creates_exactly_the_tables_migration_0001_owns() {
+    fn migration_0001_alone_creates_exactly_aircraft_and_source_status() {
         let conn = memory_conn();
-        apply(&conn).expect("migrations apply");
+        apply_through(&conn, 1);
         assert!(table_exists(&conn, "aircraft"), "aircraft was not created");
         assert!(
             table_exists(&conn, "source_status"),
             "source_status was not created"
         );
-        // No other table (positions/airports/...) is created ahead of its milestone.
+        // Nothing from a later migration (airports/runways/...) exists yet at version 1.
         assert_eq!(table_count(&conn), 2);
+    }
+
+    #[test]
+    fn migration_0002_adds_exactly_airports_and_runways() {
+        let conn = memory_conn();
+        apply_through(&conn, 2);
+        assert!(table_exists(&conn, "airports"), "airports was not created");
+        assert!(table_exists(&conn, "runways"), "runways was not created");
+        // 0001's two tables plus 0002's two tables, nothing more.
+        assert_eq!(table_count(&conn), 4);
+    }
+
+    #[test]
+    fn applying_all_migrations_creates_exactly_the_tables_defined_so_far() {
+        let conn = memory_conn();
+        apply(&conn).expect("migrations apply");
+        for table in ["aircraft", "source_status", "airports", "runways"] {
+            assert!(table_exists(&conn, table), "{table} was not created");
+        }
+        // No other table (positions/flights/airlines/metars/...) is created ahead of its
+        // milestone.
+        assert_eq!(table_count(&conn), 4);
     }
 
     #[test]
@@ -134,14 +175,14 @@ mod tests {
         apply(&conn).expect("first apply succeeds");
         let after_first = user_version(&conn).expect("reads user_version");
 
-        // A second call must not re-run migration 0001's `CREATE TABLE` (which would error
+        // A second call must not re-run any migration's `CREATE TABLE` (which would error
         // against an existing table) and must leave the version exactly where it was.
         apply(&conn).expect("second apply is a no-op, not an error");
         assert_eq!(
             user_version(&conn).expect("reads user_version"),
             after_first
         );
-        assert_eq!(table_count(&conn), 2, "tables were not re-created");
+        assert_eq!(table_count(&conn), 4, "tables were not re-created");
     }
 
     #[test]
@@ -149,8 +190,9 @@ mod tests {
         let conn = memory_conn();
         // Simulate a connection whose `user_version` already claims the latest migration,
         // without the tables actually existing — `apply` must trust `user_version` and skip
-        // migration 0001 entirely rather than re-running it.
-        conn.pragma_update(None, "user_version", 1u32)
+        // every migration entirely rather than re-running any of them.
+        let latest = MIGRATIONS.last().expect("at least one migration").version;
+        conn.pragma_update(None, "user_version", latest)
             .expect("sets user_version");
         apply(&conn).expect("apply with nothing pending succeeds");
         assert_eq!(table_count(&conn), 0, "nothing should have run");

@@ -10,7 +10,9 @@ license.workspace = true
 look-above-core.workspace = true
 
 crossbeam-channel.workspace = true
+csv.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

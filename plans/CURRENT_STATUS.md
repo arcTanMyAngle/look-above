@@ -17,8 +17,25 @@
   at L2") presumes LOD tier switching that is actually M4's deliverable — 3.2 is scoped to the
   data/query half only, tier-gated visibility stays open into M4, same honest-carry pattern as
   every prior gate's open lines. DECISION_LOG 2026-07-20 (M3 opened).
-- **Next action:** item 3.1 — OurAirports import (airports.csv/runways.csv → bundled asset →
-  migration 0002 → `Store::airports_in_bbox`). Plan: [M3_ENRICHMENT_AND_NON_ADSB.md](M3_ENRICHMENT_AND_NON_ADSB.md)
+- **3.1 landed:** OurAirports/runways import. New `import-ourairports` binary (`crates/import`,
+  mirrors 2.2a's `import-basemap` shape exactly — host allowlist, own unit tests, counts-only
+  stdout), migration `0002_airports.sql` (verbatim from docs/08), `AirportSize::
+  from_ourairports_type` in `core::contracts` (shared by import + store so the type-drop ladder
+  isn't duplicated — drops `seaplane_base`/`balloonport`/`closed`, the mapping decision
+  `contracts.rs` had already flagged as pending), and a new `store::ourairports` module
+  (idempotent bundled-CSV seed + `airports_in_bbox` query) wired into `Writer` via its existing
+  `Command`-channel pattern — deliberately **not** a full `core::contracts::Store` impl yet
+  (`positions` is still M5's table). Delegated to the storage-agent (its named remit), independently
+  re-verified: every file read in full, fresh fmt/clippy/test — **539 passed, 5 ignored, 0
+  failed** (+24 over the M2 gate's 515). Bundled-asset row counts (71,086 airports / 43,240
+  runways after the type-drop) re-derived independently via `wc -l`, matching the agent's report
+  exactly. **"Within 5%" was interpreted against the kept-type source count, not the raw
+  85,776-row upstream total** (which includes ~13,355 intentionally-dropped `closed` rows alone)
+  — recorded explicitly since it's a real interpretation call, not a re-derivation of the obvious
+  reading. Runway query API stays out of scope (3.2's job). DECISION_LOG 2026-07-20 (3.1).
+- **Next action:** item 3.2 — airport/runway rendering (markers + runway outlines at close
+  zoom), scoped per the L1/L2-vs-M4 tension recorded at the top of the M3 plan file. Plan:
+  [M3_ENRICHMENT_AND_NON_ADSB.md](M3_ENRICHMENT_AND_NON_ADSB.md)
 - **New finding at the 2.10 gate, not yet fixed:** the (also-2.10) label legibility fix that
   doubled `LABEL_CHAR_WIDTH_PX`/`LABEL_CHAR_HEIGHT_PX` makes dense regional clusters (150+
   aircraft on screen) read as visually-overlapping clutter — likely still zero *algorithmic*
@@ -339,7 +356,7 @@
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
 | M1 | **gate run 2026-07-18 — 6/7; token-refresh line open, owner-accepted** | M1 plan 1.13 |
 | M2 | **gate run 2026-07-20 — 3/6 acceptance §M2 lines pass cleanly, 3 open** | M2 plan 2.10, DECISION_LOG 2.10 |
-| M3 | **opened 2026-07-20** — checklist in progress (3.1 next) | M3 plan, DECISION_LOG 2026-07-20 |
+| M3 | **opened 2026-07-20** — checklist in progress (3.1 done, 3.2 next) | M3 plan, DECISION_LOG 2026-07-20 |
 | M4–M6 | not started (plan files written at preceding gates) | — |
 
 ### M0 acceptance §M0 — evidence (run 2026-07-15, Windows 11, rustc 1.96.0, Intel Arc / Vulkan)
@@ -358,6 +375,26 @@ Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all
 
 ## Session log (newest first)
 
+- **2026-07-20** — M3 item 3.1: OurAirports/runways import. Delegated to the storage-agent
+  (extend `crates/import` per 2.2a's precedent; new `store::ourairports` seed/query module;
+  migration `0002_airports.sql`), independently re-verified rather than trusted: every
+  changed/new file (`crates/core/src/contracts.rs`, `crates/core/src/error.rs`,
+  `crates/import/src/import_ourairports.rs`, `crates/import/Cargo.toml`,
+  `crates/store/migrations/0002_airports.sql`, `crates/store/src/{ourairports.rs,writer.rs,
+  migrations.rs,lib.rs}`, `crates/store/Cargo.toml`, workspace `Cargo.toml`) read in full, fresh
+  `cargo fmt --check`/`clippy --workspace --all-targets -D warnings`/`test --workspace` —
+  **539 passed, 5 ignored, 0 failed** (+24 over 2.10's 515), matching the agent's own reported
+  count. Bundled-asset row counts (71,086 kept airports / 43,240 kept runways, out of 85,776/
+  48,132 source rows) independently re-derived via `wc -l` against the committed
+  `crates/store/assets/ourairports/{airports,runways}.csv` (~6.5 MB combined) — matched the
+  agent's report exactly, not just trusted. Interpreted the acceptance line's "within 5%" against
+  the kept-type source count rather than the raw upstream total (which bakes in ~13,355
+  intentionally-dropped `closed` rows and would be the wrong denominator), recorded as an explicit
+  call in the M3 plan file. `Writer` gained `airports_in_bbox` through its existing
+  `Command`-channel pattern, seeded once per `Writer::open` from the bundled snapshot,
+  idempotent across repeated opens against the same on-disk file (own test). Did not implement
+  the full `core::contracts::Store` trait (still blocked on `positions`, M5's own table) or any
+  runway query API (3.2's job) or rendering (3.2). DECISION_LOG 2026-07-20 (3.1). Next: 3.2.
 - **2026-07-20** — M3 opened per owner direction ("continue with M3"), carrying forward M2's 3
   open gate lines and the trail-buffer crash per M1's own precedent for a gate that didn't fully
   pass. Wrote the missing M3 plan file (`plans/M3_ENRICHMENT_AND_NON_ADSB.md` — docs/07 says it

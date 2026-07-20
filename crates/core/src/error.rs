@@ -85,6 +85,14 @@ pub enum StoreError {
     /// A stored row could not be read back into its domain type.
     #[error("stored data is invalid: {message}")]
     Corrupt { message: String },
+
+    /// A bundled import asset (e.g. `OurAirports`' seed snapshot, M3 item 3.1) failed to
+    /// parse. Distinct from `Corrupt`, which is about data already round-tripped through
+    /// `SQLite`: this fires before any row reaches the database, when the compiled-in asset
+    /// itself does not match the shape the seed step expects — a build-time defect in the
+    /// shipped bundle, not a runtime storage failure.
+    #[error("bundled asset {asset} could not be parsed: {message}")]
+    SeedAsset { asset: String, message: String },
 }
 
 #[cfg(test)]

@@ -4,27 +4,30 @@
 //!
 //! [`Writer`] is the cheap-to-clone handle every caller holds; it never touches `SQLite`
 //! itself, only a `crossbeam` command channel the dedicated thread drains. Migration 0001
-//! backs exactly one capability at this item — recording a poll cycle's outcome against
-//! `source_status`, and reading it back — which is also the other half of 1.7's seam: the
-//! `credits_used_today` [`Writer::source_status`] hands back is the raw value
-//! `ingest::budget::CreditLedger::restored` rehydrates from. That call itself happens in
-//! `ingest`/`app` wiring (a later item); this crate only stores and returns the counter, with
-//! no notion of UTC-day rollover — `restored` already tolerates a stale persisted value.
+//! backs recording a poll cycle's outcome against `source_status`, and reading it back — which
+//! is also the other half of 1.7's seam: the `credits_used_today` [`Writer::source_status`]
+//! hands back is the raw value `ingest::budget::CreditLedger::restored` rehydrates from. That
+//! call itself happens in `ingest`/`app` wiring (a later item); this crate only stores and
+//! returns the counter, with no notion of UTC-day rollover — `restored` already tolerates a
+//! stale persisted value. Migration 0002 backs [`Writer::airports_in_bbox`] (M3 item 3.1),
+//! seeded once from the bundled `OurAirports` snapshot in `crate::ourairports`.
 //!
 //! The command set is one enum behind one channel, not one channel per operation, on purpose:
-//! a later item can add a variant for `positions`/`airports` (once those tables exist) without
-//! changing [`Writer`]'s public shape.
+//! a later item can add a variant for `positions` (once that table exists) without changing
+//! [`Writer`]'s public shape.
 
 use std::path::Path;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use look_above_core::contracts::{Airport, AirportSize};
 use look_above_core::error::StoreError;
-use look_above_core::types::{SourceId, UnixSeconds};
+use look_above_core::types::{BBox, SourceId, UnixSeconds};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::backend_error;
 use crate::migrations;
+use crate::ourairports;
 
 /// A `source_status` row read back — the poll-health snapshot the debug overlay (M1) and the
 /// credit-ledger restore (`ingest::budget::CreditLedger::restored`) both want.
@@ -60,6 +63,11 @@ enum Command {
         source: SourceId,
         reply: Sender<Result<Option<SourceStatus>, StoreError>>,
     },
+    AirportsInBbox {
+        bbox: BBox,
+        min_size: AirportSize,
+        reply: Sender<Result<Vec<Airport>, StoreError>>,
+    },
 }
 
 /// A handle to the writer thread. Cheap to clone (it is just a channel [`Sender`]); every
@@ -80,6 +88,11 @@ impl Writer {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
         let conn = open_connection(path)?;
         migrations::apply(&conn)?;
+        // Data seed, not schema: migrations bring the tables into existence exactly once per
+        // `user_version`, but `Writer::open` runs against the same persistent on-disk file on
+        // every app start, so the bundled OurAirports snapshot needs its own idempotency check
+        // (docs/08 says nothing about *data*, only schema).
+        ourairports::seed_if_empty(&conn)?;
 
         let (commands, inbox) = unbounded();
         thread::Builder::new()
@@ -131,6 +144,21 @@ impl Writer {
     /// takes.
     pub fn source_status(&self, source: SourceId) -> Result<Option<SourceStatus>, StoreError> {
         self.call(|reply| Command::SourceStatus { source, reply })
+    }
+
+    /// Airports within `bbox` at or above `min_size` — same signature as
+    /// `core::contracts::Store::airports_in_bbox` (docs/09), backed by migration 0002's
+    /// `airports` table, seeded from the bundled `OurAirports` snapshot on first open.
+    pub fn airports_in_bbox(
+        &self,
+        bbox: BBox,
+        min_size: AirportSize,
+    ) -> Result<Vec<Airport>, StoreError> {
+        self.call(|reply| Command::AirportsInBbox {
+            bbox,
+            min_size,
+            reply,
+        })
     }
 
     /// Builds a [`Command`] around a fresh one-shot reply channel, sends it, and blocks for
@@ -200,6 +228,14 @@ fn run(conn: &Connection, inbox: Receiver<Command>) {
             }
             Command::SourceStatus { source, reply } => {
                 let result = read_source_status(conn, source);
+                let _ignored = reply.send(result);
+            }
+            Command::AirportsInBbox {
+                bbox,
+                min_size,
+                reply,
+            } => {
+                let result = ourairports::airports_in_bbox(conn, bbox, min_size);
                 let _ignored = reply.send(result);
             }
         }
@@ -453,6 +489,82 @@ mod tests {
             .expect("reads via the original handle")
             .expect("row exists");
         assert_eq!(status.credits_used_today, 3);
+    }
+
+    // ---- Airports (M3 item 3.1): seed-on-open, and the bbox/min_size query ----------------
+
+    #[test]
+    fn writer_open_seeds_airports_and_runways_from_the_bundled_snapshot() {
+        let writer = Writer::open(":memory:").expect("writer starts");
+        // A tiny, permissive bbox covering the whole planet at the lowest tier: if the seed
+        // ran, this returns rows; if it didn't, it returns none.
+        let whole_world = BBox::new(-90.0, -180.0, 90.0, 180.0).expect("valid bbox");
+        let airports = writer
+            .airports_in_bbox(whole_world, AirportSize::Heliport)
+            .expect("queries");
+        assert!(
+            !airports.is_empty(),
+            "Writer::open should have seeded the bundled OurAirports snapshot"
+        );
+    }
+
+    #[test]
+    fn writer_airports_in_bbox_returns_only_the_requested_region_and_size() {
+        let writer = Writer::open(":memory:").expect("writer starts");
+        // JFK's coordinates, a real `large_airport` in the bundled snapshot.
+        let nyc_area = BBox::new(40.0, -75.0, 41.0, -73.0).expect("valid bbox");
+        let large_only = writer
+            .airports_in_bbox(nyc_area, AirportSize::Large)
+            .expect("queries");
+        assert!(
+            large_only.iter().any(|airport| airport.ident == "KJFK"),
+            "JFK should be among the large airports in the NYC-area bbox"
+        );
+        assert!(
+            large_only
+                .iter()
+                .all(|airport| airport.size == AirportSize::Large),
+            "AirportSize::Large must exclude medium/small/heliport results"
+        );
+
+        let elsewhere = BBox::new(-1.0, -1.0, 0.0, 0.0).expect("valid bbox"); // Gulf of Guinea
+        let far_away = writer
+            .airports_in_bbox(elsewhere, AirportSize::Heliport)
+            .expect("queries");
+        assert!(
+            far_away.iter().all(|airport| airport.ident != "KJFK"),
+            "a bbox nowhere near JFK must not return it"
+        );
+    }
+
+    #[test]
+    fn re_opening_a_writer_against_the_same_on_disk_file_does_not_duplicate_seeded_airports() {
+        let path = unique_temp_db_path();
+        let _cleanup = TempDbFile(path.clone());
+
+        let first_count = {
+            let writer = Writer::open(&path).expect("first open seeds");
+            let whole_world = BBox::new(-90.0, -180.0, 90.0, 180.0).expect("valid bbox");
+            writer
+                .airports_in_bbox(whole_world, AirportSize::Heliport)
+                .expect("queries")
+                .len()
+        };
+        // The first `Writer` (and its thread) is dropped here; a second `Writer::open` against
+        // the same file is exactly the "app restarts" scenario the idempotency check targets.
+        let second_count = {
+            let writer = Writer::open(&path).expect("second open must not re-seed");
+            let whole_world = BBox::new(-90.0, -180.0, 90.0, 180.0).expect("valid bbox");
+            writer
+                .airports_in_bbox(whole_world, AirportSize::Heliport)
+                .expect("queries")
+                .len()
+        };
+
+        assert_eq!(
+            first_count, second_count,
+            "re-opening the same on-disk database must not duplicate seeded rows"
+        );
     }
 
     // ---- On-disk smoke test: WAL is real, not just requested ------------------------------

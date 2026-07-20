@@ -138,6 +138,26 @@ pub enum AirportSize {
     Large,
 }
 
+impl AirportSize {
+    /// Maps an `OurAirports` `airports.type` value (docs/08) to its tier, or `None` for
+    /// anything outside the ladder this type models.
+    ///
+    /// `seaplane_base`, `balloonport`, and `closed` are deliberately excluded — those rows are
+    /// dropped entirely at import time (M3 item 3.1) rather than folded into `Heliport`/`Small`,
+    /// which is the mapping decision this enum's own doc comment anticipated. Any other,
+    /// undocumented value (upstream column drift) also maps to `None` so the importer's
+    /// drop-unless-recognized behavior stays a single `match`, not two separate checks.
+    pub fn from_ourairports_type(raw: &str) -> Option<Self> {
+        match raw {
+            "heliport" => Some(Self::Heliport),
+            "small_airport" => Some(Self::Small),
+            "medium_airport" => Some(Self::Medium),
+            "large_airport" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +182,44 @@ mod tests {
         .filter(|size| *size >= AirportSize::Medium)
         .collect();
         assert_eq!(visible_at_l1, [AirportSize::Medium, AirportSize::Large]);
+    }
+
+    #[test]
+    fn ourairports_type_mapping_keeps_the_four_size_tiers() {
+        assert_eq!(
+            AirportSize::from_ourairports_type("heliport"),
+            Some(AirportSize::Heliport)
+        );
+        assert_eq!(
+            AirportSize::from_ourairports_type("small_airport"),
+            Some(AirportSize::Small)
+        );
+        assert_eq!(
+            AirportSize::from_ourairports_type("medium_airport"),
+            Some(AirportSize::Medium)
+        );
+        assert_eq!(
+            AirportSize::from_ourairports_type("large_airport"),
+            Some(AirportSize::Large)
+        );
+    }
+
+    #[test]
+    fn ourairports_type_mapping_drops_non_airport_and_closed_types() {
+        for dropped in ["seaplane_base", "balloonport", "closed"] {
+            assert_eq!(
+                AirportSize::from_ourairports_type(dropped),
+                None,
+                "{dropped} must be dropped at import, not silently mapped"
+            );
+        }
+    }
+
+    #[test]
+    fn ourairports_type_mapping_drops_unrecognized_values_too() {
+        // Upstream column drift (a future OurAirports `type` we don't know yet) must fail
+        // closed the same way as the documented drop list, not panic or default to a tier.
+        assert_eq!(AirportSize::from_ourairports_type("space_elevator"), None);
     }
 
     #[test]

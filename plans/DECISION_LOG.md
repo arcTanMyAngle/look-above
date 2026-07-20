@@ -2475,3 +2475,41 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   marked done.
 - Checklist order follows docs/07's own M3 sentence order (airports/runways import → rendering →
   METAR → adsbdb selection lookups → info card wiring → gate), not re-derived from scratch.
+
+## 2026-07-20 — M3 item 3.1: OurAirports import lands
+
+- **Extended `crates/import` rather than adding a new crate** — same reasoning 2.2a already
+  established for Natural Earth: `store` has no network dependencies and must stay that way (M0
+  acceptance line 3), so a static, public dataset needing a live fetch belongs in the one
+  workspace crate that's allowed to touch the network at build/setup time and depended on by
+  nothing at runtime.
+- **One item, not split into 3.1a/3.1b** (unlike 2.2's basemap fetch): OurAirports is plain CSV,
+  no shapefile/zip parsing, so fetch-and-bundle and migration-and-query stayed small enough to
+  scope together without the session losing track of either half.
+- **`AirportSize::from_ourairports_type` lives in `core::contracts`**, not duplicated into
+  `import` and `store` separately — both need the identical `seaplane_base`/`balloonport`/
+  `closed`-drop ladder, and `contracts.rs`'s own doc comment on `AirportSize` had already flagged
+  "that mapping is an M3 decision, recorded when the importer lands" as the seam to close here.
+- **New `StoreError::SeedAsset` variant**, distinct from the existing `Corrupt` — `Corrupt` is
+  documented as data that already round-tripped through SQLite; a bundled-asset parse failure
+  fires before any row reaches the database, a build-time defect in the shipped bundle rather
+  than a runtime storage failure.
+- **"Within 5% of source CSV row count" (docs/11 §M3 line 1) is measured against the *kept-type*
+  source count (71,086 rows: large/medium/small/heliport), not the raw 85,776-row upstream
+  total.** The raw total includes ~13,355 `closed` rows alone (plus balloonport/seaplane_base),
+  which the type-drop mapping above already commits to excluding entirely — comparing the seeded
+  DB against that undropped total would silently fail an acceptance line the project's own prior
+  design decision (the `AirportSize` ladder) makes structurally impossible to hit literally.
+  Recorded here as an explicit interpretation, the same honesty standard applied to every other
+  acceptance-line reading at a gate (e.g. M1's literal-10-minute-scope call).
+  Bundled result: 71,086 airports / 43,240 runways (after also dropping runways whose airport was
+  cut), ~6.5 MB combined committed asset.
+- **Did not implement `core::contracts::Store` for `Writer`** — only added
+  `Writer::airports_in_bbox` through the existing `Command`-channel pattern. The full trait still
+  can't be implemented honestly: `insert_positions`/`prune` need the `positions` table, which
+  stays M5's deliverable, exactly as `crates/store/src/lib.rs`'s own pre-existing doc comment
+  already explained before this item touched the file.
+- Delegated to the storage-agent (its named remit covers "enrichment imports (OurAirports, FAA
+  registry, METAR cache)"); independently re-verified — full diff read, fresh fmt/clippy/test
+  (**539 passed, 5 ignored, 0 failed**, +24 over the M2 gate's 515), and the bundled CSV row
+  counts re-derived independently via `wc -l` rather than trusted from the agent's own report.
