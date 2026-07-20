@@ -662,7 +662,35 @@ and the [high-fidelity-flight-visualization skill](../.claude/skills/high-fideli
       new test was independently confirmed to actually *run* (not skip) on this machine — DX12
       WARP fallback adapter found, real render/readback executed end to end, not just compiled.
       DECISION_LOG 2.9.)*
-- [ ] 2.10 Gate: live run over a busy hub; visual QA §L2-core; frame-stats evidence; human review.
+- [~] 2.10 Gate: live run over a busy hub; visual QA §L2-core; frame-stats evidence; human review.
+      *(2026-07-20: run, not a full pass — 3 of 6 acceptance §M2 lines pass cleanly, 3 open;
+      recorded honestly rather than silently marked done, same shape as M0's 6/7 and M1's 6/7.
+      Full per-line evidence in CURRENT_STATUS.md's gate table. Found already in the working
+      tree at this session's start, uncommitted from an interrupted prior attempt: a `criterion`
+      gate-benchmark harness (`crates/core/benches/interpolation.rs`, docs/10 §5) and a label
+      legibility fix (`LABEL_CHAR_WIDTH_PX`/`LABEL_CHAR_HEIGHT_PX` `7×12`→`16×28`, found illegible
+      at true on-screen size with no mipmaps on the single-level SDF atlas; `InfoCardLayer`'s
+      origin moved `80`→`145` to stay clear of the now-taller F3 HUD) — both finished, verified,
+      and committed here rather than redone. **New finding this session, not yet fixed**: that
+      2x label-size bump makes dense regional clusters (150+ aircraft on screen) read as a
+      cluttered, visually-overlapping mass — plausibly still zero *algorithmic* overlap (the
+      collision sweep's own invariant is unit-tested) but a real legibility regression at the
+      density this gate's own busy-hub line requires; flagged for a follow-up, not fixed here
+      (diagnosing the collision sweep at this density is new work, not gate-checking). **Live
+      run**: released binary, real `credentials.json`, regional busy hub reached (Italy/Adriatic,
+      `count=219` OpenSky-returned aircraft, comfortably over the ≥200 line) after several
+      mistargeted attempts — most of this session's time went to a DPI-awareness bug in the
+      verification scripting itself (`SetProcessDPIAware` is per-process; separate PowerShell
+      invocations after the first silently lost it, so `GetClientRect`/cursor coordinates were
+      computed against a virtualized 1280×800 instead of the true 1920×1200, throwing pan/zoom
+      targeting off by ~1.5x compounded with zoom — same category of pitfall as 2.2b's/2.8b's own
+      DPI/window-finding scripting snags, not an app bug; fixed by sourcing
+      `SetProcessDPIAware()` unconditionally in the shared helper script). **Reconfirmed the
+      flagged trail-buffer crash** twice more, live, while mistargeting through whole-world/
+      hemisphere-scale views — `wgpu` `Device::create_buffer` rejecting a ~400 MiB trail vertex
+      buffer against this adapter's 256 MiB cap — but the properly-scoped regional (Italy) view
+      never crashed, consistent with the crash being a whole-world/huge-region density problem,
+      not an L2-core one. DECISION_LOG 2.10.)*
 
 ## Design notes
 

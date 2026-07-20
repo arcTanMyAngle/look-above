@@ -629,8 +629,10 @@ struct InfoCardLayer {
 
 /// Fixed screen-pixel origin for the info-card block — below [`STATS_OVERLAY_ORIGIN_PX`]'s own
 /// 4-line HUD (`(10, 10)` plus 4 lines at `label::LABEL_CHAR_HEIGHT_PX + LINE_LEADING_PX` each) by
-/// a comfortable margin, so the two never overlap whether or not F3 is on.
-const INFO_CARD_ORIGIN_PX: (f64, f64) = (10.0, 80.0);
+/// a comfortable margin, so the two never overlap whether or not F3 is on. Moved down from the
+/// original `80.0` when `label::LABEL_CHAR_HEIGHT_PX` grew (M2 gate item 2.10's legibility fix) —
+/// the HUD block now ends around `y=128` (`10 + 4 * (28 + 2)`), not `y=64`.
+const INFO_CARD_ORIGIN_PX: (f64, f64) = (10.0, 145.0);
 
 impl InfoCardLayer {
     /// Packs `content`'s lines (or nothing, when `content` is `None` — nothing selected) into

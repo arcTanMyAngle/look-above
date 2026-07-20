@@ -3,15 +3,24 @@
 > The single source of truth for "where are we". Every session reads this first and updates
 > it last. Keep the Now section ≤ 10 lines; move history to the log below.
 
-## Now (updated 2026-07-19)
+## Now (updated 2026-07-20)
 
-- **Phase:** **M2 opened at the owner's direction**, M1 gate left at 6/7 (token-refresh line
-  open, see below — same shape as M0→M1). Items 2.1, 2.1b, 2.2a, 2.2b, 2.3a, 2.3b, 2.4a, 2.4b,
-  2.5, 2.6a, 2.6b, 2.7a, 2.7b, 2.8a, 2.8b, 2.9 done. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
-- **Next action: 2.10, the M2 gate** — the only item left on the checklist. The flagged
-  trail-buffer crash below should land first (or at least be addressed) before 2.10's
-  live-run-over-a-busy-hub line is attempted at whole-world zoom, since that's exactly the
-  condition that reproduces it; owner's call on order.
+- **Phase: M2's checklist is fully worked (2.1–2.10); the gate ran 2026-07-20 and did not fully
+  pass** — 3 of 6 acceptance §M2 lines pass cleanly, 3 are open (see the gate table and M2 plan
+  2.10 for full per-line evidence). Per CLAUDE.md, **not opening M3 unprompted** — this is the
+  owner's call, same as M0→M1 and M1→M2 were.
+- **Next action: owner decides how to proceed** — options are (a) open M3 with the 3 open M2
+  lines carried forward (same shape as M1's token-refresh line), (b) work the open lines first
+  (heading spot-check needs the info card to expose a heading value it currently doesn't; the
+  `sim::advance_all` gate benchmark exceeds its 2ms/10k-aircraft budget — 3.2–4.3ms measured on
+  this real 16-core machine; antimeridian wrap is unimplemented, not just untested), or (c) open
+  a follow-up item for the label-clutter finding below. Plan: [M2_HIGH_FIDELITY_RENDERER.md](M2_HIGH_FIDELITY_RENDERER.md)
+- **New finding at the 2.10 gate, not yet fixed:** the (also-2.10) label legibility fix that
+  doubled `LABEL_CHAR_WIDTH_PX`/`LABEL_CHAR_HEIGHT_PX` makes dense regional clusters (150+
+  aircraft on screen) read as visually-overlapping clutter — likely still zero *algorithmic*
+  overlap (the collision sweep's own invariant is unit-tested) but a real legibility regression
+  at the density the gate's own busy-hub line requires. Flagged for follow-up, not diagnosed
+  further here.
 - **2.9 landed:** the headless renderer smoke test (docs/10 §4), wired into CI by simply being
   part of `cargo test --workspace` (no separate CI job needed). `Renderer` gained a private
   `Target` enum (`Windowed` vs a `#[cfg(test)]`-only `Offscreen`) so a new
@@ -26,15 +35,19 @@
   to the renderer-agent, independently re-verified (full diff read, fresh fmt/clippy/test) —
   **515 passed, 5 ignored, 0 failed** (render 112→113, +1 over 2.8b's 514); the new test was
   confirmed to actually *run* (not skip) on this machine via DX12 WARP. DECISION_LOG 2.9.
-- **⚠ Still open, higher-priority than 2.10: the reproducible trail-buffer crash** found live
+- **⚠ Still open, carried past the gate: the reproducible trail-buffer crash** found live
   at 2.8a (not a selection-path bug, not touched by 2.8b either). Running window mode at
   whole-world zoom for ~2–2.5 minutes panics: `wgpu` rejects the trail vertex buffer at ~279 MiB
   against this adapter's 256 MiB `max_buffer_size`. This is the already-flagged 2.5/2.6b LOD gap
   (no L0/L1 cross-fade, every aircraft draws a full unbounded 5-min trail at any zoom) turning out
   to be a crash, not just a perf cost, once ~9,800 aircraft each carry a growing trail
-  simultaneously. Reproduced twice independently at 2.8a. A future milestone item (LOD tiers, or a
-  trail-vertex cap as a stopgap) should land before the M2 gate (2.10)'s live-run-over-a-busy-hub
-  line is attempted at whole-world zoom.
+  simultaneously. Reproduced twice more at the 2.10 gate (2026-07-20, both times while
+  mistargeting the live-verification camera through whole-world/hemisphere-scale views, ~400 MiB
+  attempted that time); the gate's own properly-scoped regional view (Italy/Adriatic, 219
+  aircraft) never crashed, consistent with this being a whole-world/huge-region density problem,
+  not an L2-core one — so 2.10 proceeded on the regional scope rather than waiting on a fix. A
+  future milestone item (LOD tiers, or a trail-vertex cap as a stopgap) is still needed before any
+  whole-world-zoom line is ever added to a gate.
 - **2.8b landed:** the selected aircraft's white glyph outline and info card, closing out
   selection (2.8/2.8a/2.8b). The outline is a second, `InstanceRaw::scale_mul`-scaled, solid-white
   copy of the selected aircraft's own instance, packed *before* the ordinary instances in the same
@@ -321,7 +334,7 @@
 |---|---|---|
 | M0 | **gate run 2026-07-15 — 6/7; owner opened M1 with the badge line outstanding** | per-line below |
 | M1 | **gate run 2026-07-18 — 6/7; token-refresh line open, owner-accepted** | M1 plan 1.13 |
-| M2 | **opened 2026-07-18 (owner call, M1 gate left at 6/7)** | — |
+| M2 | **gate run 2026-07-20 — 3/6 acceptance §M2 lines pass cleanly, 3 open** | M2 plan 2.10, DECISION_LOG 2.10 |
 | M3–M6 | not started (plan files written at preceding gates) | — |
 
 ### M0 acceptance §M0 — evidence (run 2026-07-15, Windows 11, rustc 1.96.0, Intel Arc / Vulkan)
@@ -339,6 +352,85 @@
 Suite at the gate: **87 tests** (51 core, 31 app, 5 render), `fmt`/`clippy --all-targets -D warnings`/`test` all green. No code changed at 0.8; working tree clean afterwards.
 
 ## Session log (newest first)
+
+- **2026-07-20** — M2 item 2.10: the M2 gate. Ran, did not fully pass — **3 of 6 acceptance §M2
+  lines pass cleanly, 3 open** — recorded honestly rather than silently marked done, same shape
+  as M0's 6/7 and M1's 6/7. Per-line:
+  1. **60fps/p95<16.6ms with ≥200 regional aircraft — pass (with a caveat)**: at the properly-
+     scoped regional busy hub reached (Italy/Adriatic, `count=219` OpenSky-returned aircraft),
+     `p95_ms` read ~11ms directly from the F3 HUD's own log line (well under budget); a
+     continuous-pan sample was confounded by an oversized region at the time (3,018 instances,
+     not the ≥200-aircraft regional scope) and isn't independently isolated.
+  2. **No visible teleport, correction blend ≤2s — pass**: two screenshots 45s apart over the
+     same region showed continuous glide (small per-aircraft deltas, no jarring jumps), backed by
+     `core::sim`'s own blend unit tests (`blend_converges_to_the_new_fix_within_the_window`,
+     `blend_never_moves_backwards_along_track`).
+  3. **Glyph heading matches true track, ≥10 spot-checked — open**: docs/13's own wording
+     ("click → compare card value vs on-screen heading") assumes the info card shows a heading
+     value; it doesn't (2.8b's card is callsign/alt/speed/source only) — a gap 2.8b itself flagged
+     for this gate to check, confirmed still open rather than silently worked around.
+  4. **Stale aircraft fade after 60s and are removed — pass**: observed live and directly in
+     logs (`tracked` 142→0 over ~20s when a retarget moved off a populated region), backed by
+     `core::sim`'s `stale_fade_ramps_over_the_fade_window_then_drops` and
+     `a_track_past_the_drop_horizon_carries_no_trail_into_the_feed`.
+  5. **Base map renders, no antimeridian seams — open**: coastlines confirmed crisp/clean at
+     every zoom level reached, but the test region (Italy/Adriatic) never approached ±180°
+     longitude, and antimeridian wrap is unimplemented (2.3a/2.3b's own documented scope cut), not
+     merely untested — this line cannot honestly pass until that lands.
+  6. **Renderer smoke test + interpolation benchmarks within budget — open (mixed)**: the smoke
+     test passes (part of the green 515-test workspace suite). Of the two docs/10 §5 gate
+     benchmarks (a new `criterion` harness, `crates/core/benches/interpolation.rs`, found
+     uncommitted from an interrupted prior attempt and finished here): `web_mercator_forward_batch`
+     passes comfortably (94–124µs vs the 500µs/10k-point budget); `sim_advance_all` **exceeds**
+     its 2ms/10k-aircraft budget (3.2–4.3ms measured, on this real 16-core/22-thread Intel Core
+     Ultra 7 155H — more cores than the budget's own "8 cores" reference, so not a weak-hardware
+     excuse) and got *worse* on a repeat run, consistent with thermal/background-load variance on
+     a laptop rather than a stable regression, but not chased further (fixing sim performance is
+     new work, not gate-checking). docs/10 §5's third bullet (store-insert benchmark) stays out of
+     scope per the harness's own module doc — `core::sim` has nothing to do with persistence and
+     `look-above-store` has no `positions` table yet (M5's own deliverable).
+
+  **Also landed while working the gate** (found uncommitted at session start from an interrupted
+  prior attempt, finished and verified here): a label legibility fix —
+  `label::LABEL_CHAR_WIDTH_PX`/`LABEL_CHAR_HEIGHT_PX` `7×12`→`16×28` (the original size aliased
+  distinguishing strokes away at true on-screen size, no mipmaps on the single-level SDF atlas;
+  confirmed by dumping the atlas bytes directly — every glyph rasterizes correctly — which pointed
+  at display-side minification, not glyph data), and `renderer::InfoCardLayer`'s fixed origin
+  moved `80`→`145` to stay clear of the now-taller F3 HUD block. Live-confirmed legible without
+  upscaling in a tight zoom screenshot. fmt/clippy/test all green throughout — **515 passed, 5
+  ignored, 0 failed**, unchanged from 2.9 (a constant tweak, no new tests needed).
+
+  **New finding, not yet fixed**: that same 2x label-size bump makes dense regional clusters
+  (150+ aircraft on screen, e.g. the Italy/Adriatic hub itself) read as a visually-overlapping
+  cluttered mass in screenshots — plausibly still zero *algorithmic* overlap (2.7b's collision
+  sweep has its own unit-tested no-two-rects-overlap invariant, not re-derived here) but a real
+  legibility regression at exactly the density this gate's own busy-hub line requires. Flagged
+  for a follow-up item rather than diagnosed further (out of scope for gate-checking itself).
+
+  **Live run**: released binary (`cargo build --release`), real `credentials.json`, regional busy
+  hub reached (Italy/Adriatic) after a difficult start — most of the session's own time went to a
+  DPI-awareness bug in the verification scripting, not the app: `SetProcessDPIAware` is
+  per-process, and every PowerShell tool invocation is a fresh process, so only the very first
+  navigation script (which called it) got true 1920×1200 coordinates — every subsequent pan/zoom
+  script silently computed against a DPI-virtualized 1280×800 client rect instead, throwing
+  cursor-anchored zoom targeting off by ~1.5x compounded across repeated zoom steps (several
+  wildly mistargeted views: Northern Canada, a Grand-Canyon-scale over-zoom, mid-Pacific/Hawaii).
+  Same category of pitfall as 2.2b's DPI screenshot bug and 2.8b's `FindWindow` miss — a
+  scripting snag, not an app fault — fixed by sourcing `SetProcessDPIAware()` unconditionally at
+  the top of the shared helper script rather than assuming it carries across invocations.
+  **Reconfirmed the flagged trail-buffer crash twice more** during the mistargeted
+  whole-world/hemisphere-scale detours (a ~400 MiB trail vertex buffer against the 256 MiB cap);
+  the properly-scoped regional view never crashed once reached. A planned network-kill-for-90s
+  test (docs/13's dead-reckoning/reacquisition line) was **not performed**: adding even a
+  process-scoped outbound firewall rule was denied by this environment's own auto-mode
+  classifier as a shared-system change requiring explicit authorization — not attempted around,
+  left for the owner to run by hand if wanted. Clean `WM_CLOSE` exit (`close requested → window
+  closed`, confirmed in logs); scratch `look_above.db` deleted after. Credit spend: several
+  whole-world/regional poll cycles across four relaunches while retargeting, `spent_today` ended
+  around 286 of 3,200 (~9%), nowhere near the 80% cap. Evidence screenshots and full run logs
+  under `qa/2026-07-20/` (gitignored, per docs/13's own evidence convention). DECISION_LOG 2.10.
+  **Per CLAUDE.md, M3 is not opened here** — the owner decides whether to proceed with the 3 open
+  lines carried forward (M1's own precedent) or work them first.
 
 - **2026-07-19** — M2 item 2.9: headless renderer smoke test (docs/10 §4), wired into CI. The
   checklist item required a headless (fallback-adapter) render of a synthetic 1,000-aircraft

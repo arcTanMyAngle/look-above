@@ -2368,3 +2368,86 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
   compiled. No live network run needed (a pure offscreen/synthetic-data test); no credit spend.
   The flagged trail-buffer crash (2.8a) and item 2.10 (the M2 gate) were both left untouched, as
   scoped. M2 checklist now has only **2.10** (the gate) left.
+
+## 2026-07-20 — M2 item 2.10 (the M2 gate)
+
+- **Gate ran; recorded as a partial pass, not silently marked done**: 3 of 6 acceptance §M2 lines
+  pass cleanly (60fps/p95 at regional scale with a pan-sample caveat; no-teleport glide; stale
+  fade-and-drop), 3 are open (heading spot-check — the info card doesn't expose a heading value to
+  check against, a gap 2.8b itself flagged; antimeridian — unimplemented, not just untested;
+  interpolation benchmark — `sim_advance_all` exceeds its 2ms/10k-aircraft budget). Same shape as
+  M0's 6/7 and M1's 6/7: a gate that doesn't fully pass is still recorded, not blocked on or
+  hidden. Full per-line evidence: CURRENT_STATUS.md's gate table and session log, M2 plan 2.10.
+- **Finished two pieces of work found already uncommitted at this session's start**, from an
+  interrupted prior attempt at this same item: a `criterion` gate-benchmark harness
+  (`crates/core/benches/interpolation.rs`) covering docs/10 §5's first two budgets (`sim::
+  advance_all` for 10k aircraft; a `web_mercator_forward` batch of 10k points, benched standalone
+  under the same `rayon` parallelism `advance_all` already applies it with, rather than adding a
+  `project_batch` production API with no real caller — the harness's own module doc names this as
+  avoiding the exact trap M0's DECISION_LOG flagged: "a parallel batch API with no caller is a
+  guess at the call shape"); and a label legibility fix (`label::LABEL_CHAR_WIDTH_PX`/
+  `LABEL_CHAR_HEIGHT_PX` `7×12`→`16×28`, `renderer::InfoCardLayer`'s origin `80`→`145` to clear the
+  now-taller F3 HUD). Both read in full, both correct and tested (fmt/clippy/test all green, 515
+  passed/5 ignored/0 failed — unchanged from 2.9, since the label change is a pure constant tweak
+  needing no new test), both committed here rather than redone from scratch.
+- **`sim_advance_all` measured over its budget on real, capable hardware, not weak hardware**:
+  3.2–4.3ms against a 2ms/10k-aircraft budget, measured on an Intel Core Ultra 7 155H (16 cores,
+  22 threads — more than the budget's own "8 cores" reference point). A repeat run measured
+  *worse* (3.28ms → 4.26ms; the projection-batch number also worsened in step, 94µs → 123µs),
+  which points at thermal/background-load variance on a laptop under sustained load rather than a
+  stable regression — not chased further with more reruns (each one costs time/battery and the
+  trend was uniformly worse, not converging). Recorded as a genuine open budget line, not
+  explained away; diagnosing/fixing `core::sim::advance_all`'s performance is new work belonging
+  to whoever picks up this open line, not something to fix mid-gate-check.
+- **New finding, not fixed here**: the label-size legibility fix (above) makes dense regional
+  clusters (150+ aircraft on screen — including the gate's own busy-hub test region) read as a
+  visually cluttered, overlapping mass in screenshots. 2.7b's collision sweep has its own
+  unit-tested no-two-rects-overlap invariant which this session did not re-derive or disprove, so
+  this is recorded as a legibility concern at high density, not a confirmed invariant violation —
+  flagged for a follow-up item since diagnosing the collision sweep at this density is new work,
+  not gate-checking.
+- **Reconfirmed the flagged trail-buffer crash twice more, live** — both times while the
+  live-verification camera was mistargeted to whole-world/hemisphere-scale views (a ~400 MiB
+  trail vertex buffer against the adapter's 256 MiB cap, same failure shape as 2.8a's original
+  find). The gate's own properly-scoped regional view (Italy/Adriatic, `count=219`) never
+  crashed once actually reached — consistent with this being a whole-world/huge-region density
+  problem, not an L2-core one, so 2.10 proceeded on the regional scope rather than waiting on a
+  fix for a condition the gate's own setup (docs/13: "busy region", not whole world) doesn't
+  require.
+- **Most of this session's own time went to a DPI-awareness bug in the verification scripting
+  itself, not the app** — worth recording in detail since it will bite any future session's own
+  live-verification scripting the same way. `SetProcessDPIAware()` is per-process; this
+  environment's PowerShell tool starts a fresh process on every invocation with no shared state
+  across calls. The very first navigation script called it and got true 1920×1200 client
+  coordinates; every subsequent separate pan/zoom script silently did not, computing
+  `GetClientRect`/cursor math against a DPI-virtualized 1280×800 rect instead (confirmed by
+  checking saved screenshot PNGs' actual pixel dimensions directly — they were 1280×800, not
+  1920×1200, despite `GetClientSize` correctly reporting 1920×1200 in the one script that had
+  called `SetProcessDPIAware`). The ~1.5x coordinate error compounded across repeated
+  cursor-anchored zoom steps threw targeting off wildly and unpredictably (mistargeted views over
+  Northern Canada, a Grand-Canyon-scale accidental over-zoom, mid-Pacific/Hawaii, and one
+  degenerate zero-height bbox pinned at the Mercator pole clamp) before the root cause was found.
+  Fixed by moving the `SetProcessDPIAware()` call into the shared helper script itself, called
+  unconditionally on every dot-source rather than assumed to carry over — the same category of
+  scripting pitfall as 2.2b's DPI screenshot bug and 2.8b's `FindWindow`/`EnumWindows` P/Invoke
+  marshaling miss, not an app fault, but costlier this time since it wasn't recognized until well
+  into the session.
+- **A planned 90-second network-kill test (docs/13's dead-reckoning/reacquisition line) was not
+  performed.** Adding even a process-scoped Windows Firewall outbound-block rule (targeting only
+  `look-above.exe`'s own path, intended to be removed immediately after) was denied by this
+  environment's own auto-mode action classifier as a shared-system change needing explicit
+  authorization. Not attempted around (e.g. disabling a whole network adapter, which would have
+  been a *worse* blast radius, not a workaround) — left for the owner to run by hand if wanted,
+  same as the M1 token-refresh line was left for the owner's own literal-scope call rather than
+  forced through.
+- Live run: released binary (`cargo build --release -p look-above`), real `credentials.json`,
+  four relaunches while working through the DPI bug and mistargeted navigation above; final
+  regional busy hub Italy/Adriatic (`lat 41.6–46.3, lon 12.25–22.77`, `count=219`). Clean
+  `WM_CLOSE` each time (`close requested → window closed` in logs); scratch `look_above.db`
+  deleted after. `spent_today` ended around 286 of 3,200 (~9%), nowhere near the 80% cap — higher
+  than a typical single-item session's spend because of the repeated mistargeted retargets, still
+  far under the ceiling. Evidence screenshots and full run logs kept under `qa/2026-07-20/`
+  (gitignored, per docs/13's own evidence-storage convention).
+- **Per CLAUDE.md, M3 is not opened here.** The owner decides whether to open it with the 3 open
+  M2 lines carried forward (M1's own precedent for a gate that didn't fully pass) or work them
+  first.

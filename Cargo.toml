@@ -72,6 +72,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # dev-only. docs/10 §2 mandates wiremock for adapter tests: assert the request we send
 # (params, auth header, User-Agent), not just the parse of a canned reply.
 wiremock = "0.6.5"
+# dev-only. docs/10 §5 gate benchmarks (M2 item 2.10): `cargo bench`, not CI-per-push.
+criterion = "0.8.2"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

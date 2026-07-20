@@ -63,10 +63,19 @@ pub const LEADER_DISPLACEMENT_THRESHOLD_PX: f64 = 24.0;
 /// One character cell's on-screen width, in physical pixels — [`label_atlas`]'s stroke-font
 /// tiles are authored on a `[0, 1]²` square, stretched onto this (narrower) cell so the rendered
 /// text reads as an ordinary monospace label rather than a row of square blocks.
-pub const LABEL_CHAR_WIDTH_PX: f64 = 7.0;
+///
+/// Sized to keep minification of [`label_atlas::TILE_PX`] (32 px source tiles) mild: the original
+/// `7.0` (a 4.6x shrink, no mipmaps on this single-level atlas texture) aliased distinguishing
+/// strokes away entirely at true on-screen size — confirmed by dumping [`label_atlas::
+/// build_atlas_bytes`]'s raw bytes directly (every glyph rasterizes correctly) and separately
+/// confirming the rendered HUD text was illegible, which together pointed at display-side
+/// minification, not glyph data. `16.0` halves the shrink to 2x, found legible at 2026-07-19's
+/// M2 gate (item 2.10) live re-check. `render::info_card::InfoCardLayer`'s fixed
+/// `INFO_CARD_ORIGIN_PX` was moved down to keep clear of the now-taller HUD block.
+pub const LABEL_CHAR_WIDTH_PX: f64 = 16.0;
 
-/// One character cell's on-screen height, in physical pixels.
-pub const LABEL_CHAR_HEIGHT_PX: f64 = 12.0;
+/// One character cell's on-screen height, in physical pixels. See [`LABEL_CHAR_WIDTH_PX`].
+pub const LABEL_CHAR_HEIGHT_PX: f64 = 28.0;
 
 /// Gap between the aircraft glyph's edge and the start of its label, in physical pixels.
 const LABEL_GLYPH_GAP_PX: f64 = 6.0;
