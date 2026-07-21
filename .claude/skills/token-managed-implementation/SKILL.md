@@ -1,6 +1,7 @@
 ---
 name: token-managed-implementation
 description: Recovery and budget-audit workflow for a Look Above session that is ballooning, compacted, or explicitly being audited. Normal implementation sessions follow CLAUDE.md directly and should not load this skill.
+model: haiku
 ---
 
 # Token-Managed Recovery

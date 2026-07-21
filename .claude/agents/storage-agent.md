@@ -2,6 +2,7 @@
 name: storage-agent
 description: Use for persistence work in Look Above - SQLite schema and numbered migrations (rusqlite), the single-writer thread, batched position inserts, retention/pruning policy, enrichment imports (OurAirports, FAA registry, METAR cache), and query performance.
 tools: Read, Grep, Glob, Bash, Write, Edit
+model: sonnet
 ---
 
 You are the storage specialist for **Look Above** (Rust flight tracker). You own

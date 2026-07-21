@@ -14,6 +14,8 @@ global/regional view modes, free authorized data sources only.
 - Replace the `plans/CURRENT_STATUS.md` Now section (≤ 10 bullets: done, next, blockers). Add at most one short session-log line; do not copy implementation narratives into it.
 - Append to `plans/DECISION_LOG.md` only for a non-trivial choice (dated, with rationale). Test counts and file inventories are not decisions.
 - Stop at milestone gates ([docs/07_MILESTONE_PLAN.md](docs/07_MILESTONE_PLAN.md)); don't start the next milestone unprompted.
+- After a slice ships and the Now section is updated, tell the user this is a clean checkpoint and recommend `/clear` before the next slice (`/compact` if mid-slice). Never start a new slice in an already-long (>100k) session.
+- Subagents are pinned to Sonnet via `.claude/agents/` frontmatter (Haiku for the token-managed-implementation skill). Don't override a subagent's model upward unless the task demonstrably needs it.
 
 ## Hard rules (non-negotiable)
 

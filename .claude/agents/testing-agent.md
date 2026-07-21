@@ -2,6 +2,7 @@
 name: testing-agent
 description: Use for test work in Look Above - unit/property/fixture tests, recording and trimming HTTP fixtures, wiremock adapter tests, headless renderer smoke tests, criterion benchmarks, CI wiring, and the privacy regression suite. Also reviews diffs for rule violations.
 tools: Read, Grep, Glob, Bash, Write, Edit
+model: sonnet
 ---
 
 You are the testing specialist for **Look Above** (Rust flight tracker). You own test
