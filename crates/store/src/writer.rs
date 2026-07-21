@@ -9,8 +9,9 @@
 //! hands back is the raw value `ingest::budget::CreditLedger::restored` rehydrates from. That
 //! call itself happens in `ingest`/`app` wiring (a later item); this crate only stores and
 //! returns the counter, with no notion of UTC-day rollover — `restored` already tolerates a
-//! stale persisted value. Migration 0002 backs [`Writer::airports_in_bbox`] (M3 item 3.1),
-//! seeded once from the bundled `OurAirports` snapshot in `crate::ourairports`.
+//! stale persisted value. Migration 0002 backs [`Writer::airports_in_bbox`] (M3 item 3.1) and
+//! [`Writer::runways_in_bbox`] (M3 item 3.2), both seeded once from the bundled `OurAirports`
+//! snapshot in `crate::ourairports`.
 //!
 //! The command set is one enum behind one channel, not one channel per operation, on purpose:
 //! a later item can add a variant for `positions` (once that table exists) without changing
@@ -20,12 +21,13 @@ use std::path::Path;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use look_above_core::contracts::{Airport, AirportSize};
+use look_above_core::contracts::{Airport, AirportSize, Metar, Runway};
 use look_above_core::error::StoreError;
 use look_above_core::types::{BBox, SourceId, UnixSeconds};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::backend_error;
+use crate::metar;
 use crate::migrations;
 use crate::ourairports;
 
@@ -67,6 +69,19 @@ enum Command {
         bbox: BBox,
         min_size: AirportSize,
         reply: Sender<Result<Vec<Airport>, StoreError>>,
+    },
+    RunwaysInBbox {
+        bbox: BBox,
+        min_size: AirportSize,
+        reply: Sender<Result<Vec<Runway>, StoreError>>,
+    },
+    UpsertMetars {
+        batch: Vec<Metar>,
+        reply: Sender<Result<(), StoreError>>,
+    },
+    MetarsForStations {
+        stations: Vec<String>,
+        reply: Sender<Result<Vec<Metar>, StoreError>>,
     },
 }
 
@@ -161,6 +176,34 @@ impl Writer {
         })
     }
 
+    /// Runways within `bbox`'s airports at or above `min_size` — same signature as
+    /// `core::contracts::Store::runways_in_bbox` (docs/09), backed by migration 0002's
+    /// `runways` table, seeded from the bundled `OurAirports` snapshot on first open.
+    pub fn runways_in_bbox(
+        &self,
+        bbox: BBox,
+        min_size: AirportSize,
+    ) -> Result<Vec<Runway>, StoreError> {
+        self.call(|reply| Command::RunwaysInBbox {
+            bbox,
+            min_size,
+            reply,
+        })
+    }
+
+    /// Upserts a batch of METAR observations and prunes each touched station down to its two
+    /// most recent (docs/08 retention) — same signature as
+    /// `core::contracts::Store::upsert_metars` (M3 item 3.3), backed by migration 0003.
+    pub fn upsert_metars(&self, batch: Vec<Metar>) -> Result<(), StoreError> {
+        self.call(|reply| Command::UpsertMetars { batch, reply })
+    }
+
+    /// The freshest cached METAR for each of `stations` that has one — same signature as
+    /// `core::contracts::Store::metars_for_stations`.
+    pub fn metars_for_stations(&self, stations: Vec<String>) -> Result<Vec<Metar>, StoreError> {
+        self.call(|reply| Command::MetarsForStations { stations, reply })
+    }
+
     /// Builds a [`Command`] around a fresh one-shot reply channel, sends it, and blocks for
     /// the answer.
     ///
@@ -236,6 +279,22 @@ fn run(conn: &Connection, inbox: Receiver<Command>) {
                 reply,
             } => {
                 let result = ourairports::airports_in_bbox(conn, bbox, min_size);
+                let _ignored = reply.send(result);
+            }
+            Command::RunwaysInBbox {
+                bbox,
+                min_size,
+                reply,
+            } => {
+                let result = ourairports::runways_in_bbox(conn, bbox, min_size);
+                let _ignored = reply.send(result);
+            }
+            Command::UpsertMetars { batch, reply } => {
+                let result = metar::upsert_metars(conn, &batch);
+                let _ignored = reply.send(result);
+            }
+            Command::MetarsForStations { stations, reply } => {
+                let result = metar::metars_for_stations(conn, &stations);
                 let _ignored = reply.send(result);
             }
         }
@@ -538,6 +597,29 @@ mod tests {
     }
 
     #[test]
+    fn writer_runways_in_bbox_returns_at_least_one_runway_for_a_real_bundled_airport() {
+        let writer = Writer::open(":memory:").expect("writer starts");
+        // JFK's coordinates, a real `large_airport` in the bundled snapshot with real runways.
+        let nyc_area = BBox::new(40.0, -75.0, 41.0, -73.0).expect("valid bbox");
+        let runways = writer
+            .runways_in_bbox(nyc_area, AirportSize::Large)
+            .expect("queries");
+        assert!(
+            runways.iter().any(|runway| runway.airport_ident == "KJFK"),
+            "JFK should have at least one runway in the NYC-area bbox at AirportSize::Large"
+        );
+
+        let elsewhere = BBox::new(-1.0, -1.0, 0.0, 0.0).expect("valid bbox"); // Gulf of Guinea
+        let far_away = writer
+            .runways_in_bbox(elsewhere, AirportSize::Heliport)
+            .expect("queries");
+        assert!(
+            far_away.iter().all(|runway| runway.airport_ident != "KJFK"),
+            "a bbox nowhere near JFK must not return any of its runways"
+        );
+    }
+
+    #[test]
     fn re_opening_a_writer_against_the_same_on_disk_file_does_not_duplicate_seeded_airports() {
         let path = unique_temp_db_path();
         let _cleanup = TempDbFile(path.clone());
@@ -565,6 +647,32 @@ mod tests {
             first_count, second_count,
             "re-opening the same on-disk database must not duplicate seeded rows"
         );
+    }
+
+    // ---- METARs (M3 item 3.3): upsert through the channel, query back --------------------
+
+    #[test]
+    fn writer_upserts_and_queries_metars_end_to_end() {
+        use look_above_core::contracts::{FlightCategory, Metar};
+
+        let writer = Writer::open(":memory:").expect("writer starts");
+        let observation = Metar {
+            station: "KJFK".to_owned(),
+            observed_at: UnixSeconds(1_700_000_000),
+            raw: "KJFK 010000Z 28012KT 10SM FEW250 05/01 A3024".to_owned(),
+            flight_category: Some(FlightCategory::Vfr),
+            wind_dir_deg: Some(280),
+            wind_kt: Some(12),
+            visibility_sm: Some(10.0),
+        };
+        writer
+            .upsert_metars(vec![observation.clone()])
+            .expect("upserts");
+
+        let found = writer
+            .metars_for_stations(vec!["KJFK".to_owned(), "KLAX".to_owned()])
+            .expect("queries");
+        assert_eq!(found, vec![observation], "only KJFK has a cached METAR");
     }
 
     // ---- On-disk smoke test: WAL is real, not just requested ------------------------------

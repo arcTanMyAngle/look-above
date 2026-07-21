@@ -1,84 +1,98 @@
 # 05 — Token Management for AI Sessions
 
-Context (tokens) is the scarcest resource in an AI implementation session. These rules keep
-each session cheap, focused, and resumable. The workflow that applies them end-to-end is the
-[token-managed-implementation skill](../.claude/skills/token-managed-implementation/SKILL.md).
+Context is a recurring request cost, not free storage. This project optimizes for a small
+working set that can resume from a concise handoff. The operational recovery workflow is in
+[token-managed-implementation](../.claude/skills/token-managed-implementation/SKILL.md); it is
+not a routine startup dependency.
 
-## Reading budget
+## Measured hot spots
 
-- **Always read (small, load-bearing):** `plans/CURRENT_STATUS.md`, the active milestone
-  plan, `CLAUDE.md` (auto-loaded).
-- **Read on demand only:** the specific docs the current checklist item cites. A renderer
-  item needs docs 01 + 13; an ingestion item needs the sources skill + doc 09. Nothing else.
-- **Never read wholesale:** the entire `docs/` tree, generated files, lockfiles,
-  `target/`, fixture bodies (read fixture *names* and one sample record at most).
-- Prefer targeted `Grep`/section reads over whole-file reads for files > ~200 lines.
+The 2026-07-20 usage report showed four concrete costs:
 
-## API responses and fixtures
+- **80% of usage occurred above 150k context.** Long-lived sessions are the primary cost.
+- **42% came from subagent-heavy sessions.** Every agent creates another request stack.
+- **14% came from renderer-agent descendants.** Nested or repeated renderer review is a
+  specific fan-out problem.
+- **24% came from the token-managed-implementation skill.** A skill intended to save context
+  had become recurring context itself.
 
-- **Never paste a raw API response into a session.** A single OpenSky `/states/all` global
-  snapshot is megabytes. Instead: fetch → trim to ≤ 20 representative records → save to
-  `tests/fixtures/<source>/<case>.json` → reference by path.
-- When debugging a parse failure, extract the *one* offending record into the session, not
-  the payload.
+Treat these as regression metrics. Recheck them after several milestones; do not add process
+unless it lowers one of them.
 
-## Writing budget
+## Startup budget
 
-- One checklist item per session. If an item is ballooning, split it in the plan file and
-  finish the first piece properly rather than half-finishing everything.
-- Don't restate file contents in chat; reference paths. Don't echo diffs already applied.
-- Summaries in CURRENT_STATUS are ≤ 10 lines: done / next / blockers / decisions-logged.
+Start with a bounded working set:
 
-## Delegation (subagents)
+1. Read only `plans/CURRENT_STATUS.md`'s `Now` section; stop at the next `##` heading.
+2. Read the active plan's goal/constraints and the current delivery slice only.
+3. Read only the cited sections required by that slice.
+4. Locate code symbols before reading source.
 
-- Delegate when a subtask is (a) in one agent's lane and (b) would require reading files the
-  main session otherwise doesn't need — e.g., "write the WGSL shader for trail tapering"
-  goes to renderer-agent with docs 01 §pipeline as its only context.
-- Give subagents explicit file paths and the acceptance criterion. They start cold; a vague
-  prompt wastes their whole budget re-exploring.
-- Don't delegate trivial edits (< ~20 lines in files already in context) — the handoff costs
-  more than the work.
-- **Each subagent spawn is its own request stack, not a discount.** Don't spawn one to
-  "double-check" or "also look at" something the main session could answer with a single
-  targeted `Grep`/`Read`. Before spawning, name the specific files-you'd-otherwise-read that
-  the delegation avoids; if you can't name any, do it inline instead.
-- Prefer one well-scoped agent over several overlapping ones for the same checklist item.
-  Fan-out (parallel agents on independent sub-parts) is fine; fan-out on the *same* question
-  from multiple angles usually isn't.
-- For mechanical/lane-bounded subtasks (fixture trimming, formatting a doc, running a fixed
-  checklist), pick the cheapest model that can do the job — see the model-to-task mapping
-  below. Don't default every subagent to the same model as the main session.
+Never load the status session log, the whole decision log, every completed checklist note, or
+the entire docs tree for orientation. `CURRENT_STATUS` is a handoff card, not project history.
 
-## Usage data & session hygiene
+Repository limits:
 
-Observed from this project's actual usage (not theoretical): **64% of token usage happened
-in sessions that had grown past 150k context**, and **63% of usage came from
-subagent-heavy sessions**. Both are addressable with habits, not just budget rules:
+- `CURRENT_STATUS` Now: at most 10 bullets.
+- `CURRENT_STATUS` session log: one line per session and only the 10 newest lines.
+- Completed plan annotations: at most 3 lines plus a link to the decision entry.
+- Files over 400 lines: targeted symbol/section reads only.
+- Command output: request counts, summaries, filtered failures, or a bounded tail.
 
-- **Context size compounds cost, even with caching.** A session sitting above ~150k tokens
-  of context is expensive on every subsequent turn, cached or not. Don't let a session ride
-  past that just because it's "almost done" — `/compact` at a natural pause point *inside* a
-  task (after verify, before the next checklist item) rather than carrying full history to
-  the end.
-- **`/clear` between unrelated tasks, always.** Starting a new checklist item, milestone, or
-  unrelated bugfix in a session that still holds a prior task's full context is the single
-  biggest avoidable cost. If the next thing you'd read is `CURRENT_STATUS.md` again to
-  re-orient, that's the signal to `/clear` first, not to keep scrolling back.
-  Session lifecycle in the skill (§5–6) already ends sessions at handoff boundaries — treat
-  that as the trigger to `/clear`, not just to stop typing.
-  Deferred to the skill: [token-managed-implementation](../.claude/skills/token-managed-implementation/SKILL.md).
-- **Subagent spawns are the second-biggest lever.** Every spawn re-derives context from
-  scratch at its own cost; three "quick check" subagents in one session can outspend doing
-  the checks inline. Re-read the delegation rules above before reaching for `Agent` out of
-  habit.
+Use `rg -n` to find a decision heading and read that section only. Never read
+`plans/DECISION_LOG.md` wholesale; it is an append-only archive.
 
-## Session lifecycle
+## Source and tool output
 
-- **Handoff, not marathon.** End the session at the natural boundary (checklist item done,
-  verified, status updated). The next session resumes from CURRENT_STATUS with near-zero
-  re-orientation cost.
-- If a session gets compacted mid-task, CURRENT_STATUS + the milestone checklist are the
-  recovery points — which is why they're updated *before* risky/long operations, not only at
-  the end.
-- Model-to-task mapping (use cheaper models for mechanical work):
-  [12_PROMPTS_FOR_CLAUDE_OPUS_SONNET_FABLE.md](12_PROMPTS_FOR_CLAUDE_OPUS_SONNET_FABLE.md).
+- Never paste raw API responses. Trim to at most 20 representative records in a fixture and
+  inspect one offending record when debugging.
+- Do not read `target/`, `Cargo.lock`, generated assets, bulk CSV/GeoJSON, or fixture bodies.
+- Avoid unbounded recursive listings and full build logs. Suppress successful noise and keep
+  the final error plus enough surrounding context to act.
+- Do not echo an applied diff into chat. For review, inspect the diff once and then only the
+  affected functions where surrounding context matters.
+- After a subagent returns, review its diff and affected symbols. Do not reread every changed
+  file in full merely to duplicate the agent's orientation work.
+
+## Implementation and verification
+
+- Prefer one coherent, end-to-end delivery slice per session. It may cover adjacent low-risk
+  checklist items when they share files, context, and one acceptance check. Split only when the
+  work has a real design, ownership, or verification boundary.
+- Plan each file's edit once. Avoid repetitive edit/compile/fix loops by reviewing ownership,
+  error paths, and common Clippy lints before the first check.
+- Use targeted crate tests during implementation only when they answer a specific question.
+  Apply the risk tiers in doc 06 after a local diff review. Run the required final tier once;
+  rerun only the failed stage after a fix. Do not run the full workspace suite merely because a
+  Markdown file, prompt, or isolated leaf crate changed.
+- Record the final result, not every command transcript or incremental test-count delta.
+- For visible work, run automated/headless checks first and perform one focused live pass. If
+  scripted navigation cannot reach the state, record a harness gap after one attempt and move on.
+
+## Delegation budget
+
+Default to zero subagents. Spawn one only when all of these are true:
+
+1. The work is bounded to one lane with exact file paths and an acceptance check.
+2. Its cold-start reading replaces substantial reading in the parent session.
+3. The answer will be consumed as a patch or compact finding, not a second narrative audit.
+
+Normal cap: one subagent per checklist item. A second is justified only for independent files
+and independent checks. Subagents must not spawn subagents; cross-lane work returns to the
+parent as a boundary. Never spawn an agent to 'double-check', independently re-derive test
+counts, or reread work the parent can inspect in one diff.
+
+For mechanical work, select the cheapest model that can follow the existing specification.
+Keep judgment-heavy renderer debugging in the main session; use renderer-agent only for a
+bounded implementation that does not require another agent beneath it.
+
+## Handoff and session lifecycle
+
+- Replace the Now section with done / next / blockers. Do not prepend forever.
+- Add at most one short session-log line. Put non-trivial rationale once in `DECISION_LOG`; do
+  not duplicate it in status and the milestone plan.
+- Use `/compact` at a verified checkpoint if the same item must continue.
+- Use `/clear` before a new checklist item, milestone, or unrelated bugfix. If reorientation
+  would start by reading Now again, the old context should not come along.
+- Invoke the token-managed skill only for recovery, explicit budget auditing, or a session that
+  is already ballooning. Normal sessions follow the concise loop in `CLAUDE.md` directly.

@@ -44,6 +44,9 @@ pub trait Store {
     fn insert_positions(&mut self, batch: &[StateVector]) -> Result<(), StoreError>;
     fn upsert_aircraft_meta(&mut self, meta: &AircraftMeta) -> Result<(), StoreError>;
     fn airports_in_bbox(&self, bbox: BBox, min_size: AirportSize) -> Result<Vec<Airport>, StoreError>;
+    // New contract, added at M3 item 3.2 (not part of M0's original forward-declared shape):
+    // runway outlines need their own bbox+size query, mirroring airports_in_bbox exactly.
+    fn runways_in_bbox(&self, bbox: BBox, min_size: AirportSize) -> Result<Vec<Runway>, StoreError>;
     fn prune(&mut self, keep_after: UnixSeconds) -> Result<u64, StoreError>;
 }
 

@@ -1,0 +1,28 @@
+[
+  "not an object",
+  {},
+  {
+    "icaoId": "K999",
+    "rawOb": "K999 010000Z AUTO",
+    "fltCat": "VFR"
+  },
+  {
+    "obsTime": 1721000100,
+    "rawOb": "missing icaoId",
+    "fltCat": "IFR"
+  },
+  {
+    "icaoId": "K888",
+    "obsTime": 1721000200,
+    "fltCat": "MVFR"
+  },
+  {
+    "icaoId": "KJFK",
+    "obsTime": 1721000000,
+    "rawOb": "KJFK 010000Z 28012KT 10SM FEW250 05/01 A3024 RMK AO2 SLP244 T00501011",
+    "fltCat": "VFR",
+    "wdir": 280,
+    "wspd": 12,
+    "visib": "10+"
+  }
+]

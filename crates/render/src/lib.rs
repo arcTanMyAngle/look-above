@@ -4,6 +4,7 @@
 //! No network and no DB access from this crate.
 
 mod aircraft;
+mod airport;
 mod basemap;
 mod color;
 mod error;
@@ -11,6 +12,7 @@ mod glyph_atlas;
 mod info_card;
 mod label;
 mod label_atlas;
+mod metar_badge;
 mod renderer;
 mod selection;
 mod stats_overlay;

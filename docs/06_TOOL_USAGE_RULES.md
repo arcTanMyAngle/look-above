@@ -7,7 +7,9 @@ How to use tools well in this repo. Token-budget companion: [05_TOKEN_MANAGEMENT
 - Use dedicated tools (Read / Grep / Glob / Edit / Write) over shell equivalents
   (`cat`, `Select-String`, `Get-ChildItem -Recurse`).
 - `Grep` before `Read`: locate the symbol, then read just that region.
+- For files over 400 lines, never use an unbounded `Read`; inspect the diff and the affected symbols with bounded ranges.
 - Never read `target/`, `Cargo.lock`, or fixture bodies into context.
+- Cap tool output. Prefer counts, `--quiet`, test filters, and the last relevant error over full logs or recursive listings.
 - Edits over rewrites: prefer `Edit` on existing files; `Write` only for new files.
 
 ## Network
@@ -26,24 +28,42 @@ How to use tools well in this repo. Token-budget companion: [05_TOKEN_MANAGEMENT
 ```sh
 cargo check -p <crate>                      # fast inner-loop signal
 cargo test -p <crate> <filter>              # targeted tests while iterating
-cargo test --workspace                      # before claiming done
-cargo clippy --workspace -- -D warnings     # before claiming done
-cargo fmt                                    # before committing
-cargo run --release -p look-above           # visual verification (M2+)
+cargo test -p <crate>                       # isolated-crate final check
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo fmt --check
+cargo test --workspace                      # high-risk/cross-cutting final check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run --release -p look-above           # only when visible behavior changed
 cargo bench -p core                          # only when a perf item asks for it
 ```
 
+### Verification tiers
+
+| Change | Required final verification |
+|---|---|
+| Docs, plans, prompts, agent/skill instructions only | `git diff --check`; verify edited links/paths |
+| Isolated implementation inside one leaf crate | `cargo fmt --check`, crate Clippy, crate tests |
+| Public contracts, cross-crate wiring, privacy, HTTP, migrations, concurrency, renderer/GPU | Full workspace fmt, Clippy, and tests |
+| Milestone gate or release candidate | Full workspace sequence plus the applicable acceptance/visual checks |
+
+Escalate to a higher tier when uncertain. Run the chosen final tier once after reviewing the
+diff; during implementation, use only checks that answer a specific question.
+
 - Long builds: run in background, keep working on something read-only meanwhile.
 - Tests are offline by construction — if a test needs the network, it's wrong; use fixtures.
-- Renderer verification is visual: run the app, compare against
-  [13_VISUAL_QA_CHECKLIST.md](13_VISUAL_QA_CHECKLIST.md); screenshots when the harness supports it.
+- Run live visual QA only when pixels or interaction should change. Exercise the relevant
+  subsection once after automated checks; full checklist passes belong at gates.
+- Prefer a deterministic camera/test preset. If synthetic input or window capture fails once,
+  record the missing harness capability and stop rather than repeatedly debugging the QA tool.
 
 ## Subagents
 
 - Match the lane (see [../AGENTS.md](../AGENTS.md) roster). Prompt with: the goal, exact file
-  paths to touch, the doc sections that constrain the work, and the acceptance check.
-- One agent per lane at a time; parallel agents only for independent lanes (e.g., testing-agent
-  writing fixtures while renderer-agent writes a shader).
+  paths to touch, bounded doc sections, and the acceptance check.
+- Default to zero agents and cap normal work at one. Parallel agents require independent files
+  and checks; subagents must not spawn subagents.
+- Review returned work from its diff and affected symbols. Re-running fixed checks is useful;
+  rereading every changed file in full or asking another agent for a generic audit is not.
 
 ## Git
 

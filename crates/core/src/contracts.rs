@@ -74,6 +74,18 @@ pub trait Store {
         min_size: AirportSize,
     ) -> Result<Vec<Airport>, StoreError>;
 
+    /// Runways within `bbox`'s airports at or above `min_size` (see [`AirportSize`]).
+    fn runways_in_bbox(&self, bbox: BBox, min_size: AirportSize)
+    -> Result<Vec<Runway>, StoreError>;
+
+    /// Inserts or updates cached METAR observations. Retention (keep the two most recent per
+    /// station, docs/08) is the implementation's job, not the caller's. M3 item 3.3.
+    fn upsert_metars(&mut self, batch: &[Metar]) -> Result<(), StoreError>;
+
+    /// The freshest cached METAR for each of `stations` that has one — stations with no cached
+    /// observation are simply absent from the result, never an error.
+    fn metars_for_stations(&self, stations: &[String]) -> Result<Vec<Metar>, StoreError>;
+
     /// Deletes positions older than `keep_after`, returning the row count removed
     /// (privacy rule 5.1). Batched internally to avoid long write locks.
     fn prune(&mut self, keep_after: UnixSeconds) -> Result<u64, StoreError>;
@@ -124,6 +136,30 @@ pub struct Airport {
     pub iata: Option<String>,
 }
 
+/// A runway from the `OurAirports` import (`runways` table, docs/08). M3.
+///
+/// `runways.closed` is deliberately not carried here: closed runways are filtered out in SQL
+/// at query time (`store::ourairports::runways_in_bbox`), so a caller reading this type never
+/// has a flag to check. A runway with a `None` `le_*`/`he_*` end is still returned — the
+/// bundled CSV has some incomplete rows, and it's the render side's job to decide what to draw
+/// (or not) for a partial runway, not this type or its query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Runway {
+    /// The `airports.ident` this runway belongs to.
+    pub airport_ident: String,
+    pub le_ident: Option<String>,
+    pub le_lat_deg: Option<f64>,
+    pub le_lon_deg: Option<f64>,
+    pub le_heading_deg: Option<f64>,
+    pub he_ident: Option<String>,
+    pub he_lat_deg: Option<f64>,
+    pub he_lon_deg: Option<f64>,
+    pub he_heading_deg: Option<f64>,
+    pub length_ft: Option<i32>,
+    pub width_ft: Option<i32>,
+    pub surface: Option<String>,
+}
+
 /// Airport prominence, ordered so LOD tiers can filter with `size >= min_size`.
 ///
 /// Ordering is the point of this type: `Store::airports_in_bbox` takes a minimum,
@@ -156,6 +192,70 @@ impl AirportSize {
             _ => None,
         }
     }
+}
+
+/// Flight-category classification from a METAR (`metars.flight_cat`, docs/08) — also selects
+/// the badge color docs/13 assigns (VFR green / MVFR blue / IFR red / LIFR magenta). M3 3.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FlightCategory {
+    Vfr,
+    Mvfr,
+    Ifr,
+    Lifr,
+}
+
+impl FlightCategory {
+    /// Maps `aviationweather.gov`'s `fltCat` field to a category, or `None` for anything it
+    /// doesn't report (some observations lack a computable ceiling/visibility) or a value this
+    /// closed set doesn't recognize — never a parse failure, the same "unknown maps to None"
+    /// shape as [`AirportSize::from_ourairports_type`].
+    pub fn from_metar_str(raw: &str) -> Option<Self> {
+        match raw {
+            "VFR" => Some(Self::Vfr),
+            "MVFR" => Some(Self::Mvfr),
+            "IFR" => Some(Self::Ifr),
+            "LIFR" => Some(Self::Lifr),
+            _ => None,
+        }
+    }
+
+    /// The stable wire/DB spelling stored in `metars.flight_cat` (docs/08) — the inverse of
+    /// [`from_metar_str`](Self::from_metar_str).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vfr => "VFR",
+            Self::Mvfr => "MVFR",
+            Self::Ifr => "IFR",
+            Self::Lifr => "LIFR",
+        }
+    }
+}
+
+/// A cached METAR observation (`metars` table, docs/08). M3 item 3.3.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metar {
+    /// ICAO station id, e.g. `KJFK` — joins to `airports.ident`.
+    pub station: String,
+    pub observed_at: UnixSeconds,
+    /// The raw METAR text, kept for the info-card/debug overlay even though every parsed field
+    /// below is also derived from it.
+    pub raw: String,
+    /// `None` when the source did not report a computable category.
+    pub flight_category: Option<FlightCategory>,
+    /// `None` for a calm/variable report with no single heading (e.g. `VRB`).
+    pub wind_dir_deg: Option<i32>,
+    pub wind_kt: Option<i32>,
+    pub visibility_sm: Option<f64>,
+}
+
+/// A flight-category badge resolved to a position (M3 item 3.3) — the join of a queried
+/// [`Airport`] with its cached [`Metar`] (by `station` == `ident`), done once by the caller
+/// (`app::window`) rather than re-joined every render frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetarBadge {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub category: FlightCategory,
 }
 
 #[cfg(test)]
@@ -242,5 +342,47 @@ mod tests {
     fn contracts_are_dyn_compatible() {
         const fn assert_dyn_compatible(_: Option<&dyn LiveSource>, _: Option<&dyn Store>) {}
         assert_dyn_compatible(None, None);
+    }
+
+    #[test]
+    fn flight_category_recognizes_the_four_documented_values() {
+        assert_eq!(
+            FlightCategory::from_metar_str("VFR"),
+            Some(FlightCategory::Vfr)
+        );
+        assert_eq!(
+            FlightCategory::from_metar_str("MVFR"),
+            Some(FlightCategory::Mvfr)
+        );
+        assert_eq!(
+            FlightCategory::from_metar_str("IFR"),
+            Some(FlightCategory::Ifr)
+        );
+        assert_eq!(
+            FlightCategory::from_metar_str("LIFR"),
+            Some(FlightCategory::Lifr)
+        );
+    }
+
+    #[test]
+    fn flight_category_rejects_unrecognized_values_instead_of_guessing() {
+        for unrecognized in ["", "vfr", "N/A", "UNKNOWN"] {
+            assert_eq!(FlightCategory::from_metar_str(unrecognized), None);
+        }
+    }
+
+    #[test]
+    fn flight_category_as_str_round_trips_through_from_metar_str() {
+        for category in [
+            FlightCategory::Vfr,
+            FlightCategory::Mvfr,
+            FlightCategory::Ifr,
+            FlightCategory::Lifr,
+        ] {
+            assert_eq!(
+                FlightCategory::from_metar_str(category.as_str()),
+                Some(category)
+            );
+        }
     }
 }

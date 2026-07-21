@@ -2512,4 +2512,166 @@ left open. Module layout: `core::types` (vocabulary), `core::error` (taxonomies)
 - Delegated to the storage-agent (its named remit covers "enrichment imports (OurAirports, FAA
   registry, METAR cache)"); independently re-verified — full diff read, fresh fmt/clippy/test
   (**539 passed, 5 ignored, 0 failed**, +24 over the M2 gate's 515), and the bundled CSV row
+
+## 2026-07-20 — M3 item 3.2: airport/runway rendering lands
+
+- **Split into two sequential, lane-scoped delegations** (store-side, then render-side), same
+  shape as 2.3a: the store half needed a genuinely new contract (`Runway`, `runways_in_bbox`) the
+  render half would otherwise have had to invent ad hoc, so it landed first and the render agent
+  was briefed against the finished API rather than guessing its shape.
+- **`core::contracts::Runway` omits the schema's `closed` column** — closed runways are filtered
+  out in SQL at query time (`store::ourairports::runways_in_bbox`, `closed = 0`), so no caller
+  ever needs to re-check a flag that query already enforced. A runway with a `None` `le_*`/`he_*`
+  end (incomplete source rows, same as some bundled airports) is still returned — the *render*
+  side decides what to draw for a partial runway (nothing), not the query.
+- **`runways_in_bbox` added to `core::contracts::Store` and docs/09** even though M0's own
+  forward-declared trait shape never anticipated it — recorded explicitly as a new contract
+  addition in docs/09 rather than silently folded in as if it had always been there.
+- **Real bug caught during implementation, not after**: a first-pass runway stroke width fixed in
+  world-plane units (mirroring the coastline stroke's own constant) tessellated to *zero geometry*
+  for realistic runway lengths — `lyon`'s stroke tessellator has a hardcoded internal point-merge
+  floor (~1e-4 in path-space) that this crate's whole-Earth-spanning `[-1, 1]` normalized plane
+  puts most real runways well under. Fixed two ways: the stroke width is screen-constant (like
+  every other on-screen-fixed-size element in this renderer), and each runway is tessellated in a
+  coordinate space rescaled `1e5×` before handing it to `lyon`, then scaled back down — both
+  documented in `airport.rs`, with a regression test pinned to a realistic ~300 m runway.
+- **Airport markers are a plain filled circle**, not a diamond (no heading to orient one against,
+  unlike an aircraft glyph) or a single-pixel dot (harder to distinguish from AA noise at this
+  size). Both the marker fill and the runway outline are deliberately dimmer than every altitude
+  tint and the label/info-card white (color.rs tests pin this) — static map furniture, not live
+  traffic, per docs/01's "aircraft stay brightest" rule.
+- **Airport-marker draw-order placement is this item's own judgement call**: docs/01 only names
+  "coastlines/borders/runways" as one "map lines" step; runway outlines fit that literally (drawn
+  right after the coastline stroke), but airport markers aren't separately named. Placed in the
+  same map-lines slot, right after the runway outlines and still before trails — recorded as a
+  judgement call in `renderer.rs` rather than silently decided.
+- **Fixed `AirportSize::Medium` threshold, no LOD-tier gating** — the checklist's own "markers for
+  large/medium airports" wording, hardcoded rather than driven by the (nonexistent until M4) zoom
+  tier, per the M3 plan's own cross-milestone tension note recorded when M3 opened. The query is
+  piggybacked onto `app::window::App::maybe_retarget`'s existing camera-settle trigger (a cloned
+  `store::Writer` handle, cheap since it's just a channel `Sender`) rather than inventing a second
+  settle/debounce mechanism for the same event.
+- **Both geometries rebuild every frame from whatever slice `Renderer::render` is handed**, rather
+  than caching against "did the queried set change" — mirrors `trail.rs`'s own per-frame
+  tessellation shape, simpler than tracking a diff, and cheap at this milestone's scale (tens to a
+  few hundred medium/large airports in a viewport, nowhere near the 10,000-aircraft budget).
+  Recorded as a judgement call in `airport.rs` rather than assumed obvious.
+- Delegated to the storage-agent (`Runway`/`runways_in_bbox`, its stated remit) then the
+  renderer-agent (rendering + `app::window` wiring, its stated remit), independently re-verified
+  after each: every changed/new file read in full, fresh `cargo fmt --check`/`clippy --workspace
+  --all-targets -D warnings`/`test --workspace` after each lane — **541 passed** (storage lane,
+  +2 over 3.1's 539) then **553 passed, 5 ignored, 0 failed** (render lane, +12), both matching
+  each agent's own reported count exactly.
+- **Live verification was partial, recorded honestly rather than overclaimed.** A live window-mode
+  run against the owner's real `credentials.json` confirmed the app builds, launches, polls, and
+  renders the existing M2 picture (aircraft/labels/trails) with no regression, and a
+  resize-triggered run exited cleanly with no panics. Attempting to script a precise camera
+  pan/zoom to a specific busy airport (to visually confirm marker/runway-outline pixels on screen)
+  via synthetic Win32 input (`PostMessage` drag + wheel events) proved unreliable in this
+  environment within a reasonable time budget — the same category of scripting fragility 2.2b's
+  DPI bug, 2.8b's `FindWindow` miss, and 2.10's DPI-virtualization bug already ran into, this time
+  not resolved. The airport/runway pipeline is verified at the code level (diff read in full,
+  logic traced against the store query's actual behavior, tests cover the tessellation edge cases
+  including the caught `lyon` bug) but **not visually confirmed live on screen** — flagged here as
+  an open verification gap for whoever next runs the app in window mode, not silently marked done.
+  No credit spend beyond ordinary poll cycles during the launches above.
   counts re-derived independently via `wc -l` rather than trusted from the agent's own report.
+
+## 2026-07-20 — token-management audit and handoff compaction
+
+**Decision:** make bounded reads and zero-by-default delegation enforceable in the startup
+instructions, not optional advice. Startup reads only `CURRENT_STATUS`'s Now section, the
+current delivery slice, cited doc sections, and targeted code symbols. Files over 400 lines and
+tool output require bounded reads. Normal work uses at most one non-nesting subagent; generic
+second-opinion agents and full-file re-reviews are prohibited. The recovery skill is no longer
+loaded for every implementation session, and mechanical agents should use the cheapest capable
+model.
+
+**Throughput amendment:** a session now targets one coherent usable delivery slice rather than
+exactly one checklist row; adjacent low-risk rows may share context and one acceptance check.
+Verification is risk-tiered: documentation gets diff/link checks, isolated leaf-crate changes
+get crate-local checks, and cross-crate/privacy/network/migration/concurrency/renderer work and
+gates retain the full workspace sequence. Live visual QA runs once only when visible behavior
+changes. After one failed synthetic-navigation/capture attempt, record the harness gap and stop.
+A deterministic airport/region preset is queued as reusable tooling before more scripted visual
+QA. This keeps assurance concentrated where failure impact warrants it instead of applying the
+most expensive workflow to every change.
+
+**Rationale:** the usage report attributed 80% of spend to contexts above 150k, 42% to
+subagent-heavy sessions, 14% to renderer-agent descendants, and 24% to the token workflow skill.
+The repository amplified those costs: `CURRENT_STATUS` had reached 155 KB/1,666 lines with a
+367-line Now section; `DECISION_LOG` was 218 KB; `renderer.rs` was 152 KB/3,105 lines; and
+completed work was narrated in the status, milestone plan, and decision log. The status is now
+a concise handoff card, completed M3 notes link to this archive, and detailed history remains
+recoverable from this log and Git rather than recurring startup context.
+
+## 2026-07-21 — M3 item 3.3 (METAR polling + flight-category badges)
+
+- **No failover chain for the METAR source** — unlike the live-position sources, docs/09 lists
+  exactly one authorized METAR provider (`aviationweather.gov`), so `ingest::metar` does not
+  reuse `poller::Poller`'s failover/budget machinery; it is a purpose-built single-source loop.
+  A fetch error is logged and retried next cycle rather than failed over, since there is nowhere
+  else to fail over to; docs/08's own 2-per-station retention already tolerates a gap.
+- **Retargeting the METAR poller's station list does not interrupt an in-flight sleep**, unlike
+  the position poller's own retarget race — METARs are hourly, so there is no responsiveness
+  case for polling early on a camera pan, and racing the sleep would risk shortening the
+  documented ≥10-minute spacing under a rapid sequence of retargets (privacy/source-etiquette
+  rule: "enforced in code, not just documented"). A retarget only changes what the *next* cycle
+  reads.
+- **A short (5 s) idle-recheck interval, separate from the ≥10-minute poll interval, added after
+  live testing caught a real startup bug**: the very first cycle always sees the channel's
+  initial empty station list (no camera has settled yet), and without a separate short recheck
+  the loop would sleep the *full* 10-minute poll interval before ever looking again — delaying
+  every fresh session's first badges by up to 10 minutes even though the camera typically settles
+  within seconds of launch. An empty check costs nothing (no request leaves the process), so
+  there is no spacing rule it could violate by being frequent. Caught by running the built app
+  live and watching for a `metar poll cycle` log line that never appeared; fixed by splitting the
+  loop's single sleep into `poll_interval` (after a fetch attempt) and `idle_recheck_interval`
+  (while the station list is empty), both explicit parameters (`run_metar_poller`) rather than
+  constants baked into the loop, and covered by a new regression test
+  (`a_station_list_populated_after_starting_empty_is_picked_up_on_the_next_idle_recheck`).
+- **Badge rendering reuses the airport-marker mesh and draws before the marker pass**, at a
+  larger fixed screen-pixel radius, rather than offsetting the badge to a separate on-screen
+  position: the marker's own dot then paints over the badge ring's center on top, so the pairing
+  between a badge and its airport is visually unambiguous with no projection/offset math needed.
+  Color is carried per-instance (`metar_badge::BadgeInstanceRaw`), unlike the airport marker's
+  flat per-layer uniform color, since a badge's color depends on that airport's own flight
+  category.
+- **The airport ↔ METAR join happens once in `app::window`, not in `render`** — `core::contracts`
+  gained a resolved `MetarBadge { lat_deg, lon_deg, category }` type precisely so `render` never
+  needs to know about `Airport`/`Metar` idents at all, only positions and a category to color.
+  The join (large airports only, stations with no resolved flight category excluded) is unit
+  tested directly (`window::tests`) since it is pure logic with real edge cases (ident
+  mismatches, unresolved categories) worth covering in isolation.
+- **Badge freshness follows the same camera-settle cadence 3.2 already established** for
+  airports/runways (`app::window::App::maybe_retarget`) rather than a second trigger: the newly
+  queried large-airport set becomes the poller's next station list *and* the join is read back
+  from the store at that same instant. Known limitation, not fixed this item: the very first
+  settle's own join necessarily reads the store *before* that settle's own fetch has landed (the
+  fetch is asynchronous), so a session's badges only appear once the camera settles again after
+  the first background fetch completes — acceptable given docs' own "≤ 70 min" freshness bar and
+  ordinary continuous panning/zooming in practice, but recorded here rather than silently assumed
+  away; a future item could add a "new METARs landed" signal back to the render/event thread if a
+  tighter single-settle guarantee is ever wanted.
+- Colors are this project's own shades of docs/13's fixed VFR-green/MVFR-blue/IFR-red/LIFR-magenta
+  convention (`color::flight_category_badge_color`), picked dim enough to stay under every
+  altitude-bucket tint and label text (docs/01: aircraft stay the brightest things on screen) but
+  distinguishable from the airport marker's own desaturated gray and from each other by hue.
+- **`aviationweather.gov`'s wire shapes verified live, not guessed**: `fltCat` (not `flight_cat`
+  or similar), `obsTime` already in Unix seconds (unlike airplanes.live's epoch-millisecond
+  `now` — sources are not assumed to share a convention), and `visib` returned as either a plain
+  number or a qualified string (`"10+"`, fractions) rather than always one shape. Verified via
+  the sanctioned live-fetch path (`scripts/record_fixture.rs`, extended this item to support a
+  bare-JSON-array response body alongside the existing object-wrapped ones) and recorded to
+  `crates/ingest/tests/fixtures/aviationweather/`.
+- Verification: full workspace `cargo fmt --check` / `clippy --workspace --all-targets -D
+  warnings` / `test --workspace` — 590 passed, 6 ignored (live-only, unrun), 0 failed. Live
+  window-mode run against the owner's real `credentials.json` confirmed the full path end to
+  end: a real `aviationweather.gov` fetch, persistence, and — screenshotted — colored VFR/MVFR
+  badge rings on screen at their actual airports, with airports lacking a cached observation
+  correctly left as plain gray markers. The same screenshots also confirm 3.2's own airport
+  markers at real pixel positions, closing the marker half of that item's carried gap; the
+  viewport zoom level during this pass was too far out for a runway outline to register at all
+  (correctly so — a runway is sub-pixel at that scale), so the runway-outline half stays open,
+  needing the same closer-zoom-on-a-specific-airport pass 3.2 itself could not get scripted
+  navigation to reach.

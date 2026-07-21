@@ -15,6 +15,10 @@ session. This doc maps task types to models and gives ready-to-paste openers. Pr
 Rule of thumb: if the checklist item's plan already says *how*, Sonnet or Opus executes it;
 if the session must decide *how*, Fable.
 
+This mapping applies to both the orchestrator and any subagent. Do not let a simple subagent
+inherit an expensive model by accident. Renderer-agent is for a bounded implementation on
+exact files; keep cross-cutting wgpu diagnosis in the main judgment-heavy session.
+
 ## Ready-to-paste openers
 
 Each assumes the repo is the working directory (CLAUDE.md auto-loads) and appends to the
@@ -64,7 +68,8 @@ cargo test -p <crate>; update plans/CURRENT_STATUS.md.
 
 - Never mix a *decision* task and an *execution* task in one session — the decision changes
   what execution should read, and context balloons.
-- Subagent lanes (`.claude/agents/`) apply within any session regardless of model; the
-  model choice here is for the *orchestrating* session.
+- Default to no subagent and normally cap a checklist item at one. Choose its model explicitly:
+  Sonnet for mechanical/spec-driven work, Opus only for genuinely tricky implementation.
+  Subagents never spawn subagents; cross-lane issues return to the orchestrator.
 - If a Sonnet session hits a genuine design question, it stops and records the question
   (master prompt "blocked" rule) — it does not improvise architecture.

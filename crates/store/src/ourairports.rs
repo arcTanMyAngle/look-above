@@ -1,5 +1,6 @@
 //! Seeds `airports`/`runways` (migration 0002) from the bundled `OurAirports` snapshot, and
-//! serves [`Writer::airports_in_bbox`]'s query (docs/09 `Store::airports_in_bbox`).
+//! serves [`Writer::airports_in_bbox`]'s and [`Writer::runways_in_bbox`]'s queries (docs/09
+//! `Store::airports_in_bbox`/`Store::runways_in_bbox`).
 //!
 //! The snapshot itself is produced by `crates/import`'s `import-ourairports` binary — this
 //! crate never touches the network (M0 acceptance line 3) and never re-derives the type-drop
@@ -13,7 +14,7 @@
 //! is the check, not "this is the first time migration 0002 has applied" (docs/08's own
 //! migration mechanism is schema-only and says nothing about *data*).
 
-use look_above_core::contracts::{Airport, AirportSize};
+use look_above_core::contracts::{Airport, AirportSize, Runway};
 use look_above_core::error::StoreError;
 use look_above_core::types::BBox;
 use rusqlite::{Connection, params};
@@ -259,6 +260,124 @@ pub(crate) fn airports_in_bbox(
     Ok(airports)
 }
 
+/// Runways whose airport is within `bbox` at or above `min_size` — the query half of the new
+/// `runways_in_bbox` contract (docs/09), run against the connection the writer thread owns.
+///
+/// `closed = 0` is filtered directly in SQL (cheap, direct, unlike the `type` -> `AirportSize`
+/// mapping below), joined against `airports` for the same `bbox` `BETWEEN` clause
+/// `airports_in_bbox` uses; `min_size` still needs `AirportSize::from_ourairports_type` against
+/// `airports.type`, so that column is selected and filtered in Rust exactly like
+/// `airports_in_bbox` does, skipping any row whose airport type isn't recognized. A runway with
+/// a `NULL` `le_*`/`he_*` end (the source CSV has some incomplete rows) is still returned — the
+/// render side decides what to draw for a partial runway, not this query.
+pub(crate) fn runways_in_bbox(
+    conn: &Connection,
+    bbox: BBox,
+    min_size: AirportSize,
+) -> Result<Vec<Runway>, StoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT airports.type, runways.airport_ident, runways.le_ident, runways.le_lat,
+                    runways.le_lon, runways.le_heading_deg, runways.he_ident, runways.he_lat,
+                    runways.he_lon, runways.he_heading_deg, runways.length_ft, runways.width_ft,
+                    runways.surface
+             FROM runways
+             JOIN airports ON runways.airport_ident = airports.ident
+             WHERE airports.lat BETWEEN ?1 AND ?2 AND airports.lon BETWEEN ?3 AND ?4
+               AND runways.closed = 0",
+        )
+        .map_err(|error| backend_error(&error))?;
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<
+        rusqlite::Result<(
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<i32>,
+            Option<i32>,
+            Option<String>,
+        )>,
+    > = stmt
+        .query_map(
+            params![
+                bbox.lat_min(),
+                bbox.lat_max(),
+                bbox.lon_min(),
+                bbox.lon_max(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .map_err(|error| backend_error(&error))?
+        .collect();
+
+    let mut runways = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (
+            type_str,
+            airport_ident,
+            le_ident,
+            le_lat_deg,
+            le_lon_deg,
+            le_heading_deg,
+            he_ident,
+            he_lat_deg,
+            he_lon_deg,
+            he_heading_deg,
+            length_ft,
+            width_ft,
+            surface,
+        ) = row.map_err(|error| backend_error(&error))?;
+        // Same reasoning as `airports_in_bbox`: every seeded airport already passed the
+        // type-drop at import time, so `None` here would mean the bundled asset is corrupt.
+        // Skip rather than error so one bad row doesn't fail the whole query.
+        let Some(size) = AirportSize::from_ourairports_type(&type_str) else {
+            continue;
+        };
+        if size < min_size {
+            continue;
+        }
+        runways.push(Runway {
+            airport_ident,
+            le_ident,
+            le_lat_deg,
+            le_lon_deg,
+            le_heading_deg,
+            he_ident,
+            he_lat_deg,
+            he_lon_deg,
+            he_heading_deg,
+            length_ft,
+            width_ft,
+            surface,
+        });
+    }
+    Ok(runways)
+}
+
 #[cfg(test)]
 mod tests {
     use look_above_core::types::BBox;
@@ -390,6 +509,69 @@ mod tests {
             idents,
             std::collections::HashSet::from(["KJFK", "KTEB", "N51"]),
             "KLAX is outside the bbox and must not appear regardless of size"
+        );
+    }
+
+    #[test]
+    fn runways_in_bbox_excludes_out_of_bbox_below_size_and_closed_runways() {
+        let conn = migrated_conn();
+        // A small, hand-built fixture rather than the full bundled asset, so the expected
+        // subset is known exactly instead of depending on live OurAirports contents.
+        conn.execute_batch(
+            "INSERT INTO airports (ident, name, type, lat, lon, elevation_ft, iso_country, iata)
+             VALUES
+                ('KJFK', 'John F Kennedy Intl', 'large_airport', 40.6413, -73.7781, 13, 'US', 'JFK'),
+                ('N51',  'Small Field', 'small_airport', 40.7, -74.0, 100, 'US', NULL),
+                ('KLAX', 'Los Angeles Intl', 'large_airport', 33.9425, -118.4081, 125, 'US', 'LAX');
+
+             INSERT INTO runways (airport_ident, le_ident, le_lat, le_lon, le_heading_deg,
+                                   he_ident, he_lat, he_lon, he_heading_deg, length_ft,
+                                   width_ft, surface, closed)
+             VALUES
+                -- in-bbox, above min_size: returned.
+                ('KJFK', '04L', 40.626, -73.784, 40.0, '22R', 40.656, -73.769, 220.0,
+                 12079, 200, 'ASP', 0),
+                -- in-bbox, but below min_size (small_airport < Medium): excluded.
+                ('N51', '09', 40.699, -74.001, 90.0, '27', 40.701, -73.999, 270.0,
+                 2500, 50, 'TURF', 0),
+                -- out-of-bbox airport: excluded regardless of size.
+                ('KLAX', '06L', 33.936, -118.436, 60.0, '24R', 33.949, -118.380, 240.0,
+                 10285, 150, 'CON', 0),
+                -- in-bbox, above min_size, but closed: excluded even though the airport qualifies.
+                ('KJFK', '13L', 40.648, -73.833, 130.0, '31R', 40.630, -73.762, 310.0,
+                 3460, 150, 'ASP', 1);",
+        )
+        .expect("fixture inserts");
+
+        let bbox = BBox::new(40.0, -75.0, 41.0, -73.0).expect("valid bbox");
+
+        let large_only = runways_in_bbox(&conn, bbox, AirportSize::Medium).expect("queries");
+        assert_eq!(
+            large_only.len(),
+            1,
+            "only KJFK's open, in-bbox, above-min-size runway should be returned"
+        );
+        assert_eq!(large_only[0].airport_ident, "KJFK");
+        assert_eq!(large_only[0].le_ident.as_deref(), Some("04L"));
+        assert_eq!(large_only[0].he_ident.as_deref(), Some("22R"));
+
+        let everything_in_bbox =
+            runways_in_bbox(&conn, bbox, AirportSize::Heliport).expect("queries");
+        let idents: std::collections::HashSet<&str> = everything_in_bbox
+            .iter()
+            .map(|runway| runway.airport_ident.as_str())
+            .collect();
+        assert_eq!(
+            idents,
+            std::collections::HashSet::from(["KJFK", "N51"]),
+            "N51's small-airport runway is in bbox and should appear once min_size allows it; \
+             KLAX must still be excluded (out of bbox) and KJFK's closed runway must still be \
+             excluded regardless of min_size"
+        );
+        assert_eq!(
+            everything_in_bbox.len(),
+            2,
+            "KJFK's closed runway must never appear, even at the most permissive min_size"
         );
     }
 }

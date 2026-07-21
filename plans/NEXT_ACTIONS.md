@@ -26,15 +26,19 @@ parking lot — not into milestones.
    *Also decide:* the repo is **public**, but inception recorded "private by default until
    owner says otherwise" (DECISION_LOG 2026-07-14). Nothing sensitive is exposed — either
    flip it to private or amend the record.
-2. **Continue M1** — [M1_AUTHORIZED_DATA_INGESTION.md](M1_AUTHORIZED_DATA_INGESTION.md),
-   item 1.4 (OpenSky `/states/all` adapter). 1.1–1.3 done 2026-07-15.
-3. **[OWNER, FYI] The credential is on this machine, not in the repo.** `credentials.json`
+2. **Continue M3** — [M3_ENRICHMENT_AND_NON_ADSB.md](M3_ENRICHMENT_AND_NON_ADSB.md),
+   item 3.3 (METAR polling + flight-category badges). Items 3.1–3.2 are implemented.
+3. **Before the next scripted visual QA, add deterministic navigation.** Provide one small,
+   reusable debug path to open a known airport/region (for example a CLI camera preset or a
+   fixed test scene). Timebox it as tooling, then reuse it; do not keep debugging synthetic
+   Win32 mouse input separately for each renderer feature.
+4. **[OWNER, FYI] The credential is on this machine, not in the repo.** `credentials.json`
    sits in the working directory, is gitignored, and is the only copy — it is not in git and
    never was (checked before anything else touched it). If you move machines, re-download it
    from your OpenSky account, or export `LOOK_ABOVE_OPENSKY_CLIENT_ID` /
    `LOOK_ABOVE_OPENSKY_CLIENT_SECRET` instead. **Rotate it** at
    https://opensky-network.org → account settings if it is ever pasted anywhere shared.
-4. **[OWNER] Review the M0 gate record** — evidence table in
+5. **[OWNER] Review the M0 gate record** — evidence table in
    [CURRENT_STATUS.md](CURRENT_STATUS.md). 6/7 met, the seventh is #1 above. M1 proceeding
    does not retire this; it just means the review is happening late.
 

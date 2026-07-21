@@ -35,44 +35,31 @@ M2's gate record.
       `AirportSize` (heliport/small/medium/large; drop `seaplane_base`/`balloonport`/`closed` —
       docs/09's own documented-at-import-time decision). Acceptance: airport count within 5% of
       source CSV row count.
-      *(2026-07-20: implemented — new `import-ourairports` binary in `crates/import` (host
-      allowlist + own unit tests, mirroring `import-basemap`'s exact shape), migration
-      `0002_airports.sql` verbatim from docs/08, `AirportSize::from_ourairports_type` added to
-      `core::contracts` (shared by both `import` and `store` so the type-drop ladder isn't
-      duplicated), a new `crate::ourairports` module in `store` (idempotent bundled-CSV seed +
-      `airports_in_bbox` query), and `Writer::airports_in_bbox` wired through the existing
-      `Command`-channel pattern — **not** a full `core::contracts::Store` impl (still blocked on
-      `positions`, M5's table, exactly as `lib.rs`'s own doc comment already explained). Did not
-      split 3.1a/3.1b — scoping held as one item cleanly, unlike 2.2's basemap fetch (no
-      shapefile/zip parsing here, just CSV). Delegated to the storage-agent (its stated remit:
-      "enrichment imports (OurAirports, FAA registry, METAR cache)"), independently re-verified
-      by this session: every changed/new file read in full, fresh `cargo fmt --check`/
-      `clippy --workspace --all-targets -D warnings`/`test --workspace` — **539 passed, 5
-      ignored, 0 failed** (+24 over 2.10's 515: 3 in `core::contracts`, 10 in the new
-      `import-ourairports` binary, 2 net in `migrations.rs` after fixing the now-stale
-      single-migration test to check each version's own table set honestly, 6 in
-      `store::ourairports`, 3 in `store::writer`). Live run of the import tool against the real
-      `davidmegginson.github.io` host confirmed the agent's reported counts exactly (bundled
-      `airports.csv` 71,086 rows / `runways.csv` 43,240 rows, both re-derived independently via
-      `wc -l` against the committed bundled assets — not just trusted from the report).
-      **"Within 5%" interpreted against the *kept-type* source count (71,086: large/medium/
-      small/heliport), not the raw 85,776-row upstream total** — the raw total includes ~13,355
-      `closed` rows alone, which the M3 plan's own `AirportSize` mapping decision (and
-      `crates/core/src/contracts.rs`'s pre-existing doc comment) already commits to dropping
-      entirely, so comparing against the undropped raw count would be the wrong denominator, not
-      a stricter reading of the acceptance line. Recorded here explicitly rather than left
-      implicit, same as every other acceptance-line interpretation call this project has made at
-      a gate. Runway *query* API stays out of scope (3.2's job); this item only needed runway
-      rows to exist, seeded and orphan-filtered. DECISION_LOG 2026-07-20 (3.1).)*
-- [ ] 3.2 Airport + runway rendering: markers for large/medium airports, runway-outline
+      *(Done 2026-07-20: bundled OurAirports import, migration, size mapping, seed, and
+      bbox query; 539 tests passed. The 5% check uses the kept-type source count. Evidence and
+      rationale: DECISION_LOG 2026-07-20, M3 3.1.)*
+- [x] 3.2 Airport + runway rendering: markers for large/medium airports, runway-outline
       polylines at close zoom, reusing existing tessellation approach (`lyon`, per 2.2b's
       basemap precedent) rather than a new one. Scoped per the tension noted above — no LOD-tier
       gating (M4's job), just correct data drawn at the current single render tier.
-- [ ] 3.3 METAR polling + flight-category badges: new `ingest` adapter for
+      *(Done 2026-07-20: runway contract/query plus airport-marker and runway render layers;
+      553 tests passed. Live launch was healthy, but airport/runway pixels remain visually
+      unconfirmed due unreliable scripted navigation. Evidence: DECISION_LOG 2026-07-20, 3.2.)*
+- [x] 3.3 METAR polling + flight-category badges: new `ingest` adapter for
       `aviationweather.gov` (batch ≤ 100 stations, ≥ 10 min spacing — enforced in code, not just
       documented), `metars` table (keep latest 2/station per docs/08 retention), flight-category
       badge (VFR/MVFR/IFR/LIFR color per docs/13) drawn near visible large airports. Acceptance:
       badge data age ≤ 70 min; polling interval log-verified ≥ 10 min.
+      *(Done 2026-07-21: `ingest::metar` (fetch + a dedicated single-source poller, no failover
+      chain — docs/09 lists exactly one METAR provider), migration 0003 + `store::metar`
+      (upsert/retention/query), core `Metar`/`FlightCategory`/`MetarBadge` contracts, a per-instance-
+      colored badge ring layer in `render` (reuses `airport::marker_mesh`, drawn before the
+      airport-marker pass so the marker paints over the ring's center), and `app::window` wiring
+      (poller spawn, station retarget + badge join piggybacked on the existing camera-settle
+      trigger, same as 3.2). 590 total passed, 6 ignored (live-only), 0 failed; fmt/clippy clean.
+      Live-verified end to end: real `aviationweather.gov` fetch,
+      colored VFR/MVFR badge rings visually confirmed on screen at their airports, plain gray for
+      airports with no cached observation yet — see DECISION_LOG 2026-07-21, M3 3.3.)*
 - [ ] 3.4 adsbdb selection lookups: new `ingest` adapter for `GET /v0/aircraft/{hex}` and
       `GET /v0/callsign/{callsign}`, called **only** from the selection path and **only** when
       `anonymous == false` — this is a code gate (privacy rule 2.2), unit-tested as its own

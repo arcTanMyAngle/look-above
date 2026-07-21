@@ -18,12 +18,17 @@
 //! over through the chain on error, probes for the primary's recovery, and emits
 //! [`PollBatch`](poller::PollBatch)es into the `crossbeam` channel the rest of the pipeline
 //! reads.
+//!
+//! [`metar`] is the separate, single-source enrichment poller for `aviationweather.gov`
+//! (M3 item 3.3) — no failover chain, no credit budget, just a fixed ≥10-minute cadence over
+//! whatever station list the camera's viewport currently asks for.
 
 pub mod adsb_lol;
 pub mod airplanes_live;
 pub mod allowlist;
 pub mod budget;
 pub mod http;
+pub mod metar;
 mod normalize;
 pub mod opensky;
 pub mod pacer;

@@ -10,6 +10,10 @@ the `RenderFeed` the CPU pipeline hands you.
 
 ## Read before coding
 
+Read only the sections named by the parent prompt. Do not load `CURRENT_STATUS`, an entire
+milestone history, or a full source file over 400 lines. Locate the relevant pipeline/layer
+symbols first and inspect bounded ranges.
+
 - `docs/01_VISUAL_RENDERING_REQUIREMENTS.md` — frame budgets (60 fps, ≤ 4 ms render-thread
   CPU, integrated-GPU target), draw order, LOD tier table, color/theme spec. These are
   requirements, not suggestions.
@@ -20,6 +24,8 @@ the `RenderFeed` the CPU pipeline hands you.
 
 ## Hard boundaries (ADR-002)
 
+- Do not spawn subagents. If work crosses into another lane, return the exact boundary and
+  required files to the parent instead of creating a nested request stack.
 - The render thread only: swaps the double buffer, uploads instance data, records commands,
   presents. **No simulation, no I/O, no per-frame allocation in the loop.** If a task needs
   CPU-side layout/culling/interpolation, it belongs in `core` — hand it to geo-math-agent or

@@ -19,7 +19,11 @@
 //! 3. Apply `app::window`'s latest click selection ([`Simulator::set_selected`], M2 item 2.8a) —
 //!    read fresh off a `watch` channel every iteration rather than edge-detected, since re-setting
 //!    an unchanged `Option<Icao24>` is free and selection changes at click cadence.
-//! 4. Advance every track to now and publish the resulting feed to the render thread through the
+//! 4. Drain every METAR batch that has arrived (M3 item 3.3) and persist it to the store —
+//!    unlike position batches, there is nothing to merge into the [`Simulator`]: badges are read
+//!    straight back out of the store on the camera-settle cadence `app::window` already drives
+//!    `current_airports`/`current_runways` from, not carried through the render feed.
+//! 5. Advance every track to now and publish the resulting feed to the render thread through the
 //!    [`crate::double_buffer`].
 //!
 //! Stale tracks are evicted from the table (at [`DROP_AFTER_S`], the same horizon the simulator
@@ -38,6 +42,7 @@ use crossbeam_channel::Receiver;
 use look_above_core::merge::{DROP_AFTER_S, SessionTable};
 use look_above_core::sim::{RenderFeed, Simulator};
 use look_above_core::types::{Icao24, StateVector, UnixSeconds};
+use look_above_ingest::metar::MetarBatch;
 use look_above_ingest::poller::PollBatch;
 use look_above_store::Writer;
 use tokio::sync::watch;
@@ -55,11 +60,20 @@ const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
 ///
 /// Fails only if the OS refuses a new thread (resource exhaustion), which [`crate::window`]
 /// surfaces the same way a renderer-init failure is — fatal, not a silent degrade.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this is the one place every piece the worker owns (simulator, table, writer, both \
+              channel receivers, the feed producer, selection, shutdown) converges to be handed \
+              off; a params struct would not reduce what the caller has to assemble, just move \
+              it behind one more layer of indirection — the same reasoning `renderer::record_draw_passes` \
+              gives for its own too_many_arguments"
+)]
 pub fn spawn(
     simulator: Simulator,
     table: SessionTable,
     writer: Writer,
     batch_rx: Receiver<PollBatch>,
+    metar_rx: Receiver<MetarBatch>,
     producer: Producer<RenderFeed>,
     select_rx: watch::Receiver<Option<Icao24>>,
     shutdown: Arc<AtomicBool>,
@@ -70,18 +84,24 @@ pub fn spawn(
         // worker ends; `run` only needs to borrow it.
         .spawn(move || {
             run(
-                simulator, table, &writer, &batch_rx, &producer, &select_rx, &shutdown,
+                simulator, table, &writer, &batch_rx, &metar_rx, &producer, &select_rx, &shutdown,
             );
         })
 }
 
 /// The worker loop — see the module doc for the per-iteration steps. Returns when `shutdown` is
 /// set (checked once per iteration, so the thread stops within one frame of being told to).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors spawn's own too_many_arguments reason: this is `spawn`'s closure body, \
+              taking by-reference exactly what it was handed by value"
+)]
 fn run(
     mut simulator: Simulator,
     mut table: SessionTable,
     writer: &Writer,
     batch_rx: &Receiver<PollBatch>,
+    metar_rx: &Receiver<MetarBatch>,
     producer: &Producer<RenderFeed>,
     select_rx: &watch::Receiver<Option<Icao24>>,
     shutdown: &AtomicBool,
@@ -93,6 +113,7 @@ fn run(
         if drain_and_merge(batch_rx, writer, &mut table) {
             sync_simulator(&mut simulator, &mut table, now_s, now_unix);
         }
+        drain_and_store_metars(metar_rx, writer);
 
         // Cheap (an `Option<Icao24>` `Copy`) to re-apply every iteration rather than only on
         // change — simpler than edge-detecting a watch channel, and selection changes at click
@@ -120,6 +141,22 @@ fn drain_and_merge(
         merged = true;
     }
     merged
+}
+
+/// Persists every METAR batch waiting on the channel (M3 item 3.3) — there is no session table
+/// to merge into (unlike [`drain_and_merge`]'s positions): a badge is read straight back out of
+/// the store on `app::window`'s own settle cadence, so this only needs to get each batch into
+/// `metars` before that next read. A write failure is logged, not propagated — the same
+/// "the pipeline itself is healthy" reasoning `pipeline::record_cycle` already documents for
+/// `source_status`.
+fn drain_and_store_metars(metar_rx: &Receiver<MetarBatch>, writer: &Writer) {
+    for batch in metar_rx.try_iter() {
+        let count = batch.metars.len();
+        match writer.upsert_metars(batch.metars) {
+            Ok(()) => tracing::debug!(count, "metar batch persisted"),
+            Err(error) => tracing::warn!(%error, "could not persist a metar batch"),
+        }
+    }
 }
 
 /// Bounds the table to still-live tracks, then installs the current picture into the simulator.

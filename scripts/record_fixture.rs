@@ -27,6 +27,9 @@
 //! # airplanes.live / adsb.lol: a point and radius in nm (≤ 250). Keyless and free.
 //! cargo run -p look-above-ingest --bin record-fixture -- airplaneslive 47 8 73 point_nominal
 //! cargo run -p look-above-ingest --bin record-fixture -- adsblol       47 8 73 point_nominal
+//!
+//! # aviationweather.gov: a comma-separated station id list. Keyless and free (NOAA).
+//! cargo run -p look-above-ingest --bin record-fixture -- aviationweather KJFK,KLAX,KORD metar_nominal
 //! ```
 //!
 //! The file lands in `crates/ingest/tests/fixtures/<source>/<name>.json`. Re-record a
@@ -86,6 +89,7 @@ enum Source {
     OpenSky,
     AirplanesLive,
     AdsbLol,
+    AviationWeather,
 }
 
 impl Source {
@@ -95,15 +99,18 @@ impl Source {
             Source::OpenSky => "opensky",
             Source::AirplanesLive => "airplaneslive",
             Source::AdsbLol => "adsblol",
+            Source::AviationWeather => "aviationweather",
         }
     }
 
-    /// The top-level array holding the per-aircraft records — `states` for `OpenSky`'s
-    /// positional arrays, `ac` for the readsb feeds.
-    fn records_key(self) -> &'static str {
+    /// The top-level array holding the per-record array — `states` for `OpenSky`'s positional
+    /// arrays, `ac` for the readsb feeds. `None` means the response body *is* the array
+    /// (`aviationweather.gov`'s METAR endpoint returns a bare JSON array, not an object).
+    fn records_key(self) -> Option<&'static str> {
         match self {
-            Source::OpenSky => "states",
-            Source::AirplanesLive | Source::AdsbLol => "ac",
+            Source::OpenSky => Some("states"),
+            Source::AirplanesLive | Source::AdsbLol => Some("ac"),
+            Source::AviationWeather => None,
         }
     }
 }
@@ -121,6 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Source::AdsbLol,
             fetch_point(adsb_lol::POINT_ENDPOINT, &args).await?,
         ),
+        Some("aviationweather") => (Source::AviationWeather, fetch_metar(&args).await?),
         _ => return Err(usage().into()),
     };
 
@@ -178,10 +186,29 @@ async fn fetch_point(endpoint: &str, args: &[String]) -> Result<Value, Box<dyn E
     Ok(send_json(HttpClient::new()?.get(&url)?).await?)
 }
 
+/// `<station,station,...> <name>`, `aviationweather.gov`'s own comma-separated `ids` shape
+/// (`look_above_ingest::metar::MetarSource` sends the same query, ≤ 100 ids per request).
+async fn fetch_metar(args: &[String]) -> Result<Value, Box<dyn Error>> {
+    let ids = args.get(1).ok_or_else(usage)?;
+    let request = HttpClient::new()?
+        .get(look_above_ingest::metar::METAR_ENDPOINT)?
+        .query(&[("ids", ids.as_str()), ("format", "json")]);
+    Ok(send_json(request).await?)
+}
+
 /// Trim the record array to [`MAX_FIXTURE_RECORDS`], then scrub credential-shaped keys.
-fn prepare(mut body: Value, records_key: &str) -> Value {
-    if let Some(Value::Array(records)) = body.get_mut(records_key) {
-        records.truncate(MAX_FIXTURE_RECORDS);
+fn prepare(mut body: Value, records_key: Option<&str>) -> Value {
+    match records_key {
+        Some(key) => {
+            if let Some(Value::Array(records)) = body.get_mut(key) {
+                records.truncate(MAX_FIXTURE_RECORDS);
+            }
+        }
+        None => {
+            if let Value::Array(records) = &mut body {
+                records.truncate(MAX_FIXTURE_RECORDS);
+            }
+        }
     }
     scrub(&mut body);
     body
@@ -205,10 +232,13 @@ fn scrub(value: &mut Value) {
     }
 }
 
-/// How many records the array under `key` holds — `0` when it is absent or `null` (an empty
-/// region), never an error.
-fn records_len(body: &Value, key: &str) -> usize {
-    body.get(key).and_then(Value::as_array).map_or(0, Vec::len)
+/// How many records the array under `key` holds (or, for `key: None`, the root array itself) —
+/// `0` when it is absent, `null`, or not an array, never an error.
+fn records_len(body: &Value, key: Option<&str>) -> usize {
+    match key {
+        Some(key) => body.get(key).and_then(Value::as_array).map_or(0, Vec::len),
+        None => body.as_array().map_or(0, Vec::len),
+    }
 }
 
 /// Pretty-print `body` to `crates/ingest/tests/fixtures/<source>/<name>.json`.
@@ -243,12 +273,12 @@ fn bbox_args(args: &[String]) -> Result<[f64; 4], Box<dyn Error>> {
 }
 
 /// The output name is always the argument after the region parameters — index 5 for the bbox
-/// sources, index 4 for the point sources.
+/// source, index 4 for the point sources, index 2 for the METAR source (just a station list).
 fn out_name(args: &[String]) -> Result<&str, Box<dyn Error>> {
-    let index = if matches!(args.first().map(String::as_str), Some("opensky")) {
-        5
-    } else {
-        4
+    let index = match args.first().map(String::as_str) {
+        Some("opensky") => 5,
+        Some("aviationweather") => 2,
+        _ => 4,
     };
     args.get(index)
         .map(String::as_str)
@@ -286,7 +316,8 @@ fn usage() -> String {
     "usage:\n  \
      record-fixture opensky <lamin> <lomin> <lamax> <lomax> <name>\n  \
      record-fixture airplaneslive <lat> <lon> <radius_nm> <name>\n  \
-     record-fixture adsblol <lat> <lon> <radius_nm> <name>"
+     record-fixture adsblol <lat> <lon> <radius_nm> <name>\n  \
+     record-fixture aviationweather <station,station,...> <name>"
         .to_owned()
 }
 
@@ -308,8 +339,8 @@ mod tests {
             .collect();
         let body = json!({ "now": 1_721_000_000_000_i64, "total": 50, "ac": records });
 
-        let prepared = prepare(body, "ac");
-        assert_eq!(records_len(&prepared, "ac"), MAX_FIXTURE_RECORDS);
+        let prepared = prepare(body, Some("ac"));
+        assert_eq!(records_len(&prepared, Some("ac")), MAX_FIXTURE_RECORDS);
         assert_eq!(
             prepared.get("now").and_then(Value::as_i64),
             Some(1_721_000_000_000),
@@ -322,8 +353,8 @@ mod tests {
     #[test]
     fn a_short_record_list_is_left_alone() {
         let body = json!({ "states": [["3c6444"], ["4ca7b6"]] });
-        let prepared = prepare(body, "states");
-        assert_eq!(records_len(&prepared, "states"), 2);
+        let prepared = prepare(body, Some("states"));
+        assert_eq!(records_len(&prepared, Some("states")), 2);
     }
 
     /// An empty region: `OpenSky` sends `states: null`, and that is neither a crash nor a
@@ -331,8 +362,21 @@ mod tests {
     #[test]
     fn a_null_record_array_is_zero_records_not_an_error() {
         let body = json!({ "time": 1_721_000_000, "states": Value::Null });
-        let prepared = prepare(body, "states");
-        assert_eq!(records_len(&prepared, "states"), 0);
+        let prepared = prepare(body, Some("states"));
+        assert_eq!(records_len(&prepared, Some("states")), 0);
+    }
+
+    /// `aviationweather.gov`'s METAR endpoint returns a bare array, not an object — `records_key:
+    /// None` means "the root is the array", and trimming/counting must work against it directly.
+    #[test]
+    fn a_root_level_array_is_trimmed_and_counted_with_no_records_key() {
+        let records: Vec<Value> = (0..50)
+            .map(|i| json!({ "icaoId": format!("K{i:03}") }))
+            .collect();
+        let body = Value::Array(records);
+
+        let prepared = prepare(body, None);
+        assert_eq!(records_len(&prepared, None), MAX_FIXTURE_RECORDS);
     }
 
     // ---- Scrubbing --------------------------------------------------------------------------
@@ -388,11 +432,13 @@ mod tests {
     #[test]
     fn each_source_maps_to_its_fixture_dir_and_record_key() {
         assert_eq!(Source::OpenSky.dir(), "opensky");
-        assert_eq!(Source::OpenSky.records_key(), "states");
+        assert_eq!(Source::OpenSky.records_key(), Some("states"));
         assert_eq!(Source::AirplanesLive.dir(), "airplaneslive");
         assert_eq!(Source::AdsbLol.dir(), "adsblol");
-        assert_eq!(Source::AirplanesLive.records_key(), "ac");
-        assert_eq!(Source::AdsbLol.records_key(), "ac");
+        assert_eq!(Source::AirplanesLive.records_key(), Some("ac"));
+        assert_eq!(Source::AdsbLol.records_key(), Some("ac"));
+        assert_eq!(Source::AviationWeather.dir(), "aviationweather");
+        assert_eq!(Source::AviationWeather.records_key(), None);
     }
 
     /// A name that could escape the fixtures directory is refused before any write.
@@ -407,8 +453,8 @@ mod tests {
         }
     }
 
-    /// The output-name index tracks the region arity: the bbox sources put it fifth, the
-    /// point sources fourth.
+    /// The output-name index tracks the region arity: the bbox source puts it fifth, the point
+    /// sources fourth, and the METAR source (just a station list, no lat/lon/radius) second.
     #[test]
     fn the_output_name_follows_the_region_arguments() {
         let opensky = strings(&["opensky", "46", "7", "48", "9", "states_nominal"]);
@@ -416,6 +462,9 @@ mod tests {
 
         let point = strings(&["adsblol", "47", "8", "73", "point_nominal"]);
         assert_eq!(out_name(&point).expect("named"), "point_nominal");
+
+        let metar = strings(&["aviationweather", "KJFK,KLAX", "metar_nominal"]);
+        assert_eq!(out_name(&metar).expect("named"), "metar_nominal");
 
         let missing = strings(&["adsblol", "47", "8", "73"]);
         assert!(

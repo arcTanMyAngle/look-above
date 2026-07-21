@@ -20,12 +20,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::unbounded;
 use look_above_core::camera::Camera;
-use look_above_core::contracts::RegionQuery;
+use look_above_core::contracts::{Airport, AirportSize, Metar, MetarBadge, RegionQuery, Runway};
 use look_above_core::merge::SessionTable;
 use look_above_core::sim::{RenderFeed, Simulator};
 use look_above_core::types::{Icao24, SourceId};
 use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
+use look_above_ingest::metar::{self, MetarSource, run_metar_poller};
 use look_above_ingest::opensky::OpenSkyAuth;
 use look_above_ingest::poller::{PRIMARY, Poller, SystemWallClock, WallClock};
 use look_above_render::{
@@ -149,6 +150,31 @@ struct App {
     /// initial region it was constructed with) — so a settled camera is not resent every frame.
     last_sent_region: RegionQuery,
 
+    /// A clone of the same `store::Writer` [`App::start`] hands to the simulation worker (cheap:
+    /// `Writer` is just a channel `Sender` — see its own doc comment), kept here so the render/
+    /// event thread can query airports/runways directly (M3 item 3.2) without routing through
+    /// the worker. `None` until [`App::start`] has opened the store.
+    store: Option<Writer>,
+    /// The airports [`App::maybe_retarget`] most recently queried for the camera's settled
+    /// viewport (M3 item 3.2), at the fixed `AirportSize::Medium` threshold the checklist's own
+    /// "large/medium airports" wording asks for (no LOD-tier gating yet — see the M3 plan's own
+    /// cross-milestone tension note). Kept (not cleared) across a failed query — see
+    /// `maybe_retarget`'s own doc comment.
+    current_airports: Vec<Airport>,
+    /// The runways [`App::maybe_retarget`] most recently queried alongside
+    /// [`App::current_airports`] — same threshold, same tolerant-on-error behavior.
+    current_runways: Vec<Runway>,
+    /// The live handle used to retarget the running METAR poller's station list (M3 item 3.3) —
+    /// mirrors [`App::retarget_tx`]'s shape, but carries the `AirportSize::Large` subset of
+    /// [`App::current_airports`]' idents instead of a `RegionQuery`. `None` until
+    /// [`App::start`] has spawned the poller.
+    metar_retarget_tx: Option<watch::Sender<Vec<String>>>,
+    /// The flight-category badges [`App::maybe_retarget`] most recently resolved — the join of
+    /// [`App::current_airports`]' large airports against whatever METAR the store has cached
+    /// for each (M3 item 3.3). Kept (not cleared) across a failed query, same as
+    /// [`App::current_airports`] itself.
+    current_metar_badges: Vec<MetarBadge>,
+
     /// The render-thread end of the double buffer the simulation worker publishes into. Swapped
     /// once at the start of every frame — nothing here computes the feed (ADR-002). `None` until
     /// [`App::start`] has spawned the worker.
@@ -173,6 +199,30 @@ struct App {
     sim_handle: Option<JoinHandle<()>>,
 }
 
+/// Joins `airports` against `metars` by `station == ident`, keeping only the large airports
+/// with a cached observation that resolved to a flight category (M3 item 3.3) — a `None`
+/// category has nothing to badge (see `core::contracts::Metar::flight_category`'s own doc
+/// comment on when the source reports no computable one).
+///
+/// A free function, not a method: it is a pure join with no `App` state to read, and
+/// [`App::maybe_retarget`] is already a free function itself for the same "called while other
+/// `self` fields are borrowed" reason.
+fn metar_badges_for(airports: &[Airport], metars: &[Metar]) -> Vec<MetarBadge> {
+    airports
+        .iter()
+        .filter(|airport| airport.size == AirportSize::Large)
+        .filter_map(|airport| {
+            let metar = metars.iter().find(|metar| metar.station == airport.ident)?;
+            let category = metar.flight_category?;
+            Some(MetarBadge {
+                lat_deg: airport.lat_deg,
+                lon_deg: airport.lon_deg,
+                category,
+            })
+        })
+        .collect()
+}
+
 impl App {
     /// `Config` and the runtime handle have no meaningful `Default`, so this replaces what
     /// `#[derive(Default)]` used to give `App` — everything else starts the same way it did.
@@ -195,6 +245,11 @@ impl App {
             retarget_tx: None,
             last_camera_change_instant: None,
             last_sent_region: RegionQuery::default(),
+            store: None,
+            current_airports: Vec::new(),
+            current_runways: Vec::new(),
+            metar_retarget_tx: None,
+            current_metar_badges: Vec::new(),
             feed_consumer: None,
             current_feed: RenderFeed::default(),
             selected_icao24: None,
@@ -204,6 +259,14 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one-time startup sequencing: window/renderer/camera, then the store, the \
+                  position-poller chain, the metar poller (M3 item 3.3), and the simulation \
+                  worker, each a few lines to construct and hand off — splitting it into \
+                  sub-functions would mean passing most of these same locals through another \
+                  layer of parameters rather than reducing what this method actually does"
+    )]
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
@@ -247,6 +310,10 @@ impl App {
                 self.config.storage.db_path.display()
             )
         })?;
+        // Cheap (a channel `Sender` clone — see `Writer`'s own doc comment): kept on `App` so
+        // this thread can query airports/runways (M3 item 3.2) directly, alongside the other
+        // clone the simulation worker below takes ownership of.
+        let store_handle = writer.clone();
 
         let client = HttpClient::new().context("build the shared HTTP client")?;
         let auth =
@@ -260,6 +327,11 @@ impl App {
 
         let clock: Arc<dyn WallClock> = Arc::new(SystemWallClock);
         let (sender, receiver) = unbounded();
+        // Cloned before `client` moves into `with_default_chain` below — the METAR source is a
+        // separate, single-source poller (M3 item 3.3, see `ingest::metar`'s module doc
+        // comment), not part of the live-position failover chain, but it shares the same
+        // allowlist-enforcing `HttpClient`.
+        let metar_source = MetarSource::new(client.clone());
         let mut poller =
             Poller::with_default_chain(client, auth, retarget_rx, sender, Arc::clone(&clock));
 
@@ -298,6 +370,20 @@ impl App {
         );
         self.runtime_handle.spawn(poller.run());
 
+        // The METAR poller (M3 item 3.3): starts with an empty station list — nothing to poll
+        // until the first camera settle populates it (see `App::maybe_retarget`) — at the fixed
+        // ≥10-minute cadence `ingest::metar::MIN_POLL_INTERVAL` documents.
+        let (metar_retarget_tx, metar_retarget_rx) = watch::channel(Vec::new());
+        let (metar_sender, metar_receiver) = unbounded();
+        self.runtime_handle.spawn(run_metar_poller(
+            metar_source,
+            metar_retarget_rx,
+            metar_sender,
+            Arc::clone(&clock),
+            metar::MIN_POLL_INTERVAL,
+            metar::IDLE_RECHECK_INTERVAL,
+        ));
+
         // Hand the merge/interpolate/persist side to a worker thread (ADR-002): it owns the
         // `SessionTable`, the `Writer`, and the batch receiver, drains poll cycles, runs
         // `core::sim` at render cadence, and publishes each frame's feed into the double buffer
@@ -310,6 +396,7 @@ impl App {
             SessionTable::new(),
             writer,
             receiver,
+            metar_receiver,
             producer,
             select_rx,
             Arc::clone(&shutdown),
@@ -321,6 +408,8 @@ impl App {
         self.camera = Some(camera);
         self.retarget_tx = Some(retarget_tx);
         self.last_sent_region = initial_query;
+        self.store = Some(store_handle);
+        self.metar_retarget_tx = Some(metar_retarget_tx);
         self.feed_consumer = Some(consumer);
         self.select_tx = Some(select_tx);
         self.sim_shutdown = Some(shutdown);
@@ -353,6 +442,11 @@ impl App {
             &mut self.last_camera_change_instant,
             &mut self.last_sent_region,
             self.retarget_tx.as_ref(),
+            self.store.as_ref(),
+            &mut self.current_airports,
+            &mut self.current_runways,
+            self.metar_retarget_tx.as_ref(),
+            &mut self.current_metar_badges,
         );
 
         // Swap in the latest feed the simulation worker has published (ADR-002's atomic
@@ -396,6 +490,9 @@ impl App {
             camera,
             stats_overlay,
             info_card.as_ref(),
+            &self.current_airports,
+            &self.current_runways,
+            &self.current_metar_badges,
         ) {
             Ok(FrameOutcome::Presented) => {
                 if let Some(summary) = self.stats.record(now) {
@@ -443,6 +540,29 @@ impl App {
     /// starts — and nothing is ever sent — before the user has interacted with the camera for
     /// the first time. A free-standing function so it can be called from [`App::draw`] while
     /// `renderer`/`camera` (borrowed from other `self` fields) are still in scope.
+    ///
+    /// M3 item 3.2 piggybacks the airport/runway "map lines" query on this same settle-and-send
+    /// trigger point (`store`/`current_airports`/`current_runways`): the checklist's own
+    /// "reusing existing tessellation approach" scoping reads naturally as "reuse the existing
+    /// retarget trigger" too, rather than inventing a second debounce/settle mechanism for the
+    /// same camera-settled event. `store` is `None` only before [`App::start`] has opened it (in
+    /// practice never true while this runs — see this method's own early returns above); a query
+    /// failure logs a `tracing::warn!` and leaves the previous set in place, the same
+    /// don't-crash-the-app tolerance this method's own failed `retarget_tx.send` already has.
+    ///
+    /// M3 item 3.3 piggybacks the same way again: the freshly queried `AirportSize::Large`
+    /// subset becomes the METAR poller's next station list (`metar_retarget_tx`), and whatever
+    /// the store already has cached for those stations is joined into `current_metar_badges` —
+    /// no separate fetch here, this is a read of `metars` as it stands, not a wait for a new
+    /// poll cycle to land.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this bundles the camera-settle state (last_change/last_sent_region/retarget_tx) \
+                  with M3 3.2/3.3's own store-query outputs (current_airports/current_runways/ \
+                  current_metar_badges) at the one point they share a trigger; splitting any of \
+                  it into its own function would duplicate the settle-debounce check itself, not \
+                  reduce it"
+    )]
     fn maybe_retarget(
         camera: &Camera,
         now: Instant,
@@ -450,6 +570,11 @@ impl App {
         last_change: &mut Option<Instant>,
         last_sent_region: &mut RegionQuery,
         retarget_tx: Option<&watch::Sender<RegionQuery>>,
+        store: Option<&Writer>,
+        current_airports: &mut Vec<Airport>,
+        current_runways: &mut Vec<Runway>,
+        metar_retarget_tx: Option<&watch::Sender<Vec<String>>>,
+        current_metar_badges: &mut Vec<MetarBadge>,
     ) {
         if changed {
             *last_change = Some(now);
@@ -464,12 +589,57 @@ impl App {
             return;
         };
 
-        let query = RegionQuery::region(camera.viewport_bbox());
+        let bbox = camera.viewport_bbox();
+        let query = RegionQuery::region(bbox);
         if query != *last_sent_region {
             // A closed channel means the poller task itself has ended; there is nothing more
             // this side can do about it, so a failed send only stops retargeting, not the app.
             let _ = retarget_tx.send(query);
             *last_sent_region = query;
+
+            // M3 item 3.2: refresh the "map lines" airport/runway data for the newly settled
+            // viewport. Fixed `AirportSize::Medium` threshold per the checklist's own "large/
+            // medium airports" wording — a hardcoded interpretation, not an LOD-driven one, the
+            // same kind of explicit reading call the M3 plan's 3.1 entry already recorded for
+            // its own acceptance-line wording.
+            if let Some(store) = store {
+                match store.airports_in_bbox(bbox, AirportSize::Medium) {
+                    Ok(airports) => *current_airports = airports,
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "airports_in_bbox query failed; keeping the previous airport set"
+                    ),
+                }
+                match store.runways_in_bbox(bbox, AirportSize::Medium) {
+                    Ok(runways) => *current_runways = runways,
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "runways_in_bbox query failed; keeping the previous runway set"
+                    ),
+                }
+
+                // M3 item 3.3: retarget the METAR poller at the newly settled viewport's large
+                // airports, and read back whatever the store already has cached for them.
+                let large_idents: Vec<String> = current_airports
+                    .iter()
+                    .filter(|airport| airport.size == AirportSize::Large)
+                    .map(|airport| airport.ident.clone())
+                    .collect();
+                if let Some(metar_retarget_tx) = metar_retarget_tx {
+                    // Same tolerance as `retarget_tx.send` above: a gone poller task only stops
+                    // retargeting, not the app.
+                    let _ = metar_retarget_tx.send(large_idents.clone());
+                }
+                match store.metars_for_stations(large_idents) {
+                    Ok(metars) => {
+                        *current_metar_badges = metar_badges_for(current_airports, &metars);
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "metars_for_stations query failed; keeping the previous badge set"
+                    ),
+                }
+            }
         }
     }
 
@@ -660,5 +830,103 @@ impl ApplicationHandler for App {
         self.renderer = None;
         self.window = None;
         tracing::info!("window closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use look_above_core::contracts::FlightCategory;
+    use look_above_core::types::UnixSeconds;
+
+    use super::*;
+
+    fn airport(ident: &str, size: AirportSize, lat_deg: f64, lon_deg: f64) -> Airport {
+        Airport {
+            ident: ident.to_owned(),
+            name: format!("{ident} test airport"),
+            size,
+            lat_deg,
+            lon_deg,
+            elevation_ft: None,
+            iso_country: None,
+            iata: None,
+        }
+    }
+
+    fn metar(station: &str, category: Option<FlightCategory>) -> Metar {
+        Metar {
+            station: station.to_owned(),
+            observed_at: UnixSeconds(1_700_000_000),
+            raw: format!("{station} RAW"),
+            flight_category: category,
+            wind_dir_deg: None,
+            wind_kt: None,
+            visibility_sm: None,
+        }
+    }
+
+    // ---- `metar_badges_for` (M3 item 3.3) ----------------------------------------------------
+
+    #[test]
+    fn a_large_airport_with_a_categorized_metar_gets_a_badge_at_its_own_position() {
+        let airports = vec![airport("KJFK", AirportSize::Large, 40.64, -73.78)];
+        let metars = vec![metar("KJFK", Some(FlightCategory::Ifr))];
+
+        let badges = metar_badges_for(&airports, &metars);
+        assert_eq!(
+            badges,
+            vec![MetarBadge {
+                lat_deg: 40.64,
+                lon_deg: -73.78,
+                category: FlightCategory::Ifr,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_medium_or_smaller_airport_never_gets_a_badge_even_with_a_categorized_metar() {
+        let airports = vec![airport("KTEB", AirportSize::Medium, 40.85, -74.06)];
+        let metars = vec![metar("KTEB", Some(FlightCategory::Vfr))];
+
+        assert!(metar_badges_for(&airports, &metars).is_empty());
+    }
+
+    #[test]
+    fn a_large_airport_with_no_cached_metar_gets_no_badge() {
+        let airports = vec![airport("KJFK", AirportSize::Large, 40.64, -73.78)];
+        assert!(metar_badges_for(&airports, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_metar_with_no_resolved_category_gets_no_badge() {
+        let airports = vec![airport("KJFK", AirportSize::Large, 40.64, -73.78)];
+        let metars = vec![metar("KJFK", None)];
+        assert!(
+            metar_badges_for(&airports, &metars).is_empty(),
+            "a metar with an uncomputable flight category has nothing to draw"
+        );
+    }
+
+    #[test]
+    fn a_metar_for_a_different_station_does_not_cross_wire_onto_this_airport() {
+        let airports = vec![airport("KJFK", AirportSize::Large, 40.64, -73.78)];
+        let metars = vec![metar("KLAX", Some(FlightCategory::Lifr))];
+        assert!(metar_badges_for(&airports, &metars).is_empty());
+    }
+
+    #[test]
+    fn only_the_large_subset_is_badged_out_of_a_mixed_size_query() {
+        let airports = vec![
+            airport("KJFK", AirportSize::Large, 40.64, -73.78),
+            airport("KTEB", AirportSize::Medium, 40.85, -74.06),
+        ];
+        let metars = vec![
+            metar("KJFK", Some(FlightCategory::Mvfr)),
+            metar("KTEB", Some(FlightCategory::Vfr)),
+        ];
+
+        let badges = metar_badges_for(&airports, &metars);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].category, FlightCategory::Mvfr);
     }
 }

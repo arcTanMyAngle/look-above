@@ -13,10 +13,10 @@ NOAA weather + open airport datasets).
 
 ## Workflow contract
 
-1. Read [plans/CURRENT_STATUS.md](plans/CURRENT_STATUS.md) first, then the active milestone plan it names.
-2. Work one checklist item at a time; keep diffs scoped to it.
-3. Verify with `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`.
-4. Before ending: update `plans/CURRENT_STATUS.md`, log decisions in `plans/DECISION_LOG.md`.
+1. Read only the `Now` section of [plans/CURRENT_STATUS.md](plans/CURRENT_STATUS.md), then only the active checklist item and top-level constraints in the milestone plan it names.
+2. Work one coherent delivery slice at a time: one checklist item, or adjacent low-risk items sharing files and one acceptance check. Locate symbols before reading files over 400 lines.
+3. Verify proportionally to risk using [docs/06_TOOL_USAGE_RULES.md](docs/06_TOOL_USAGE_RULES.md); the full workspace sequence is reserved for high-risk/cross-cutting Rust changes and gates.
+4. Before ending: replace the ≤10-bullet `Now` section, add at most one short session-log line, and log only non-trivial decisions in `plans/DECISION_LOG.md`.
 5. Stop at milestone gates; a human reviews before the next milestone starts.
 
 ## Hard rules
@@ -41,16 +41,18 @@ NOAA weather + open airport datasets).
 | [testing-agent](.claude/agents/testing-agent.md) | Unit/integration tests, HTTP fixtures, benchmarks | Product decisions |
 | [ux-agent](.claude/agents/ux-agent.md) | Interaction design, labels, color ramps, accessibility, visual QA | Shader internals |
 
-Delegate to a subagent when a task is squarely in one lane; work directly for small
-cross-cutting edits. Give each subagent the specific file paths and the docs it needs —
-they start with no context.
+Default to direct work. Delegate only when a task is squarely in one lane and the cold
+subagent avoids substantial main-session reads. Use at most one subagent per delivery slice
+unless two lanes have independent files and acceptance checks. Nested subagents and generic
+"double-check the work" agents are prohibited. Give the agent exact file paths, bounded doc
+sections, and the acceptance check; do not forward the full parent transcript.
 
 ## Build & test commands
 
 ```sh
 cargo build --workspace          # compile everything
 cargo test --workspace           # all tests (offline; fixtures only, no live API calls)
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo run --release -p look-above   # run the app (once crates/app exists)
 ```

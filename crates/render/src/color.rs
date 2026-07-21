@@ -1,5 +1,6 @@
 //! The map background and base-map palette, and the sRGB conversion they share.
 
+use look_above_core::contracts::FlightCategory;
 use look_above_core::sim::AltitudeBucket;
 
 /// Background of the map view, authored as nonlinear sRGB (`#0A0E14`).
@@ -166,6 +167,64 @@ const INFO_CARD_TEXT_SRGB: [u8; 3] = [0xFF, 0xFF, 0xFF];
 /// reasoning as [`label_text_color`]).
 pub fn info_card_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
     layer_color(INFO_CARD_TEXT_SRGB, format)
+}
+
+/// Airport marker fill (M3 item 3.2), authored as nonlinear sRGB (`#4A525E`).
+///
+/// docs/01: aircraft stay the brightest things on screen; docs/13 wants map furniture (this is
+/// static, not live traffic) legible without competing for attention. A cool, desaturated
+/// gray-blue — clearly dimmer than every [`altitude_bucket_tint`] (including
+/// [`AltitudeBucket::Ground`]'s own already-muted gray, the ramp's dimmest stop) and far below
+/// [`LABEL_TEXT_SRGB`]'s near-white — reads as a static point-of-interest marker, not an aircraft.
+const AIRPORT_MARKER_SRGB: [u8; 3] = [0x4A, 0x52, 0x5E];
+
+/// Runway outline stroke (M3 item 3.2), authored as nonlinear sRGB (`#363D48`).
+///
+/// Dimmer again than [`AIRPORT_MARKER_SRGB`] (a runway outline is a longer, more visually
+/// dominant shape than a small marker dot, so it reads better a touch quieter at the same
+/// brightness) but still a shade brighter than [`COASTLINE_STROKE_SRGB`], so a runway reads as
+/// "on top of" the coastline layer rather than blending into it — both stay well under the
+/// altitude-ramp/label brightness this module's own
+/// `palette_brightens_background_then_land_then_coastline_and_stays_dark`-style tests pin for the
+/// rest of the map furniture.
+const RUNWAY_OUTLINE_SRGB: [u8; 3] = [0x36, 0x3D, 0x48];
+
+/// The airport marker fill color as shader-ready, opaque linear RGBA (same linearize-if-`srgb`
+/// reasoning as [`land_fill_color`]/[`coastline_stroke_color`]).
+pub fn airport_marker_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    layer_color(AIRPORT_MARKER_SRGB, format)
+}
+
+/// The runway outline stroke color as shader-ready, opaque linear RGBA.
+pub fn runway_outline_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    layer_color(RUNWAY_OUTLINE_SRGB, format)
+}
+
+/// METAR flight-category badge colors (M3 item 3.3), authored as nonlinear sRGB — docs/13's
+/// own naming ("VFR green / MVFR blue / IFR red / LIFR magenta") is the aviation-standard
+/// convention, so hue is fixed; these are this project's own shades of it (`DECISION_LOG`).
+/// Moderately saturated and mid-brightness: distinguishable at a glance from
+/// [`AIRPORT_MARKER_SRGB`]'s desaturated gray and from each other, but dimmer than every
+/// [`altitude_bucket_tint`] stop so a badge still reads as map furniture, not live traffic
+/// (docs/01: aircraft stay the brightest things on screen).
+const FLIGHT_CATEGORY_VFR_SRGB: [u8; 3] = [0x22, 0x75, 0x3C];
+const FLIGHT_CATEGORY_MVFR_SRGB: [u8; 3] = [0x2E, 0x6F, 0xB0];
+const FLIGHT_CATEGORY_IFR_SRGB: [u8; 3] = [0xB2, 0x3A, 0x3A];
+const FLIGHT_CATEGORY_LIFR_SRGB: [u8; 3] = [0xA2, 0x3F, 0xA8];
+
+/// The badge color for `category`, as shader-ready, opaque linear RGBA (same
+/// linearize-if-`srgb` reasoning as [`airport_marker_color`]).
+pub fn flight_category_badge_color(
+    category: FlightCategory,
+    format: wgpu::TextureFormat,
+) -> [f32; 4] {
+    let srgb = match category {
+        FlightCategory::Vfr => FLIGHT_CATEGORY_VFR_SRGB,
+        FlightCategory::Mvfr => FLIGHT_CATEGORY_MVFR_SRGB,
+        FlightCategory::Ifr => FLIGHT_CATEGORY_IFR_SRGB,
+        FlightCategory::Lifr => FLIGHT_CATEGORY_LIFR_SRGB,
+    };
+    layer_color(srgb, format)
 }
 
 /// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
@@ -413,6 +472,56 @@ mod tests {
         }
     }
 
+    // ---- Airport marker / runway outline colors (M3 item 3.2) -------------------------------
+
+    #[test]
+    fn airport_marker_and_runway_outline_are_dimmer_than_every_altitude_tint_and_label_text() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let marker_luma = luma(airport_marker_color(format));
+        let runway_luma = luma(runway_outline_color(format));
+        let label_luma = luma(label_text_color(format));
+
+        assert!(
+            marker_luma < label_luma,
+            "airport marker must stay dimmer than label text"
+        );
+        assert!(
+            runway_luma < label_luma,
+            "runway outline must stay dimmer than label text"
+        );
+        for bucket in ALL_BUCKETS {
+            let tint_luma = luma(altitude_bucket_tint(bucket, format));
+            assert!(
+                marker_luma < tint_luma,
+                "airport marker must stay dimmer than {bucket:?}'s tint"
+            );
+            assert!(
+                runway_luma < tint_luma,
+                "runway outline must stay dimmer than {bucket:?}'s tint"
+            );
+        }
+    }
+
+    #[test]
+    fn airport_marker_and_runway_outline_darken_on_an_srgb_surface() {
+        let marker_srgb = airport_marker_color(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let marker_plain = airport_marker_color(wgpu::TextureFormat::Bgra8Unorm);
+        assert!(
+            marker_srgb[0] < marker_plain[0]
+                || marker_srgb[1] < marker_plain[1]
+                || marker_srgb[2] < marker_plain[2]
+        );
+
+        let runway_srgb = runway_outline_color(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let runway_plain = runway_outline_color(wgpu::TextureFormat::Bgra8Unorm);
+        assert!(
+            runway_srgb[0] < runway_plain[0]
+                || runway_srgb[1] < runway_plain[1]
+                || runway_srgb[2] < runway_plain[2]
+        );
+    }
+
     #[test]
     fn altitude_bucket_tint_darkens_on_an_srgb_surface_too() {
         let srgb = altitude_bucket_tint(
@@ -422,5 +531,104 @@ mod tests {
         let plain =
             altitude_bucket_tint(AltitudeBucket::To28000Ft, wgpu::TextureFormat::Bgra8Unorm);
         assert!(srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2]);
+    }
+
+    // ---- Flight-category badge colors (M3 item 3.3) ------------------------------------------
+
+    const ALL_CATEGORIES: [FlightCategory; 4] = [
+        FlightCategory::Vfr,
+        FlightCategory::Mvfr,
+        FlightCategory::Ifr,
+        FlightCategory::Lifr,
+    ];
+
+    #[test]
+    fn every_flight_category_gets_a_distinct_opaque_color() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let mut seen = Vec::new();
+        for category in ALL_CATEGORIES {
+            let color = flight_category_badge_color(category, format);
+            assert!(
+                (color[3] - 1.0).abs() < 1e-6,
+                "{category:?} badge must be opaque"
+            );
+            seen.push(color);
+        }
+        for i in 0..seen.len() {
+            for j in (i + 1)..seen.len() {
+                assert_ne!(
+                    seen[i], seen[j],
+                    "{:?} and {:?} share a badge color",
+                    ALL_CATEGORIES[i], ALL_CATEGORIES[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "ifr_color/lifr_color mirror the domain's own IFR/LIFR terminology (docs/13); \
+                  obscuring the names to satisfy the lint would hurt readability more than it helps"
+    )]
+    fn badge_colors_follow_the_documented_hue_convention() {
+        // docs/13: VFR green / MVFR blue / IFR red / LIFR magenta — checked on the dominant
+        // channel(s) rather than pinning exact values, so the shade can be retuned freely.
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let vfr_color = flight_category_badge_color(FlightCategory::Vfr, format);
+        let mvfr_color = flight_category_badge_color(FlightCategory::Mvfr, format);
+        let ifr_color = flight_category_badge_color(FlightCategory::Ifr, format);
+        let lifr_color = flight_category_badge_color(FlightCategory::Lifr, format);
+
+        assert!(
+            vfr_color[1] > vfr_color[0] && vfr_color[1] > vfr_color[2],
+            "VFR must read as green"
+        );
+        assert!(
+            mvfr_color[2] > mvfr_color[0] && mvfr_color[2] > mvfr_color[1],
+            "MVFR must read as blue"
+        );
+        assert!(
+            ifr_color[0] > ifr_color[1] && ifr_color[0] > ifr_color[2],
+            "IFR must read as red"
+        );
+        assert!(
+            lifr_color[0] > lifr_color[1] && lifr_color[2] > lifr_color[1],
+            "LIFR must read as magenta (red and blue both above green)"
+        );
+    }
+
+    #[test]
+    fn badge_colors_stay_dimmer_than_every_altitude_tint_and_label_text() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let label_luma = luma(label_text_color(format));
+
+        for category in ALL_CATEGORIES {
+            let badge_luma = luma(flight_category_badge_color(category, format));
+            assert!(
+                badge_luma < label_luma,
+                "{category:?} badge must stay dimmer than label text"
+            );
+            for bucket in ALL_BUCKETS {
+                let tint_luma = luma(altitude_bucket_tint(bucket, format));
+                assert!(
+                    badge_luma < tint_luma,
+                    "{category:?} badge must stay dimmer than {bucket:?}'s tint"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn badge_colors_darken_on_an_srgb_surface() {
+        for category in ALL_CATEGORIES {
+            let srgb = flight_category_badge_color(category, wgpu::TextureFormat::Bgra8UnormSrgb);
+            let plain = flight_category_badge_color(category, wgpu::TextureFormat::Bgra8Unorm);
+            assert!(
+                srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2],
+                "{category:?} must darken on an sRGB surface"
+            );
+        }
     }
 }

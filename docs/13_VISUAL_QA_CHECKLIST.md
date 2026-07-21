@@ -8,6 +8,14 @@ results (pass/fail + notes + frame-stats numbers) in `plans/CURRENT_STATUS.md`.
 Setup: busy region (e.g. bbox around a major hub), ≥ 200 live aircraft, frame-stats overlay
 on, release build, laptop on mains power.
 
+## Efficient execution
+
+For an individual visible feature, run only the relevant subsection once after headless/unit
+checks pass. A full checklist pass is a milestone-gate activity. Prefer deterministic camera
+presets or test scenes over synthetic mouse automation. If the required view cannot be reached
+or captured after one focused attempt, record that harness gap and stop; do not turn feature
+verification into an open-ended window-control debugging session.
+
 ## L2-core (regional mode) — required at M2
 
 **Motion**

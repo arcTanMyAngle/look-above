@@ -5,20 +5,24 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use look_above_core::camera::Camera;
+use look_above_core::contracts::{Airport, MetarBadge, Runway};
 use look_above_core::geo::WEB_MERCATOR_EXTENT_M;
 use look_above_core::sim::{AircraftInstance, RenderFeed, TrailVertex};
 use look_above_core::types::Icao24;
+use lyon::tessellation::VertexBuffers;
 use wgpu::util::DeviceExt as _;
 use wgpu::{CurrentSurfaceTexture, DisplayAndWindowHandle};
 
 use crate::aircraft::{self, InstanceRaw, QuadVertex};
-use crate::basemap::{self, MeshData};
+use crate::airport::{self, AirportInstanceRaw};
+use crate::basemap::{self, MeshData, Vertex};
 use crate::color;
 use crate::error::RenderError;
 use crate::glyph_atlas;
 use crate::info_card::{self, InfoCardContent};
 use crate::label::{self, LabelPlacement, LeaderVertexRaw, TextInstanceRaw, TextQuadVertex};
 use crate::label_atlas;
+use crate::metar_badge::{self, BadgeInstanceRaw};
 use crate::stats_overlay::{self, StatsOverlay};
 use crate::trail::{self, TrailVertexRaw};
 
@@ -31,6 +35,17 @@ const SAMPLE_COUNT: u32 = 4;
 /// fragment entry point whose output color comes from a per-pass `@group(1)` uniform rather
 /// than being baked into the shader source (see `basemap.wgsl`'s module doc comment).
 const BASEMAP_SHADER: &str = include_str!("shaders/basemap.wgsl");
+
+/// The airport marker shader (M3 item 3.2): instanced circles, screen-constant radius, flat
+/// per-layer color — see `airport.wgsl`'s module doc comment. The runway-outline pass draws no
+/// new shader of its own: it reuses [`BASEMAP_SHADER`] (see [`build_runway_resources`]'s doc
+/// comment for why that reuse is exact, not approximate).
+const AIRPORT_SHADER: &str = include_str!("shaders/airport.wgsl");
+
+/// The METAR badge shader (M3 item 3.3): instanced rings, screen-constant radius, per-instance
+/// color — see `metar_badge.wgsl`'s module doc comment for how this differs from
+/// [`AIRPORT_SHADER`]'s flat per-layer color.
+const METAR_BADGE_SHADER: &str = include_str!("shaders/metar_badge.wgsl");
 
 /// The aircraft glyph shader (M2 item 2.5): instanced quads, rotation from per-instance heading,
 /// SDF atlas sampling — see `aircraft.wgsl`'s module doc comment.
@@ -80,6 +95,331 @@ impl BasemapLayer {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
+/// The runway-outline pass's GPU resources (M3 item 3.2) — one of the two "map lines" passes
+/// this item adds (see [`AirportMarkerLayer`] for the other). Drawn right after
+/// [`BasemapLayer`]'s coastline pass and before the trail pass (docs/01's draw order names
+/// "coastlines/borders/runways" together as one "map lines" step) — see
+/// [`Renderer::record_draw_passes`]'s own doc comment for that placement call.
+///
+/// Unlike [`BasemapLayer`]'s static, build-once mesh, this rebuilds every frame from whatever
+/// `runways` slice the caller hands `Renderer::render` — see `airport.rs`'s module doc comment on
+/// why (the queried set only actually changes on camera settle, but re-tessellating a few hundred
+/// runways at most, every frame, from reused scratch buffers, is simpler than tracking "did it
+/// change" and still costs nothing measurable against docs/01's 4 ms render-thread budget).
+#[derive(Debug)]
+struct RunwayLayer {
+    pipeline: wgpu::RenderPipeline,
+    /// This renderer's surface format's runway-outline color (`@group(1)`, fixed, like
+    /// [`BasemapLayer::color_bind_group`] — see [`color::runway_outline_color`]).
+    color_bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
+    index_capacity: usize,
+    /// Reused every frame so tessellating a frame's runways never allocates once capacity has
+    /// warmed up (ADR-002) — cleared and refilled by [`airport::tessellate_runways`], not
+    /// reallocated. `lyon`'s own `VertexBuffers` (not `basemap::MeshData`): the tessellator
+    /// writes into it directly across the whole runway list in one pass (see that function's
+    /// doc comment), the same shape `basemap::tessellate_coastline`'s per-feature loop uses
+    /// internally, just kept alive across frames here instead of being built fresh once.
+    scratch: VertexBuffers<Vertex, u32>,
+}
+
+impl RunwayLayer {
+    /// Tessellates `runways` into this frame's outline geometry, growing the GPU vertex/index
+    /// buffers first if the frame produced more than they currently hold. Returns the index
+    /// count to draw. `meters_per_pixel` sizes the screen-constant stroke width — see
+    /// [`airport::RUNWAY_STROKE_WIDTH_PX`]'s own doc comment.
+    fn upload_runways(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        runways: &[Runway],
+        meters_per_pixel: f64,
+    ) -> u32 {
+        airport::tessellate_runways(runways, meters_per_pixel, &mut self.scratch);
+
+        if self.scratch.vertices.len() > self.vertex_capacity {
+            let new_capacity = self
+                .scratch
+                .vertices
+                .len()
+                .max(self.vertex_capacity.saturating_mul(2))
+                .max(airport::MIN_RUNWAY_VERTEX_CAPACITY);
+            self.vertex_buffer = create_runway_vertex_buffer(device, new_capacity);
+            self.vertex_capacity = new_capacity;
+        }
+        if self.scratch.indices.len() > self.index_capacity {
+            let new_capacity = self
+                .scratch
+                .indices
+                .len()
+                .max(self.index_capacity.saturating_mul(2))
+                .max(airport::MIN_RUNWAY_INDEX_CAPACITY);
+            self.index_buffer = create_runway_index_buffer(device, new_capacity);
+            self.index_capacity = new_capacity;
+        }
+
+        if !self.scratch.vertices.is_empty() {
+            queue.write_buffer(
+                &self.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.scratch.vertices),
+            );
+        }
+        if !self.scratch.indices.is_empty() {
+            queue.write_buffer(
+                &self.index_buffer,
+                0,
+                bytemuck::cast_slice(&self.scratch.indices),
+            );
+        }
+
+        // Runway index counts are bounded by the queried viewport's runway rows (a few hundred
+        // at most, nowhere near docs/01's 10,000-aircraft budget), far inside `u32`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "runway index count is bounded by a viewport's queried runway rows, far \
+                      inside u32::MAX"
+        )]
+        {
+            self.scratch.indices.len() as u32
+        }
+    }
+
+    /// Binds the runway pipeline/color and draws every uploaded index in one call.
+    /// `view_proj_bind_group` is the same `@group(0)` every other pass uses.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+        index_count: u32,
+    ) {
+        if index_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_bind_group(1, &self.color_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..index_count, 0, 0..1);
+    }
+}
+
+/// The airport-marker pass's GPU resources (M3 item 3.2) — the other "map lines" pass this item
+/// adds (see [`RunwayLayer`] for the runway outlines). Drawn right after [`RunwayLayer`]'s own
+/// draw, still before the trail pass — airport markers are not separately named in docs/01's
+/// draw-order sentence, so this ordering (map-lines slot, after the runway outlines) is this
+/// item's own judgement call, recorded at the call site in
+/// [`Renderer::record_draw_passes`].
+///
+/// Instanced off one static unit-circle mesh ([`airport::marker_mesh`], built once — the same
+/// "static shared geometry + per-instance offsets" shape [`AircraftLayer`]'s shared unit quad
+/// has), with a per-frame screen-constant-size uniform ([`AirportMarkerLayer::set_params`]) the
+/// same role [`AircraftLayer::set_glyph_scale`] plays for aircraft glyphs. The *instance* buffer
+/// itself, like [`RunwayLayer`]'s geometry, rebuilds every frame from whatever `airports` slice
+/// the caller hands `Renderer::render` — see `airport.rs`'s module doc comment on why.
+#[derive(Debug)]
+struct AirportMarkerLayer {
+    pipeline: wgpu::RenderPipeline,
+    /// The `@group(1)` uniform carrying both the fixed marker color and the per-frame
+    /// screen-constant scale — one buffer/bind group rather than two (color never changes;
+    /// writing both together each frame costs nothing extra over writing the scale alone).
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
+    mesh_vertex_buffer: wgpu::Buffer,
+    mesh_index_buffer: wgpu::Buffer,
+    mesh_index_count: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    /// Reused every frame so packing a frame's airports never allocates once capacity has warmed
+    /// up (ADR-002) — cleared and refilled by [`airport::pack_airport_instances`].
+    instance_scratch: Vec<AirportInstanceRaw>,
+    /// This renderer's surface format's airport-marker color (see
+    /// [`color::airport_marker_color`]) — kept here (not just baked into the uniform once) so
+    /// [`AirportMarkerLayer::set_params`] can rewrite the whole uniform (color + scale) together
+    /// every frame without needing to re-derive the color from the format each time.
+    color: [f32; 4],
+}
+
+impl AirportMarkerLayer {
+    /// Rewrites the marker's screen-constant scale (and its unchanging color) for this frame —
+    /// see [`airport::airport_marker_scale_normalized`]'s doc comment for why this must be
+    /// recomputed every frame rather than once at startup (it depends on the camera's current
+    /// zoom), the same reason [`AircraftLayer::set_glyph_scale`] does.
+    fn set_params(&self, queue: &wgpu::Queue, scale: f32) {
+        queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&marker_params_bytes(self.color, scale)),
+        );
+    }
+
+    /// Packs `airports` into this frame's instance buffer (via
+    /// [`airport::pack_airport_instances`]), growing the GPU buffer first if the queried set has
+    /// more airports than it currently holds. Returns the instance count to draw.
+    fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        airports: &[Airport],
+    ) -> u32 {
+        airport::pack_airport_instances(airports, &mut self.instance_scratch);
+
+        if self.instance_scratch.len() > self.instance_capacity {
+            let new_capacity = self
+                .instance_scratch
+                .len()
+                .max(self.instance_capacity.saturating_mul(2))
+                .max(airport::MIN_AIRPORT_INSTANCE_CAPACITY);
+            self.instance_buffer = create_airport_instance_buffer(device, new_capacity);
+            self.instance_capacity = new_capacity;
+        }
+
+        if !self.instance_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instance_scratch),
+            );
+        }
+
+        // Bounded by a viewport's queried medium/large airport count — a handful to a few
+        // hundred at most, far inside `u32`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "airport instance count is bounded by a viewport's queried airport rows, \
+                      far inside u32::MAX"
+        )]
+        {
+            self.instance_scratch.len() as u32
+        }
+    }
+
+    /// Binds the marker pipeline/resources and draws every uploaded instance in one call.
+    /// `view_proj_bind_group` is the same `@group(0)` every other pass uses.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+        instance_count: u32,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_bind_group(1, &self.params_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_index_buffer(self.mesh_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.mesh_index_count, 0, 0..instance_count);
+    }
+}
+
+/// The METAR badge pass's GPU resources (M3 item 3.3) — a ring drawn around a large airport's
+/// marker, colored by its cached flight category. Instanced off the same shared unit-circle
+/// mesh [`AirportMarkerLayer`] uses (this layer builds its own independent copy of the GPU
+/// buffers — see [`metar_badge`]'s module doc comment for why), at a larger screen-constant
+/// radius so the marker's own dot paints over the ring's center once drawn after this pass (see
+/// [`Renderer::record_draw_passes`]'s own doc comment for that ordering).
+///
+/// Unlike [`AirportMarkerLayer`], the `@group(1)` uniform here carries only the per-frame scale
+/// — a badge's color is per-instance ([`metar_badge::BadgeInstanceRaw::color`]), not a flat
+/// per-layer constant, so there is nothing color-shaped to keep fixed at startup.
+#[derive(Debug)]
+struct BadgeLayer {
+    pipeline: wgpu::RenderPipeline,
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
+    mesh_vertex_buffer: wgpu::Buffer,
+    mesh_index_buffer: wgpu::Buffer,
+    mesh_index_count: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    /// Reused every frame so packing a frame's badges never allocates once capacity has warmed
+    /// up (ADR-002) — cleared and refilled by [`metar_badge::pack_badge_instances`].
+    instance_scratch: Vec<BadgeInstanceRaw>,
+}
+
+impl BadgeLayer {
+    /// Rewrites the badge ring's screen-constant scale for this frame — see
+    /// [`metar_badge::badge_scale_normalized`]'s doc comment for why this must be recomputed
+    /// every frame rather than once at startup (it depends on the camera's current zoom), the
+    /// same reason [`AirportMarkerLayer::set_params`] does for the marker's own scale.
+    fn set_params(&self, queue: &wgpu::Queue, scale: f32) {
+        queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&badge_params_bytes(scale)),
+        );
+    }
+
+    /// Packs `badges` into this frame's instance buffer (via
+    /// [`metar_badge::pack_badge_instances`], which also resolves each badge's category to this
+    /// renderer's surface `format`), growing the GPU buffer first if the queried set has more
+    /// badges than it currently holds. Returns the instance count to draw.
+    fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        badges: &[MetarBadge],
+        format: wgpu::TextureFormat,
+    ) -> u32 {
+        metar_badge::pack_badge_instances(badges, format, &mut self.instance_scratch);
+
+        if self.instance_scratch.len() > self.instance_capacity {
+            let new_capacity = self
+                .instance_scratch
+                .len()
+                .max(self.instance_capacity.saturating_mul(2))
+                .max(metar_badge::MIN_BADGE_INSTANCE_CAPACITY);
+            self.instance_buffer = create_badge_instance_buffer(device, new_capacity);
+            self.instance_capacity = new_capacity;
+        }
+
+        if !self.instance_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instance_scratch),
+            );
+        }
+
+        // Bounded by a viewport's queried large-airport count (a subset of the airport-marker
+        // pass's own bounded count), far inside `u32`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "badge instance count is bounded by a viewport's queried large-airport \
+                      rows, far inside u32::MAX"
+        )]
+        {
+            self.instance_scratch.len() as u32
+        }
+    }
+
+    /// Binds the badge pipeline/resources and draws every uploaded instance in one call.
+    /// `view_proj_bind_group` is the same `@group(0)` every other pass uses.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+        instance_count: u32,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_bind_group(1, &self.params_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_index_buffer(self.mesh_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.mesh_index_count, 0, 0..instance_count);
     }
 }
 
@@ -749,7 +1089,8 @@ struct OffscreenTarget {
 /// label pass (text + leader lines), 2.1b added the F3 debug HUD, and 2.8b adds the selected
 /// aircraft's white glyph outline (packed into the aircraft pass itself) and its info card, drawn
 /// last of all — every piece of docs/01's draw order ("map base → map lines → trails → aircraft →
-/// labels → UI overlay") now exists.
+/// labels → UI overlay") now exists. M3 item 3.2 fills in docs/01's "map lines" step itself
+/// (runway outlines, airport markers), which had nothing in it before.
 #[derive(Debug)]
 pub struct Renderer {
     target: Target,
@@ -775,6 +1116,18 @@ pub struct Renderer {
     basemap_view_proj_bind_group: wgpu::BindGroup,
     basemap_land: BasemapLayer,
     basemap_coastline: BasemapLayer,
+    /// The runway-outline pass (M3 item 3.2) — docs/01's "map lines" step, drawn right after the
+    /// coastline stroke and before the trail pass (see [`RunwayLayer`]'s own doc comment).
+    runway: RunwayLayer,
+    /// The METAR badge pass (M3 item 3.3) — also docs/01's "map lines" step, drawn right after
+    /// [`Renderer::runway`] and *before* [`Renderer::airport_marker`] so the marker's own dot
+    /// paints over each ring's center (see [`BadgeLayer`]'s own doc comment).
+    badge: BadgeLayer,
+    /// The airport-marker pass (M3 item 3.2) — also docs/01's "map lines" step, drawn right
+    /// after [`Renderer::badge`] and still before the trail pass; not separately ordered by
+    /// docs/01's draw-order sentence, so this placement is this item's own judgement call (see
+    /// [`AirportMarkerLayer`]'s own doc comment).
+    airport_marker: AirportMarkerLayer,
     /// The trail ribbon pass (M2 item 2.6b) — drawn after the base map and *before* the aircraft
     /// glyphs, reusing [`Renderer::basemap_view_proj_bind_group`] for its own `@group(0)` (see
     /// [`TrailLayer::draw`]).
@@ -865,6 +1218,10 @@ impl Renderer {
             config.width,
             config.height,
         );
+        let runway = build_runway_resources(&device, &view_proj_layout, config.format);
+        let badge = build_badge_resources(&device, &view_proj_layout, config.format);
+        let airport_marker =
+            build_airport_marker_resources(&device, &view_proj_layout, config.format);
         let trail = build_trail_resources(&device, &view_proj_layout, config.format);
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, config.format);
         let label = build_label_resources(&device, &queue, config.format);
@@ -882,6 +1239,9 @@ impl Renderer {
             basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
             basemap_land: basemap_resources.land,
             basemap_coastline: basemap_resources.coastline,
+            runway,
+            badge,
+            airport_marker,
             trail,
             aircraft,
             label,
@@ -990,6 +1350,9 @@ impl Renderer {
         );
         let basemap_resources =
             build_basemap_resources(&device, &view_proj_layout, FORMAT, width, height);
+        let runway = build_runway_resources(&device, &view_proj_layout, FORMAT);
+        let badge = build_badge_resources(&device, &view_proj_layout, FORMAT);
+        let airport_marker = build_airport_marker_resources(&device, &view_proj_layout, FORMAT);
         let trail = build_trail_resources(&device, &view_proj_layout, FORMAT);
         let aircraft = build_aircraft_resources(&device, &queue, &view_proj_layout, FORMAT);
         let label = build_label_resources(&device, &queue, FORMAT);
@@ -1014,6 +1377,9 @@ impl Renderer {
             basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
             basemap_land: basemap_resources.land,
             basemap_coastline: basemap_resources.coastline,
+            runway,
+            badge,
+            airport_marker,
             trail,
             aircraft,
             label,
@@ -1159,12 +1525,30 @@ impl Renderer {
     /// `info_card` is `Some` only while an aircraft is selected (`app::window::App` looks it up
     /// in `feed.aircraft` by its held `selected_icao24`); `None` (nothing selected, or the
     /// selected aircraft left the feed) likewise builds/uploads nothing for the card.
+    ///
+    /// `airports`/`runways` (M3 item 3.2) are whatever `app::window::App` most recently queried
+    /// from `store::Writer` for the camera's settled viewport (fixed `AirportSize::Medium`
+    /// threshold, no LOD-tier gating yet — see the M3 plan's own cross-milestone tension note);
+    /// empty slices draw nothing for either pass, the same tolerant shape `stats`/`info_card`
+    /// being `None` already has. `metar_badges` (M3 item 3.3) is the same shape again, one level
+    /// narrower: `app::window::App`'s own join of that same queried airport set (filtered to
+    /// `AirportSize::Large`) against whatever METAR the store has cached for it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the public entry point every one of this frame's per-pass inputs converges \
+                  through before record_draw_passes; see that method's own too_many_arguments \
+                  reason for why splitting this into a params struct would not actually reduce \
+                  the information this call carries"
+    )]
     pub fn render(
         &mut self,
         feed: &RenderFeed,
         camera: &Camera,
         stats: Option<StatsOverlay>,
         info_card: Option<&InfoCardContent>,
+        airports: &[Airport],
+        runways: &[Runway],
+        metar_badges: &[MetarBadge],
     ) -> Result<FrameOutcome, RenderError> {
         // `match`, not `let`-`else` — see `Renderer::resize`'s own comment on why: in a
         // non-test build `Target` has only the one `Windowed` variant, which would make a
@@ -1206,7 +1590,17 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("look-above frame"),
             });
-        self.record_draw_passes(&mut encoder, &view, feed, camera, stats, info_card);
+        self.record_draw_passes(
+            &mut encoder,
+            &view,
+            feed,
+            camera,
+            stats,
+            info_card,
+            airports,
+            runways,
+            metar_badges,
+        );
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
@@ -1255,7 +1649,10 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("look-above headless frame"),
             });
-        self.record_draw_passes(&mut encoder, &view, feed, camera, None, None);
+        // No airports/runways/badges in the smoke test — it exercises the aircraft/trail/label
+        // path (docs/10 §4), not these items' own passes; empty slices draw nothing for any of
+        // them, the same tolerant shape `Renderer::render`'s own doc comment describes.
+        self.record_draw_passes(&mut encoder, &view, feed, camera, None, None, &[], &[], &[]);
 
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
@@ -1328,12 +1725,30 @@ impl Renderer {
         pixels
     }
 
-    /// Uploads this frame's dynamic GPU state (glyph scale, trail/aircraft/label geometry, the
-    /// optional F3 HUD and info-card text) and records docs/01's full draw order — background
-    /// clear, base map, trails, aircraft, labels, HUD, info card — into `encoder`, resolving onto
-    /// `resolve_target`. Shared by [`Renderer::render`] (the windowed swapchain path) and
-    /// [`Renderer::render_headless`] (the renderer smoke test's offscreen path, `#[cfg(test)]`)
-    /// so the two draw exactly the same pass sequence with nothing duplicated to drift apart.
+    /// Uploads this frame's dynamic GPU state (glyph scale, runway/badge/marker/trail/aircraft/
+    /// label geometry, the optional F3 HUD and info-card text) and records docs/01's full draw
+    /// order — background clear, base map, map lines (runway outlines, METAR badges, airport
+    /// markers — M3 items 3.2/3.3), trails, aircraft, labels, HUD, info card — into `encoder`,
+    /// resolving onto `resolve_target`. Shared by [`Renderer::render`] (the windowed swapchain
+    /// path) and [`Renderer::render_headless`] (the renderer smoke test's offscreen path,
+    /// `#[cfg(test)]`) so the two draw exactly the same pass sequence with nothing duplicated to
+    /// drift apart.
+    ///
+    /// Airport markers/badges are not separately named in docs/01's draw-order sentence ("map
+    /// base → map lines (coastlines/borders/runways) → trails → ..."); placing them in the same
+    /// map-lines slot — badges right after the runway-outline draw, markers right after that, so
+    /// a marker's own dot paints over its badge's ring center (see [`BadgeLayer`]'s own doc
+    /// comment) — is this item's own judgement call, the same kind of explicit interpretation
+    /// call this project records at every gate rather than silently deciding (see
+    /// `plans/M3_ENRICHMENT_AND_NON_ADSB.md`'s own 3.1 entry for the precedent).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "this is the one place every pass's per-frame inputs converge (feed, camera, \
+                  optional HUD/info-card content, and M3's airports/runways/metar_badges) so \
+                  every pass draws from the exact same frame's data — splitting it into a params \
+                  struct would not reduce the actual information this function needs, just move \
+                  it behind one more layer of indirection"
+    )]
     fn record_draw_passes(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1342,6 +1757,9 @@ impl Renderer {
         camera: &Camera,
         stats: Option<StatsOverlay>,
         info_card: Option<&InfoCardContent>,
+        airports: &[Airport],
+        runways: &[Runway],
+        metar_badges: &[MetarBadge],
     ) {
         let meters_per_pixel = camera.meters_per_pixel();
 
@@ -1350,6 +1768,24 @@ impl Renderer {
         // long as they run before `queue.submit`, same as `set_view_proj`'s writes always have.
         let glyph_scale = aircraft::glyph_scale_normalized(meters_per_pixel);
         self.aircraft.set_glyph_scale(&self.queue, glyph_scale);
+        let airport_marker_scale = airport::airport_marker_scale_normalized(meters_per_pixel);
+        self.airport_marker
+            .set_params(&self.queue, airport_marker_scale);
+        let badge_scale = metar_badge::badge_scale_normalized(meters_per_pixel);
+        self.badge.set_params(&self.queue, badge_scale);
+        let runway_index_count =
+            self.runway
+                .upload_runways(&self.device, &self.queue, runways, meters_per_pixel);
+        // Read before the call below: `self.format()` borrows all of `self` immutably (it is a
+        // method call, not a direct field access the borrow checker can see is disjoint), which
+        // would conflict with `self.badge`'s simultaneous `&mut` if inlined into the call.
+        let format = self.format();
+        let badge_instance_count =
+            self.badge
+                .upload_instances(&self.device, &self.queue, metar_badges, format);
+        let airport_instance_count =
+            self.airport_marker
+                .upload_instances(&self.device, &self.queue, airports);
         let trail_vertex_count =
             self.trail
                 .upload_trails(&self.device, &self.queue, &feed.trails, meters_per_pixel);
@@ -1393,14 +1829,31 @@ impl Renderer {
             multiview_mask: None,
         });
 
-        // docs/01 draw order: map base, then map lines, then trails (2.6b), then aircraft
-        // glyphs (2.5; a selected one's own outline instance is packed first among them —
-        // 2.8b), then labels (2.7b), then the F3 debug HUD (2.1b), then the selected-aircraft
-        // info card (2.8b) last of all, on top of everything else.
+        // docs/01 draw order: map base, then map lines (runway outlines, then airport markers —
+        // M3 item 3.2; see `record_draw_passes`'s own doc comment on the marker-placement
+        // judgement call), then trails (2.6b), then aircraft glyphs (2.5; a selected one's own
+        // outline instance is packed first among them — 2.8b), then labels (2.7b), then the F3
+        // debug HUD (2.1b), then the selected-aircraft info card (2.8b) last of all, on top of
+        // everything else.
         self.basemap_land
             .draw(&mut pass, &self.basemap_view_proj_bind_group);
         self.basemap_coastline
             .draw(&mut pass, &self.basemap_view_proj_bind_group);
+        self.runway.draw(
+            &mut pass,
+            &self.basemap_view_proj_bind_group,
+            runway_index_count,
+        );
+        self.badge.draw(
+            &mut pass,
+            &self.basemap_view_proj_bind_group,
+            badge_instance_count,
+        );
+        self.airport_marker.draw(
+            &mut pass,
+            &self.basemap_view_proj_bind_group,
+            airport_instance_count,
+        );
         self.trail.draw(
             &mut pass,
             &self.basemap_view_proj_bind_group,
@@ -1980,6 +2433,395 @@ fn create_trail_pipeline(
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[Some(TrailVertexRaw::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Builds the runway-outline pass's GPU resources (M3 item 3.2): the pipeline and an initial
+/// (empty, [`airport::MIN_RUNWAY_VERTEX_CAPACITY`]/[`airport::MIN_RUNWAY_INDEX_CAPACITY`]-sized)
+/// vertex/index buffer pair. Runs once, in [`Renderer::new`]/[`Renderer::new_headless`], alongside
+/// the base-map resource builder.
+///
+/// Reuses [`BASEMAP_SHADER`] and [`create_basemap_pipeline`] verbatim rather than a new shader —
+/// a runway outline is exactly another flat-shaded, per-layer-colored stroke mesh over
+/// [`basemap::Vertex`], the same shape the coastline pass already is (see [`RunwayLayer`]'s own
+/// doc comment for the one real difference: the buffers here are rebuilt every frame, not built
+/// once). Its own shader module/pipeline layout are still built fresh here (not shared with
+/// [`build_basemap_resources`]'s locals, which are not returned) — a second small one-time
+/// compile at startup, not a per-frame cost.
+///
+/// `view_proj_layout` must be the exact same object every other pass was built from — see
+/// [`build_basemap_resources`]'s doc comment.
+fn build_runway_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> RunwayLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above runway outline shader"),
+        source: wgpu::ShaderSource::Wgsl(BASEMAP_SHADER.into()),
+    });
+
+    let color_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::FRAGMENT,
+        "look-above runway outline color bind group layout",
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above runway outline pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout), Some(&color_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = create_basemap_pipeline(
+        device,
+        &shader,
+        &pipeline_layout,
+        format,
+        "look-above runway outline pipeline",
+    );
+    let color_bind_group = create_color_bind_group(
+        device,
+        &color_layout,
+        color::runway_outline_color(format),
+        "look-above runway outline color",
+    );
+
+    let vertex_buffer = create_runway_vertex_buffer(device, airport::MIN_RUNWAY_VERTEX_CAPACITY);
+    let index_buffer = create_runway_index_buffer(device, airport::MIN_RUNWAY_INDEX_CAPACITY);
+
+    RunwayLayer {
+        pipeline,
+        color_bind_group,
+        vertex_buffer,
+        index_buffer,
+        vertex_capacity: airport::MIN_RUNWAY_VERTEX_CAPACITY,
+        index_capacity: airport::MIN_RUNWAY_INDEX_CAPACITY,
+        scratch: VertexBuffers::new(),
+    }
+}
+
+/// An empty runway-outline vertex buffer sized for `capacity` vertices —
+/// [`RunwayLayer::upload_runways`] recreates this at a larger capacity if a frame's tessellated
+/// runways outgrow it.
+fn create_runway_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above runway outline vertex buffer"),
+        size: (capacity * size_of::<Vertex>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// An empty runway-outline index buffer sized for `capacity` indices — see
+/// [`create_runway_vertex_buffer`]'s own doc comment.
+fn create_runway_index_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above runway outline index buffer"),
+        size: (capacity * size_of::<u32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the airport-marker pass's GPU resources (M3 item 3.2): the shared unit-circle mesh
+/// ([`airport::marker_mesh`]), the per-frame params uniform (color + screen-constant scale), an
+/// initial (empty, [`airport::MIN_AIRPORT_INSTANCE_CAPACITY`]-sized) instance buffer, and the
+/// pipeline itself. Runs once, in [`Renderer::new`]/[`Renderer::new_headless`], alongside the
+/// runway-outline resource builder.
+///
+/// `view_proj_layout` must be the exact same object every other pass was built from — see
+/// [`build_basemap_resources`]'s doc comment.
+fn build_airport_marker_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> AirportMarkerLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above airport marker shader"),
+        source: wgpu::ShaderSource::Wgsl(AIRPORT_SHADER.into()),
+    });
+
+    let params_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+        "look-above airport marker params bind group layout",
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above airport marker pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout), Some(&params_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = create_airport_marker_pipeline(device, &shader, &pipeline_layout, format);
+
+    let mesh = airport::marker_mesh();
+    let mesh_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above airport marker mesh vertices"),
+        contents: bytemuck::cast_slice(&mesh.vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let mesh_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above airport marker mesh indices"),
+        contents: bytemuck::cast_slice(&mesh.indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let mesh_index_count = index_count(&mesh);
+
+    let color = color::airport_marker_color(format);
+    let (params_buffer, params_bind_group) =
+        build_marker_params_resources(device, &params_layout, color);
+
+    let instance_buffer =
+        create_airport_instance_buffer(device, airport::MIN_AIRPORT_INSTANCE_CAPACITY);
+
+    AirportMarkerLayer {
+        pipeline,
+        params_buffer,
+        params_bind_group,
+        mesh_vertex_buffer,
+        mesh_index_buffer,
+        mesh_index_count,
+        instance_buffer,
+        instance_capacity: airport::MIN_AIRPORT_INSTANCE_CAPACITY,
+        instance_scratch: Vec::new(),
+        color,
+    }
+}
+
+/// The `@group(1)` marker-params uniform (color + scale) and its bind group, seeded with `color`
+/// and a zero scale — like the aircraft pass's glyph-params uniform, nothing reads this before
+/// `Renderer::render` has already rewritten the scale for the frame (see
+/// [`AirportMarkerLayer::set_params`]'s call site in [`Renderer::record_draw_passes`]).
+fn build_marker_params_resources(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color: [f32; 4],
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above airport marker params uniform"),
+        contents: bytemuck::bytes_of(&marker_params_bytes(color, 0.0)),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above airport marker params bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
+}
+
+/// The raw bytes behind `airport.wgsl`'s `MarkerParams` uniform: `color` (`vec4<f32>`) followed
+/// by `scale` (`f32`), padded to WGSL's 16-byte uniform alignment — the same "plain `f32` array,
+/// no dedicated repr(C) struct" idiom [`AircraftLayer::set_glyph_scale`]'s own buffer write uses.
+fn marker_params_bytes(color: [f32; 4], scale: f32) -> [f32; 8] {
+    [color[0], color[1], color[2], color[3], scale, 0.0, 0.0, 0.0]
+}
+
+/// An empty airport-marker instance buffer sized for `capacity` instances —
+/// [`AirportMarkerLayer::upload_instances`] recreates this at a larger capacity if a frame's
+/// queried airport set outgrows it.
+fn create_airport_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above airport marker instance buffer"),
+        size: (capacity * size_of::<AirportInstanceRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the airport marker pipeline: `TriangleList` over the shared unit-circle mesh
+/// (`basemap::Vertex` per-vertex, `airport::AirportInstanceRaw` per-instance),
+/// `SAMPLE_COUNT`-multisampled like every other pass, no depth/stencil, alpha-blended (MSAA's own
+/// edge antialiasing on a small circle benefits from it, the same reasoning the aircraft
+/// pipeline's blend state already has).
+fn create_airport_marker_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above airport marker pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(Vertex::LAYOUT), Some(AirportInstanceRaw::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Builds the METAR badge pass's GPU resources (M3 item 3.3): a second, independent copy of the
+/// shared unit-circle mesh ([`airport::marker_mesh`] — see [`metar_badge`]'s module doc comment
+/// for why this layer does not just borrow [`AirportMarkerLayer`]'s own copy), the per-frame
+/// scale-only params uniform, an initial (empty,
+/// [`metar_badge::MIN_BADGE_INSTANCE_CAPACITY`]-sized) instance buffer, and the pipeline itself.
+/// Runs once, in [`Renderer::new`]/[`Renderer::new_headless`], alongside the airport-marker
+/// resource builder.
+///
+/// `view_proj_layout` must be the exact same object every other pass was built from — see
+/// [`build_basemap_resources`]'s doc comment.
+fn build_badge_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> BadgeLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above metar badge shader"),
+        source: wgpu::ShaderSource::Wgsl(METAR_BADGE_SHADER.into()),
+    });
+
+    let params_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::VERTEX,
+        "look-above metar badge params bind group layout",
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above metar badge pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout), Some(&params_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = create_badge_pipeline(device, &shader, &pipeline_layout, format);
+
+    let mesh = airport::marker_mesh();
+    let mesh_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above metar badge mesh vertices"),
+        contents: bytemuck::cast_slice(&mesh.vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let mesh_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above metar badge mesh indices"),
+        contents: bytemuck::cast_slice(&mesh.indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let mesh_index_count = index_count(&mesh);
+
+    let (params_buffer, params_bind_group) = build_badge_params_resources(device, &params_layout);
+
+    let instance_buffer =
+        create_badge_instance_buffer(device, metar_badge::MIN_BADGE_INSTANCE_CAPACITY);
+
+    BadgeLayer {
+        pipeline,
+        params_buffer,
+        params_bind_group,
+        mesh_vertex_buffer,
+        mesh_index_buffer,
+        mesh_index_count,
+        instance_buffer,
+        instance_capacity: metar_badge::MIN_BADGE_INSTANCE_CAPACITY,
+        instance_scratch: Vec::new(),
+    }
+}
+
+/// The `@group(1)` badge-params uniform (scale only) and its bind group, seeded with a zero
+/// scale — nothing reads this before `Renderer::render` has already rewritten it for the frame
+/// (see [`BadgeLayer::set_params`]'s call site in [`Renderer::record_draw_passes`]), the same
+/// "seeded at zero, rewritten before first read" shape [`build_marker_params_resources`] uses.
+fn build_badge_params_resources(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above metar badge params uniform"),
+        contents: bytemuck::bytes_of(&badge_params_bytes(0.0)),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above metar badge params bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
+}
+
+/// The raw bytes behind `metar_badge.wgsl`'s `BadgeParams` uniform: `scale` (`f32`), padded to
+/// WGSL's 16-byte uniform alignment — the same idiom [`marker_params_bytes`]/
+/// [`AircraftLayer::set_glyph_scale`]'s own buffer writes use.
+fn badge_params_bytes(scale: f32) -> [f32; 4] {
+    [scale, 0.0, 0.0, 0.0]
+}
+
+/// An empty badge instance buffer sized for `capacity` instances — [`BadgeLayer::upload_instances`]
+/// recreates this at a larger capacity if a frame's queried badge set outgrows it.
+fn create_badge_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above metar badge instance buffer"),
+        size: (capacity * size_of::<BadgeInstanceRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the badge pipeline: `TriangleList` over the shared unit-circle mesh
+/// (`basemap::Vertex` per-vertex, `metar_badge::BadgeInstanceRaw` per-instance),
+/// `SAMPLE_COUNT`-multisampled and alpha-blended like [`create_airport_marker_pipeline`] — the
+/// same MSAA-edge-antialiasing reasoning applies to a badge ring's own small circular geometry.
+fn create_badge_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above metar badge pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(Vertex::LAYOUT), Some(BadgeInstanceRaw::LAYOUT)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
