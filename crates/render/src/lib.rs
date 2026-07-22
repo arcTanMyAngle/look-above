@@ -7,6 +7,7 @@ mod aircraft;
 mod airport;
 mod basemap;
 mod color;
+mod density;
 mod error;
 mod glyph_atlas;
 mod info_card;

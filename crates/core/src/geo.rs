@@ -67,6 +67,23 @@ impl MercatorXy {
     }
 }
 
+/// A position projected onto the unit disk of an orthographic globe view (dimensionless, `x`/`y`
+/// each within `[-1, 1]`), as seen from directly above some observer point on the sphere.
+///
+/// Not pixels or metres: [`crate::globe_camera::GlobeCamera`] is what scales this by a pixel
+/// radius.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnitDiskXy {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl UnitDiskXy {
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
 /// Wraps a longitude into `[-180, 180)`. Exactly 180° normalizes to -180°.
 pub fn normalize_lon_deg(lon_deg: f64) -> f64 {
     (lon_deg + 180.0).rem_euclid(360.0) - 180.0
@@ -164,6 +181,66 @@ pub fn web_mercator_inverse(point: MercatorXy) -> LatLon {
             .to_degrees(),
         (point.x_m / WEB_MERCATOR_RADIUS_M).to_degrees(),
     )
+}
+
+/// Projects `point` onto the unit disk of an orthographic globe view centered on `center` (the
+/// sub-observer point — the position directly facing the viewer), or `None` if `point` is on the
+/// far hemisphere (not visible from this observer).
+///
+/// Standard orthographic azimuthal projection, derived by rotating the sphere so `center` sits at
+/// the pole facing the viewer and reading off the rotated point's `x`/`y`. `x`/`y` always land
+/// within the unit disk (`x² + y² ≤ 1`, exactly `1` at the horizon) *regardless* of visibility —
+/// that identity falls out of `x`/`y` being two coordinates of a rotated unit vector. Only
+/// sin/cos/multiplication are used (no division, no sqrt), so poles and the antimeridian (a raw
+/// longitude difference left unnormalized — sin/cos are already 360°-periodic, so e.g. a 358°
+/// difference behaves identically to -2°) never produce NaN.
+pub fn orthographic_forward(center: LatLon, point: LatLon) -> Option<UnitDiskXy> {
+    let phi1 = center.lat_deg.to_radians();
+    let lambda1 = center.lon_deg.to_radians();
+    let phi = point.lat_deg.to_radians();
+    let delta_lambda = point.lon_deg.to_radians() - lambda1;
+
+    let cos_c = phi1.sin() * phi.sin() + phi1.cos() * phi.cos() * delta_lambda.cos();
+    if cos_c < 0.0 {
+        return None;
+    }
+
+    let x = phi.cos() * delta_lambda.sin();
+    let y = phi1.cos() * phi.sin() - phi1.sin() * phi.cos() * delta_lambda.cos();
+    Some(UnitDiskXy::new(x, y))
+}
+
+/// Unprojects a unit-disk position back to a geographic point, given the same `center` used by
+/// [`orthographic_forward`]. `None` if `disk` falls outside the unit disk (`x² + y² > 1`, plus a
+/// small float-error margin) — no point on the visible hemisphere projects there.
+///
+/// Exact inverse of [`orthographic_forward`] within that disk; every `asin` argument is clamped
+/// before use so a `rho` that floating-point rounding pushed a hair past its analytical `[0, 1]`
+/// range can't turn into NaN.
+pub fn orthographic_inverse(center: LatLon, disk: UnitDiskXy) -> Option<LatLon> {
+    let rho = disk.x.hypot(disk.y);
+    if rho > 1.0 + 1e-9 {
+        return None;
+    }
+    if rho < 1e-12 {
+        return Some(center);
+    }
+
+    let phi1 = center.lat_deg.to_radians();
+    let lambda1 = center.lon_deg.to_radians();
+    let c = rho.clamp(-1.0, 1.0).asin();
+    let (sin_c, cos_c) = (c.sin(), c.cos());
+
+    let phi = (cos_c * phi1.sin() + disk.y * sin_c * phi1.cos() / rho)
+        .clamp(-1.0, 1.0)
+        .asin();
+    let lambda =
+        lambda1 + (disk.x * sin_c).atan2(rho * phi1.cos() * cos_c - disk.y * phi1.sin() * sin_c);
+
+    Some(LatLon::new(
+        phi.to_degrees(),
+        normalize_lon_deg(lambda.to_degrees()),
+    ))
 }
 
 #[cfg(test)]
@@ -503,6 +580,137 @@ mod tests {
             let textbook = WEB_MERCATOR_RADIUS_M * (FRAC_PI_4 + phi / 2.0).tan().ln();
             let actual = web_mercator_forward(LatLon::new(lat, 0.0)).y_m;
             assert_close(actual, textbook, 1e-6);
+        }
+    }
+
+    // --- Orthographic globe projection: property tests over a lat/lon grid -----
+    //
+    // A combinatorial grid rather than a `proptest` crate (not a workspace dependency; M4 4.1
+    // established the "loop over sampled/edge values" property-test style for this codebase)
+    // covering both poles and both sides of the antimeridian for both `center` and `point`.
+
+    const GRID_LATS_DEG: [f64; 7] = [-90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0];
+    const GRID_LONS_DEG: [f64; 9] = [
+        -180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 179.999,
+    ];
+
+    fn grid_points() -> Vec<LatLon> {
+        GRID_LATS_DEG
+            .iter()
+            .flat_map(|&lat| GRID_LONS_DEG.iter().map(move |&lon| LatLon::new(lat, lon)))
+            .collect()
+    }
+
+    #[test]
+    fn orthographic_forward_never_produces_nan_or_infinity_across_the_grid() {
+        for &center in &grid_points() {
+            for &point in &grid_points() {
+                if let Some(disk) = orthographic_forward(center, point) {
+                    assert!(
+                        disk.x.is_finite() && disk.y.is_finite(),
+                        "center {center:?}, point {point:?} -> non-finite {disk:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn orthographic_forward_keeps_every_visible_point_inside_the_unit_disk() {
+        for &center in &grid_points() {
+            for &point in &grid_points() {
+                if let Some(disk) = orthographic_forward(center, point) {
+                    let r2 = disk.x * disk.x + disk.y * disk.y;
+                    assert!(
+                        r2 <= 1.0 + 1e-9,
+                        "center {center:?}, point {point:?} -> {disk:?} has x²+y² = {r2}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn orthographic_forward_excludes_the_far_hemisphere() {
+        // The point antipodal to `center` (lat negated, lon rotated 180°) is always maximally
+        // far, i.e. strictly on the excluded far hemisphere except in the degenerate case where
+        // `center` itself sits exactly on a pole (every longitude is equidistant there).
+        for &center in &grid_points() {
+            if center.lat_deg.abs() == 90.0 {
+                continue;
+            }
+            let antipode = LatLon::new(-center.lat_deg, normalize_lon_deg(center.lon_deg + 180.0));
+            assert_eq!(
+                orthographic_forward(center, antipode),
+                None,
+                "center {center:?} should not see its antipode {antipode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn orthographic_forward_sees_the_center_point_itself_at_the_disk_origin() {
+        for &center in &grid_points() {
+            let disk = orthographic_forward(center, center)
+                .expect("a point always sees itself, being at zero angular distance");
+            assert_close(disk.x, 0.0, 1e-9);
+            assert_close(disk.y, 0.0, 1e-9);
+        }
+    }
+
+    #[test]
+    fn orthographic_inverse_never_produces_nan_or_infinity_across_the_grid() {
+        for &center in &grid_points() {
+            for x in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+                for y in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+                    if let Some(result) = orthographic_inverse(center, UnitDiskXy::new(x, y)) {
+                        assert!(
+                            result.lat_deg.is_finite() && result.lon_deg.is_finite(),
+                            "center {center:?}, disk ({x}, {y}) -> non-finite {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn orthographic_inverse_rejects_points_outside_the_unit_disk() {
+        assert_eq!(
+            orthographic_inverse(LatLon::new(0.0, 0.0), UnitDiskXy::new(1.1, 0.0)),
+            None
+        );
+        assert_eq!(
+            orthographic_inverse(LatLon::new(0.0, 0.0), UnitDiskXy::new(0.8, 0.8)),
+            None
+        );
+    }
+
+    #[test]
+    fn orthographic_forward_and_inverse_round_trip_away_from_the_horizon() {
+        // Near the horizon (cos_c close to 0) the projection is nearly singular — a tiny
+        // world-space move barely changes `disk`, so float error there is expected and excluded.
+        for &center in &grid_points() {
+            for &point in &grid_points() {
+                let Some(disk) = orthographic_forward(center, point) else {
+                    continue;
+                };
+                if disk.x * disk.x + disk.y * disk.y > 0.98 {
+                    continue;
+                }
+                let round_tripped = orthographic_inverse(center, disk)
+                    .expect("a point just projected from the visible hemisphere unprojects");
+                // Longitude is meaningless at a pole (`point` there) and underdetermined when
+                // `center` itself is a pole (disk x/y only fix a bearing, not which meridian the
+                // camera's own lon0 reference used) — compare positions via distance instead of
+                // raw lat/lon fields so those degeneracies do not cause false failures.
+                let distance_m = haversine_distance_m(point, round_tripped);
+                assert!(
+                    distance_m < 1000.0,
+                    "center {center:?}, point {point:?} -> disk {disk:?} -> {round_tripped:?}, \
+                     {distance_m} m off"
+                );
+            }
         }
     }
 }

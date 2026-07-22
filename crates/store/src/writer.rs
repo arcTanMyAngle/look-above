@@ -21,12 +21,14 @@ use std::path::Path;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use look_above_core::contracts::{Airport, AirportSize, Metar, Runway};
+use look_above_core::contracts::{AircraftMeta, Airport, AirportSize, Flight, Metar, Runway};
 use look_above_core::error::StoreError;
-use look_above_core::types::{BBox, SourceId, UnixSeconds};
+use look_above_core::types::{BBox, Icao24, SourceId, UnixSeconds};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::aircraft;
 use crate::error::backend_error;
+use crate::flights;
 use crate::metar;
 use crate::migrations;
 use crate::ourairports;
@@ -82,6 +84,22 @@ enum Command {
     MetarsForStations {
         stations: Vec<String>,
         reply: Sender<Result<Vec<Metar>, StoreError>>,
+    },
+    UpsertAircraftMeta {
+        meta: AircraftMeta,
+        reply: Sender<Result<(), StoreError>>,
+    },
+    AircraftMeta {
+        icao24: Icao24,
+        reply: Sender<Result<Option<AircraftMeta>, StoreError>>,
+    },
+    InsertFlight {
+        flight: Flight,
+        reply: Sender<Result<(), StoreError>>,
+    },
+    LatestFlight {
+        icao24: Icao24,
+        reply: Sender<Result<Option<Flight>, StoreError>>,
     },
 }
 
@@ -204,6 +222,33 @@ impl Writer {
         self.call(|reply| Command::MetarsForStations { stations, reply })
     }
 
+    /// Upserts `meta` by `icao24` — same signature as `core::contracts::Store::
+    /// upsert_aircraft_meta` (M3 item 3.4), backed by migration 0001's `aircraft` table.
+    pub fn upsert_aircraft_meta(&self, meta: AircraftMeta) -> Result<(), StoreError> {
+        self.call(|reply| Command::UpsertAircraftMeta { meta, reply })
+    }
+
+    /// The cached airframe metadata row for `icao24`, or `None` if it has never been looked
+    /// up — same signature as `core::contracts::Store::aircraft_meta` (M3 item 3.4).
+    pub fn aircraft_meta(&self, icao24: Icao24) -> Result<Option<AircraftMeta>, StoreError> {
+        self.call(|reply| Command::AircraftMeta { icao24, reply })
+    }
+
+    /// Inserts one resolved flight/route observation — same signature as
+    /// `core::contracts::Store::insert_flight` (M3 item 3.4), backed by migration 0004's
+    /// `flights` table. A plain insert, never an upsert (see [`flights::insert_flight`]'s doc
+    /// comment).
+    pub fn insert_flight(&self, flight: Flight) -> Result<(), StoreError> {
+        self.call(|reply| Command::InsertFlight { flight, reply })
+    }
+
+    /// The most recently observed [`Flight`] row for `icao24` (highest `last_seen`), or `None`
+    /// if none has ever been recorded — same signature as
+    /// `core::contracts::Store::latest_flight` (M3 item 3.4).
+    pub fn latest_flight(&self, icao24: Icao24) -> Result<Option<Flight>, StoreError> {
+        self.call(|reply| Command::LatestFlight { icao24, reply })
+    }
+
     /// Builds a [`Command`] around a fresh one-shot reply channel, sends it, and blocks for
     /// the answer.
     ///
@@ -295,6 +340,22 @@ fn run(conn: &Connection, inbox: Receiver<Command>) {
             }
             Command::MetarsForStations { stations, reply } => {
                 let result = metar::metars_for_stations(conn, &stations);
+                let _ignored = reply.send(result);
+            }
+            Command::UpsertAircraftMeta { meta, reply } => {
+                let result = aircraft::upsert_aircraft_meta(conn, &meta);
+                let _ignored = reply.send(result);
+            }
+            Command::AircraftMeta { icao24, reply } => {
+                let result = aircraft::aircraft_meta(conn, icao24);
+                let _ignored = reply.send(result);
+            }
+            Command::InsertFlight { flight, reply } => {
+                let result = flights::insert_flight(conn, &flight);
+                let _ignored = reply.send(result);
+            }
+            Command::LatestFlight { icao24, reply } => {
+                let result = flights::latest_flight(conn, icao24);
                 let _ignored = reply.send(result);
             }
         }
@@ -673,6 +734,79 @@ mod tests {
             .metars_for_stations(vec!["KJFK".to_owned(), "KLAX".to_owned()])
             .expect("queries");
         assert_eq!(found, vec![observation], "only KJFK has a cached METAR");
+    }
+
+    // ---- Aircraft metadata (M3 item 3.4): upsert through the channel, query back ----------
+
+    #[test]
+    fn writer_upserts_and_queries_aircraft_meta_end_to_end() {
+        use look_above_core::contracts::AircraftCategory;
+        use look_above_core::types::Icao24;
+
+        let writer = Writer::open(":memory:").expect("writer starts");
+        let icao24 = Icao24::from_hex("a1b2c3").expect("valid test ICAO24");
+        let meta = AircraftMeta {
+            icao24,
+            registration: Some("N12345".to_owned()),
+            type_code: Some("B738".to_owned()),
+            category: AircraftCategory::Jet,
+            operator: Some("Test Air".to_owned()),
+            is_anonymous: false,
+            fetched_at: Some(UnixSeconds(1_700_000_000)),
+            lookup_failed_at: None,
+        };
+        writer.upsert_aircraft_meta(meta.clone()).expect("upserts");
+
+        assert_eq!(writer.aircraft_meta(icao24).expect("queries"), Some(meta));
+    }
+
+    #[test]
+    fn writer_aircraft_meta_for_a_never_looked_up_icao24_returns_none() {
+        use look_above_core::types::Icao24;
+
+        let writer = Writer::open(":memory:").expect("writer starts");
+        let icao24 = Icao24::from_hex("d4e5f6").expect("valid test ICAO24");
+        assert_eq!(writer.aircraft_meta(icao24).expect("queries"), None);
+    }
+
+    // ---- Flights (M3 item 3.4): insert through the channel, latest_flight query back ------
+
+    #[test]
+    fn writer_inserts_and_queries_the_latest_flight_end_to_end() {
+        use look_above_core::types::{CallSign, Icao24};
+
+        let writer = Writer::open(":memory:").expect("writer starts");
+        let icao24 = Icao24::from_hex("a1b2c3").expect("valid test ICAO24");
+        let older = Flight {
+            icao24,
+            callsign: CallSign::new("UAL123"),
+            origin: Some("KJFK".to_owned()),
+            destination: Some("KLAX".to_owned()),
+            first_seen: UnixSeconds(100),
+            last_seen: UnixSeconds(150),
+        };
+        let newer = Flight {
+            last_seen: UnixSeconds(250),
+            first_seen: UnixSeconds(200),
+            ..older.clone()
+        };
+        writer.insert_flight(older).expect("first insert");
+        writer.insert_flight(newer.clone()).expect("second insert");
+
+        assert_eq!(
+            writer.latest_flight(icao24).expect("queries"),
+            Some(newer),
+            "ORDER BY last_seen DESC must pick the newer row"
+        );
+    }
+
+    #[test]
+    fn writer_latest_flight_for_an_icao24_with_no_rows_returns_none() {
+        use look_above_core::types::Icao24;
+
+        let writer = Writer::open(":memory:").expect("writer starts");
+        let icao24 = Icao24::from_hex("d4e5f6").expect("valid test ICAO24");
+        assert_eq!(writer.latest_flight(icao24).expect("queries"), None);
     }
 
     // ---- On-disk smoke test: WAL is real, not just requested ------------------------------

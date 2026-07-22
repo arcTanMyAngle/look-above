@@ -2,7 +2,8 @@
 -- (comments included) — that doc and this file must never drift; a schema change updates both
 -- in the same commit. The rest of docs/08's eventual schema (positions, flights, airports,
 -- runways, airlines, metars) lands in later numbered migrations at the milestones that need
--- them (M3/M5) — migrations are append-only, so nothing here is created ahead of its milestone.
+-- them (M3 for flights/airports/runways/metars, M5 for positions) — migrations are append-only,
+-- so nothing here is created ahead of its milestone.
 
 -- Airframe metadata cache (adsbdb / FAA registry / feed-provided). M1/M3.
 CREATE TABLE aircraft (

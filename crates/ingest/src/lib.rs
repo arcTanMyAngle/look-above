@@ -22,8 +22,14 @@
 //! [`metar`] is the separate, single-source enrichment poller for `aviationweather.gov`
 //! (M3 item 3.3) — no failover chain, no credit budget, just a fixed ≥10-minute cadence over
 //! whatever station list the camera's viewport currently asks for.
+//!
+//! [`adsbdb`] is the selection-only enrichment adapter for `api.adsbdb.com` (M3 item 3.4) —
+//! pure request/parse like [`metar`], but stateless in a different sense: no poller, no
+//! cadence, called on demand from `app`'s selection path and only when the target is not
+//! anonymous (privacy rule 2.2, enforced by [`adsbdb::should_enrich`]).
 
 pub mod adsb_lol;
+pub mod adsbdb;
 pub mod airplanes_live;
 pub mod allowlist;
 pub mod budget;

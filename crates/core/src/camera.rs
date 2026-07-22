@@ -279,6 +279,16 @@ impl Camera {
         )
         .expect("clamped, order-preserved corners always form a valid, non-inverted bbox")
     }
+
+    /// Viewport width in kilometres, for `crate::lod::next_tier`'s span input.
+    ///
+    /// Unlike [`Camera::viewport_bbox`] this never needs clamping: it is a direct
+    /// `width_px * meters_per_pixel` reading, so it stays representative of the true zoom level
+    /// even panned past the projected world's edge or framing a pole, where the bbox's lat/lon
+    /// corners saturate and understate the span.
+    pub fn viewport_span_km(&self) -> f64 {
+        self.width_px * self.meters_per_pixel / 1000.0
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +563,26 @@ mod tests {
 
         assert!(narrow.lon_max() - narrow.lon_min() < wide.lon_max() - wide.lon_min());
         assert!(narrow.lat_max() - narrow.lat_min() < wide.lat_max() - wide.lat_min());
+    }
+
+    #[test]
+    fn viewport_span_km_matches_width_px_times_meters_per_pixel() {
+        let cam = Camera::new(1000, 800);
+        let expected = cam.width_px() * cam.meters_per_pixel() / 1000.0;
+        assert_close(cam.viewport_span_km(), expected, EPS_M);
+    }
+
+    #[test]
+    fn viewport_span_km_shrinks_as_the_camera_zooms_in() {
+        let mut cam = Camera::new(1000, 800);
+        let wide_span = cam.viewport_span_km();
+
+        cam.zoom_by_notches(20.0, 500.0, 400.0);
+        for _ in 0..500 {
+            cam.update(1.0 / 60.0);
+        }
+
+        assert!(cam.viewport_span_km() < wide_span);
     }
 
     #[test]

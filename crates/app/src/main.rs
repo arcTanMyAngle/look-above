@@ -6,6 +6,7 @@
 
 mod config;
 mod double_buffer;
+mod enrichment;
 mod frame_stats;
 mod headless;
 mod logging;

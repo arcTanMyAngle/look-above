@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use look_above_core::camera::Camera;
 use look_above_core::contracts::{Airport, MetarBadge, Runway};
-use look_above_core::geo::WEB_MERCATOR_EXTENT_M;
+use look_above_core::geo::{LatLon, WEB_MERCATOR_EXTENT_M};
+use look_above_core::globe_camera::GlobeCamera;
 use look_above_core::sim::{AircraftInstance, RenderFeed, TrailVertex};
 use look_above_core::types::Icao24;
 use lyon::tessellation::VertexBuffers;
@@ -15,8 +16,9 @@ use wgpu::{CurrentSurfaceTexture, DisplayAndWindowHandle};
 
 use crate::aircraft::{self, InstanceRaw, QuadVertex};
 use crate::airport::{self, AirportInstanceRaw};
-use crate::basemap::{self, MeshData, Vertex};
+use crate::basemap::{self, GlobeVertex, MeshData, Vertex};
 use crate::color;
+use crate::density::{self, DensityDotInstanceRaw, DensityQuadVertex};
 use crate::error::RenderError;
 use crate::glyph_atlas;
 use crate::info_card::{self, InfoCardContent};
@@ -60,6 +62,14 @@ const TRAIL_SHADER: &str = include_str!("shaders/trail.wgsl");
 /// comment.
 const LABEL_SHADER: &str = include_str!("shaders/label.wgsl");
 
+/// The globe base-map shader (M4 item 4.3): per-vertex orthographic projection with a
+/// per-fragment horizon test — see `globe_basemap.wgsl`'s module doc comment.
+const GLOBE_BASEMAP_SHADER: &str = include_str!("shaders/globe_basemap.wgsl");
+
+/// The L0 density-dot shader (M4 item 4.3): instanced screen-constant quads, additively blended
+/// — see `density.wgsl`'s module doc comment.
+const DENSITY_SHADER: &str = include_str!("shaders/density.wgsl");
+
 /// What [`Renderer::render`] did with a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameOutcome {
@@ -73,8 +83,81 @@ pub enum FrameOutcome {
 /// One base-map layer's static GPU resources: its own geometry and its own flat color, drawn
 /// by its own pipeline. The view-proj bind group (`@group(0)`) is shared across layers and
 /// lives on [`Renderer`] directly — both layers share one camera.
+///
+/// M4 item 4.3: alpha-blended (not opaque, unlike its pre-4.3 shape) and carrying its own
+/// rewritable `color_buffer`/`base_color`, so [`BasemapLayer::set_alpha_multiplier`] can fade
+/// this layer *out* every frame as `mode_blend` rises toward the globe — the other half of the
+/// plan's "cross-faded during transition" line that only [`GlobeBasemapLayer`]'s fade-in
+/// originally covered (see [`Renderer::record_draw_passes`]'s own comment on this call site: the
+/// bug that omission caused was the flat Mercator map staying fully opaque and visible in the
+/// screen corners outside the globe's inscribed disk, even at full L0). At `multiplier = 1.0`
+/// (every L1/L2 frame, `mode_blend` always `0.0` there) this reproduces the original always-
+/// opaque behavior exactly — zero visible change outside L0's transition. **Not** shared with
+/// [`RunwayLayer`], which keeps building its own pipeline from [`create_basemap_pipeline`]
+/// (still opaque, `blend: None`) — see that struct's own doc comment for why runways must not be
+/// entangled with globe-transition state.
 #[derive(Debug)]
 struct BasemapLayer {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    color_bind_group: wgpu::BindGroup,
+    /// The buffer backing [`BasemapLayer::color_bind_group`] — kept here (not just inside the
+    /// bind group) so [`BasemapLayer::set_alpha_multiplier`] can `queue.write_buffer` into it
+    /// every frame, the same "layer keeps the buffer handle for per-frame rewrites" shape
+    /// [`AirportMarkerLayer::params_buffer`]/[`DensityLayer::params_buffer`] already have.
+    color_buffer: wgpu::Buffer,
+    /// This layer's authored, fully-opaque color (`color::land_fill_color`/
+    /// `color::coastline_stroke_color`) — [`BasemapLayer::set_alpha_multiplier`] scales only its
+    /// alpha channel by this frame's multiplier, never mutating this stored baseline.
+    base_color: [f32; 4],
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl BasemapLayer {
+    /// Rewrites this layer's alpha as `base_color.a * multiplier` for this frame — see this
+    /// struct's own doc comment for why (the L0 cross-fade). `multiplier = 1.0` is a no-op
+    /// against the authored (already-opaque) color, so every L1/L2 frame (where the caller always
+    /// passes `1.0 - mode_blend = 1.0`) draws pixel-identical to this layer's original opaque
+    /// behavior.
+    fn set_alpha_multiplier(&self, queue: &wgpu::Queue, multiplier: f32) {
+        let color = [
+            self.base_color[0],
+            self.base_color[1],
+            self.base_color[2],
+            self.base_color[3] * multiplier,
+        ];
+        queue.write_buffer(&self.color_buffer, 0, bytemuck::bytes_of(&color));
+    }
+
+    /// Binds this layer's pipeline/color and draws its whole static mesh in one indexed call.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+    ) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_bind_group(1, &self.color_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
+/// The globe base-map's own land/coastline layer (M4 item 4.3) — the globe analogue of
+/// [`BasemapLayer`], drawn right after the Mercator basemap's own land/coastline (see
+/// [`Renderer::record_draw_passes`]'s draw-order comment). Static geometry, built once in
+/// [`Renderer::new`]/`new_headless` alongside [`BasemapLayer`]'s own — the globe camera can
+/// rotate/zoom, but the tessellated sphere mesh itself never changes.
+///
+/// Unlike [`BasemapLayer`], `draw` takes this frame's `blend` directly: it both gates the whole
+/// draw call (skipped entirely at `blend <= 0.0`, matching every other layer's
+/// zero-work-when-invisible early return) and — inside the shared `globe_view_proj` uniform
+/// [`Renderer`] rewrites once per frame — fades the fragment shader's output alpha, so the globe
+/// basemap cross-fades in/out with the rest of the L0 transition rather than popping.
+#[derive(Debug)]
+struct GlobeBasemapLayer {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -82,13 +165,18 @@ struct BasemapLayer {
     pipeline: wgpu::RenderPipeline,
 }
 
-impl BasemapLayer {
-    /// Binds this layer's pipeline/color and draws its whole static mesh in one indexed call.
+impl GlobeBasemapLayer {
+    /// Binds this layer's pipeline/color and draws its whole static mesh in one indexed call —
+    /// unless `blend` is fully transparent, in which case nothing is bound or drawn at all.
     fn draw<'pass>(
         &'pass self,
         pass: &mut wgpu::RenderPass<'pass>,
         view_proj_bind_group: &'pass wgpu::BindGroup,
+        blend: f64,
     ) {
+        if blend <= 0.0 {
+            return;
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, view_proj_bind_group, &[]);
         pass.set_bind_group(1, &self.color_bind_group, &[]);
@@ -519,6 +607,106 @@ impl AircraftLayer {
         pass.set_bind_group(0, view_proj_bind_group, &[]);
         pass.set_bind_group(1, &self.glyph_params_bind_group, &[]);
         pass.set_bind_group(2, &self.atlas_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..6, 0, 0..instance_count);
+    }
+}
+
+/// The L0 density-dot pass's GPU resources (M4 item 4.3) — a screen-constant, additively-blended
+/// quad per visible aircraft, drawn right after the aircraft-glyph pass (see
+/// [`Renderer::record_draw_passes`]'s draw-order comment). *Not* gated against
+/// [`AircraftLayer`]'s own draw here — both draw unconditionally today; cross-fading glyphs vs.
+/// density dots by LOD tier is 4.4's job, not this item's (see the M4 plan's own 4.3 entry).
+///
+/// Shares [`Renderer`]'s `globe_view_proj_bind_group` for its own `@group(0)` — the same shared-
+/// bind-group shape [`GlobeBasemapLayer`] uses, since both are globe-space passes reading the
+/// same sub-observer center/scale/blend uniform.
+#[derive(Debug)]
+struct DensityLayer {
+    pipeline: wgpu::RenderPipeline,
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
+    quad_vertex_buffer: wgpu::Buffer,
+    quad_index_buffer: wgpu::Buffer,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    /// This renderer's surface format's density-dot color (see [`color::density_dot_color`]) —
+    /// kept here, like [`AirportMarkerLayer::color`], so [`DensityLayer::set_params`] can
+    /// rewrite the whole uniform (color + scale) together every frame.
+    color: [f32; 4],
+    /// Reused every frame so packing a frame's visible aircraft never allocates once capacity
+    /// has warmed up (ADR-002) — cleared and refilled by [`density::pack_density_dots`].
+    instance_scratch: Vec<DensityDotInstanceRaw>,
+}
+
+impl DensityLayer {
+    /// Rewrites the dot's constant screen-space size (and its unchanging color) for this frame —
+    /// see [`density::density_dot_scale_normalized`]'s doc comment for why the scale must be
+    /// recomputed every frame (it depends on the globe camera's current zoom).
+    fn set_params(&self, queue: &wgpu::Queue, scale: f32) {
+        queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&density_params_bytes(self.color, scale)),
+        );
+    }
+
+    /// Packs `aircraft` into this frame's instance buffer (via [`density::pack_density_dots`],
+    /// projected around `globe_center`), growing the GPU buffer first if the frame produced more
+    /// instances than it currently holds. Returns the instance count to draw.
+    fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        aircraft: &[AircraftInstance],
+        globe_center: LatLon,
+    ) -> u32 {
+        density::pack_density_dots(aircraft, globe_center, &mut self.instance_scratch);
+
+        if self.instance_scratch.len() > self.instance_capacity {
+            let new_capacity = self
+                .instance_scratch
+                .len()
+                .max(self.instance_capacity.saturating_mul(2))
+                .max(density::MIN_DENSITY_INSTANCE_CAPACITY);
+            self.instance_buffer = create_density_instance_buffer(device, new_capacity);
+            self.instance_capacity = new_capacity;
+        }
+
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.instance_scratch),
+        );
+
+        // Bounded by the feed size; docs/01's own upper budget (10,000 aircraft) is far inside
+        // `u32`, same reasoning as `AircraftLayer::upload_instances`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the aircraft count is bounded by docs/01's own 10,000-aircraft budget, \
+                      far inside u32::MAX"
+        )]
+        {
+            self.instance_scratch.len() as u32
+        }
+    }
+
+    /// Binds the density pipeline/resources and draws every uploaded instance in one call.
+    /// `view_proj_bind_group` is [`Renderer`]'s shared globe `@group(0)` bind group.
+    fn draw<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        view_proj_bind_group: &'pass wgpu::BindGroup,
+        instance_count: u32,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, view_proj_bind_group, &[]);
+        pass.set_bind_group(1, &self.params_bind_group, &[]);
         pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
         pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1116,6 +1304,31 @@ pub struct Renderer {
     basemap_view_proj_bind_group: wgpu::BindGroup,
     basemap_land: BasemapLayer,
     basemap_coastline: BasemapLayer,
+    /// The uniform the globe basemap and density-dot passes (M4 item 4.3) share for their own
+    /// `@group(0)` — sub-observer center/scale plus this frame's globe<->Mercator blend. Distinct
+    /// from [`Renderer::basemap_view_proj_buffer`]: those passes compute their own per-vertex
+    /// orthographic projection instead of applying a baked matrix, and need `blend` for their
+    /// fragment-shader alpha fade too (see `globe_basemap.wgsl`'s own doc comment).
+    /// [`Renderer::set_globe_params`] is the only writer, called once per frame by `app` right
+    /// next to [`Renderer::set_view_proj`].
+    globe_view_proj_buffer: wgpu::Buffer,
+    globe_view_proj_bind_group: wgpu::BindGroup,
+    globe_basemap_land: GlobeBasemapLayer,
+    globe_basemap_coastline: GlobeBasemapLayer,
+    /// The L0 density-dot pass (M4 item 4.3) — drawn right after [`Renderer::aircraft`] (see
+    /// [`Renderer::record_draw_passes`]'s draw-order comment).
+    density: DensityLayer,
+    /// This frame's globe camera sub-observer center, stashed by [`Renderer::set_globe_params`]
+    /// so [`Renderer::record_draw_passes`] can project aircraft onto the globe's disk
+    /// ([`density::pack_density_dots`]) without `render` ever holding a
+    /// [`look_above_core::globe_camera::GlobeCamera`] itself — `app` owns that (this crate stays
+    /// winit-free, ADR-002), so only the two scalars this pass actually needs cross the
+    /// boundary.
+    globe_center: LatLon,
+    /// This frame's globe<->Mercator blend, stashed alongside `globe_center` for the same
+    /// reason — [`GlobeBasemapLayer::draw`]'s own early-return and the density pass's
+    /// upload-gate (`record_draw_passes`) both read it.
+    globe_blend: f64,
     /// The runway-outline pass (M3 item 3.2) — docs/01's "map lines" step, drawn right after the
     /// coastline stroke and before the trail pass (see [`RunwayLayer`]'s own doc comment).
     runway: RunwayLayer,
@@ -1210,6 +1423,14 @@ impl Renderer {
             wgpu::ShaderStages::VERTEX,
             "look-above shared view-proj bind group layout",
         );
+        // Vertex *and* fragment: the globe passes' shared uniform carries both the vertex
+        // shader's center/scale and the fragment shader's blend-fade alpha — see the field doc
+        // on `Renderer::globe_view_proj_buffer`.
+        let globe_view_proj_layout = create_uniform_bind_group_layout(
+            &device,
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            "look-above shared globe view-proj bind group layout",
+        );
 
         let basemap_resources = build_basemap_resources(
             &device,
@@ -1218,6 +1439,14 @@ impl Renderer {
             config.width,
             config.height,
         );
+        let globe_basemap_resources = build_globe_basemap_resources(
+            &device,
+            &globe_view_proj_layout,
+            config.format,
+            config.width,
+            config.height,
+        );
+        let density = build_density_resources(&device, &globe_view_proj_layout, config.format);
         let runway = build_runway_resources(&device, &view_proj_layout, config.format);
         let badge = build_badge_resources(&device, &view_proj_layout, config.format);
         let airport_marker =
@@ -1239,6 +1468,13 @@ impl Renderer {
             basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
             basemap_land: basemap_resources.land,
             basemap_coastline: basemap_resources.coastline,
+            globe_view_proj_buffer: globe_basemap_resources.view_proj_buffer,
+            globe_view_proj_bind_group: globe_basemap_resources.view_proj_bind_group,
+            globe_basemap_land: globe_basemap_resources.land,
+            globe_basemap_coastline: globe_basemap_resources.coastline,
+            density,
+            globe_center: LatLon::new(0.0, 0.0),
+            globe_blend: 0.0,
             runway,
             badge,
             airport_marker,
@@ -1275,6 +1511,14 @@ impl Renderer {
     /// format, so the raw bytes read back match the authored hex colors directly, no transfer
     /// function to invert first) instead of a swapchain — see [`Renderer::render_headless`].
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one-time headless construction sequencing (device/adapter, the offscreen \
+                  target, then every pass's resources, M4 4.3's globe/density resources now \
+                  among them) — the same shape `Renderer::new` itself already has, splitting it \
+                  further would just move locals through another layer of parameters rather than \
+                  reducing what this constructor actually does"
+    )]
     fn new_headless(width: u32, height: u32) -> Result<Self, RenderError> {
         const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -1348,8 +1592,16 @@ impl Renderer {
             wgpu::ShaderStages::VERTEX,
             "look-above shared view-proj bind group layout",
         );
+        let globe_view_proj_layout = create_uniform_bind_group_layout(
+            &device,
+            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            "look-above shared globe view-proj bind group layout",
+        );
         let basemap_resources =
             build_basemap_resources(&device, &view_proj_layout, FORMAT, width, height);
+        let globe_basemap_resources =
+            build_globe_basemap_resources(&device, &globe_view_proj_layout, FORMAT, width, height);
+        let density = build_density_resources(&device, &globe_view_proj_layout, FORMAT);
         let runway = build_runway_resources(&device, &view_proj_layout, FORMAT);
         let badge = build_badge_resources(&device, &view_proj_layout, FORMAT);
         let airport_marker = build_airport_marker_resources(&device, &view_proj_layout, FORMAT);
@@ -1377,6 +1629,13 @@ impl Renderer {
             basemap_view_proj_bind_group: basemap_resources.view_proj_bind_group,
             basemap_land: basemap_resources.land,
             basemap_coastline: basemap_resources.coastline,
+            globe_view_proj_buffer: globe_basemap_resources.view_proj_buffer,
+            globe_view_proj_bind_group: globe_basemap_resources.view_proj_bind_group,
+            globe_basemap_land: globe_basemap_resources.land,
+            globe_basemap_coastline: globe_basemap_resources.coastline,
+            density,
+            globe_center: LatLon::new(0.0, 0.0),
+            globe_blend: 0.0,
             runway,
             badge,
             airport_marker,
@@ -1475,6 +1734,31 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&matrix),
         );
+    }
+
+    /// Uploads this frame's globe-space uniform (sub-observer center, radius-to-clip scale, and
+    /// the globe<->Mercator `blend`) for the globe basemap and density-dot passes to read, and
+    /// refreshes the density pass's own screen-constant dot-size uniform (which depends on the
+    /// same `globe_camera.radius_px()`). Also stashes `globe_camera`'s center and `blend` on
+    /// `self` — see the field docs on [`Renderer::globe_center`]/[`Renderer::globe_blend`] for
+    /// why `record_draw_passes` needs them cached here rather than reading `globe_camera`
+    /// directly (this crate never holds one — `app` owns it, per this crate's own winit-free
+    /// boundary, ADR-002).
+    ///
+    /// Call once per frame, right next to [`Renderer::set_view_proj`] — `app::window::App::draw`
+    /// is the one caller.
+    pub fn set_globe_params(&mut self, globe_camera: &GlobeCamera, blend: f64) {
+        self.queue.write_buffer(
+            &self.globe_view_proj_buffer,
+            0,
+            bytemuck::bytes_of(&globe_view_proj_bytes(globe_camera, blend)),
+        );
+        self.density.set_params(
+            &self.queue,
+            density::density_dot_scale_normalized(globe_camera.radius_px()),
+        );
+        self.globe_center = globe_camera.center();
+        self.globe_blend = blend;
     }
 
     /// Follow the window to a new size.
@@ -1749,6 +2033,14 @@ impl Renderer {
                   struct would not reduce the actual information this function needs, just move \
                   it behind one more layer of indirection"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every pass's per-frame upload plus the full draw-order recording (M4 4.3's \
+                  globe basemap and density-dot passes now among them) — the same \
+                  one-place-everything-converges shape the too_many_arguments reason above \
+                  already documents; splitting the uploads from the draw calls would separate two \
+                  halves that must stay in the exact order they run in"
+    )]
     fn record_draw_passes(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1762,6 +2054,22 @@ impl Renderer {
         metar_badges: &[MetarBadge],
     ) {
         let meters_per_pixel = camera.meters_per_pixel();
+
+        // M4 item 4.3's cross-fade: the flat Mercator land/coastline layers fade *out* as
+        // `globe_blend` rises toward the globe — see `BasemapLayer`'s own doc comment for why
+        // this is the fix for the flat map staying fully opaque (and visible in the screen
+        // corners outside the globe's inscribed disk) at full L0. `clamp` is defensive only —
+        // `App::draw`'s `mode_blend` is already kept within `[0, 1]` by construction.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "an f64 already clamped to [0, 1] narrows to f32 losslessly at this \
+                      precision"
+        )]
+        let mercator_fade_multiplier = (1.0 - self.globe_blend).clamp(0.0, 1.0) as f32;
+        self.basemap_land
+            .set_alpha_multiplier(&self.queue, mercator_fade_multiplier);
+        self.basemap_coastline
+            .set_alpha_multiplier(&self.queue, mercator_fade_multiplier);
 
         // Both writes below are queue uploads, not render-pass work — they must land before the
         // pass's draw call reads them, which the queue's own call-order guarantee satisfies as
@@ -1792,6 +2100,21 @@ impl Renderer {
         let instance_count =
             self.aircraft
                 .upload_instances(&self.device, &self.queue, &feed.aircraft);
+        // M4 item 4.3: skip the CPU-side projection/packing entirely while the globe isn't even
+        // partially visible (`globe_blend <= 0.0`, the common case at L1/L2) — the same
+        // zero-work-when-invisible reasoning `GlobeBasemapLayer::draw`'s own early return has,
+        // just applied a step earlier so a Mercator-mode frame with docs/01's own 10,000-aircraft
+        // budget never pays for a projection nothing will draw.
+        let density_instance_count = if self.globe_blend > 0.0 {
+            self.density.upload_instances(
+                &self.device,
+                &self.queue,
+                &feed.aircraft,
+                self.globe_center,
+            )
+        } else {
+            0
+        };
         self.label
             .set_screen_params(&self.queue, camera.width_px(), camera.height_px());
         let (label_text_count, label_leader_count) =
@@ -1829,16 +2152,29 @@ impl Renderer {
             multiview_mask: None,
         });
 
-        // docs/01 draw order: map base, then map lines (runway outlines, then airport markers —
-        // M3 item 3.2; see `record_draw_passes`'s own doc comment on the marker-placement
-        // judgement call), then trails (2.6b), then aircraft glyphs (2.5; a selected one's own
-        // outline instance is packed first among them — 2.8b), then labels (2.7b), then the F3
+        // docs/01 draw order: map base (Mercator, then the globe basemap cross-fading in/out on
+        // top of it — M4 item 4.3), then map lines (runway outlines, then airport markers — M3
+        // item 3.2; see `record_draw_passes`'s own doc comment on the marker-placement judgement
+        // call), then trails (2.6b), then aircraft glyphs (2.5; a selected one's own outline
+        // instance is packed first among them — 2.8b) with the L0 density dots layered on top of
+        // them (M4 item 4.3 — see `DensityLayer`'s own doc comment on why that overlap with the
+        // glyph pass is intentional here, not yet tier-gated), then labels (2.7b), then the F3
         // debug HUD (2.1b), then the selected-aircraft info card (2.8b) last of all, on top of
         // everything else.
         self.basemap_land
             .draw(&mut pass, &self.basemap_view_proj_bind_group);
         self.basemap_coastline
             .draw(&mut pass, &self.basemap_view_proj_bind_group);
+        self.globe_basemap_land.draw(
+            &mut pass,
+            &self.globe_view_proj_bind_group,
+            self.globe_blend,
+        );
+        self.globe_basemap_coastline.draw(
+            &mut pass,
+            &self.globe_view_proj_bind_group,
+            self.globe_blend,
+        );
         self.runway.draw(
             &mut pass,
             &self.basemap_view_proj_bind_group,
@@ -1863,6 +2199,11 @@ impl Renderer {
             &mut pass,
             &self.basemap_view_proj_bind_group,
             instance_count,
+        );
+        self.density.draw(
+            &mut pass,
+            &self.globe_view_proj_bind_group,
+            density_instance_count,
         );
         self.label
             .draw(&mut pass, label_text_count, label_leader_count);
@@ -1990,15 +2331,16 @@ fn build_basemap_resources(
     // as separate passes: both are `TriangleList` today (lyon's stroke tessellator already
     // emits triangles, not a `LineList` primitive), so they are identical apart from label and
     // bound resources for now, but kept separate so either can gain its own primitive/blend
-    // state later without disturbing the other.
-    let land_pipeline = create_basemap_pipeline(
+    // state later without disturbing the other. Alpha-blended (M4 item 4.3), not opaque — see
+    // [`create_basemap_pipeline_blended`]'s own doc comment.
+    let land_pipeline = create_basemap_pipeline_blended(
         device,
         &shader,
         &pipeline_layout,
         format,
         "look-above basemap land fill pipeline",
     );
-    let coastline_pipeline = create_basemap_pipeline(
+    let coastline_pipeline = create_basemap_pipeline_blended(
         device,
         &shader,
         &pipeline_layout,
@@ -2006,6 +2348,13 @@ fn build_basemap_resources(
         "look-above basemap coastline stroke pipeline",
     );
 
+    let land_color = color::land_fill_color(format);
+    let (land_color_buffer, land_color_bind_group) = create_rewritable_color_bind_group(
+        device,
+        &color_layout,
+        land_color,
+        "look-above basemap land color",
+    );
     let land = BasemapLayer {
         vertex_buffer: create_mesh_buffer(
             device,
@@ -2020,14 +2369,18 @@ fn build_basemap_resources(
             BufferKind::Index,
         ),
         index_count: index_count(&geometry.land),
-        color_bind_group: create_color_bind_group(
-            device,
-            &color_layout,
-            color::land_fill_color(format),
-            "look-above basemap land color",
-        ),
+        color_bind_group: land_color_bind_group,
+        color_buffer: land_color_buffer,
+        base_color: land_color,
         pipeline: land_pipeline,
     };
+    let coastline_color = color::coastline_stroke_color(format);
+    let (coastline_color_buffer, coastline_color_bind_group) = create_rewritable_color_bind_group(
+        device,
+        &color_layout,
+        coastline_color,
+        "look-above basemap coastline color",
+    );
     let coastline = BasemapLayer {
         vertex_buffer: create_mesh_buffer(
             device,
@@ -2042,12 +2395,9 @@ fn build_basemap_resources(
             BufferKind::Index,
         ),
         index_count: index_count(&geometry.coastline),
-        color_bind_group: create_color_bind_group(
-            device,
-            &color_layout,
-            color::coastline_stroke_color(format),
-            "look-above basemap coastline color",
-        ),
+        color_bind_group: coastline_color_bind_group,
+        color_buffer: coastline_color_buffer,
+        base_color: coastline_color,
         pipeline: coastline_pipeline,
     };
 
@@ -2057,6 +2407,404 @@ fn build_basemap_resources(
         land,
         coastline,
     }
+}
+
+/// Everything [`Renderer::new`] needs out of globe base-map setup (M4 item 4.3), bundled the
+/// same way [`BasemapResources`] is for the Mercator path.
+struct GlobeBasemapResources {
+    view_proj_buffer: wgpu::Buffer,
+    view_proj_bind_group: wgpu::BindGroup,
+    land: GlobeBasemapLayer,
+    coastline: GlobeBasemapLayer,
+}
+
+/// Tessellates the globe base map and uploads it as static GPU buffers, builds the shared globe
+/// view-proj uniform, and builds both globe layers' pipelines. Runs once, in [`Renderer::new`]/
+/// `new_headless`, alongside [`build_basemap_resources`] — see that function's own doc comment
+/// for the `view_proj_layout`-sharing contract this mirrors (here shared with
+/// [`build_density_resources`]'s own pipeline instead of the aircraft pipeline).
+fn build_globe_basemap_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> GlobeBasemapResources {
+    let geometry = basemap::tessellate_globe();
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above globe basemap shader"),
+        source: wgpu::ShaderSource::Wgsl(GLOBE_BASEMAP_SHADER.into()),
+    });
+
+    let color_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::FRAGMENT,
+        "look-above globe basemap layer-color bind group layout",
+    );
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above globe basemap pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout), Some(&color_layout)],
+        immediate_size: 0,
+    });
+
+    // Seeded at `blend: 0.0` (fully transparent/invisible) rather than whatever the app will
+    // actually want first: the same "avoid a wrong flash in the gap before the app's own first
+    // call" reasoning `build_basemap_resources`'s own seed has, except here "wrong" would mean a
+    // stray flash of the globe before the app has decided whether to show it at all, which
+    // `blend: 0.0` avoids regardless of what that decision turns out to be.
+    let view_proj_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above globe view-proj uniform"),
+        contents: bytemuck::bytes_of(&globe_view_proj_bytes(
+            &GlobeCamera::new(width, height),
+            0.0,
+        )),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let view_proj_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above globe view-proj bind group"),
+        layout: view_proj_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: view_proj_buffer.as_entire_binding(),
+        }],
+    });
+
+    let land_pipeline = create_globe_basemap_pipeline(
+        device,
+        &shader,
+        &pipeline_layout,
+        format,
+        "look-above globe basemap land fill pipeline",
+    );
+    let coastline_pipeline = create_globe_basemap_pipeline(
+        device,
+        &shader,
+        &pipeline_layout,
+        format,
+        "look-above globe basemap coastline stroke pipeline",
+    );
+
+    let land = GlobeBasemapLayer {
+        vertex_buffer: create_globe_mesh_buffer(
+            device,
+            &geometry.land,
+            "look-above globe basemap land",
+            BufferKind::Vertex,
+        ),
+        index_buffer: create_globe_mesh_buffer(
+            device,
+            &geometry.land,
+            "look-above globe basemap land",
+            BufferKind::Index,
+        ),
+        index_count: globe_index_count(&geometry.land),
+        color_bind_group: create_color_bind_group(
+            device,
+            &color_layout,
+            color::land_fill_color(format),
+            "look-above globe basemap land color",
+        ),
+        pipeline: land_pipeline,
+    };
+    let coastline = GlobeBasemapLayer {
+        vertex_buffer: create_globe_mesh_buffer(
+            device,
+            &geometry.coastline,
+            "look-above globe basemap coastline",
+            BufferKind::Vertex,
+        ),
+        index_buffer: create_globe_mesh_buffer(
+            device,
+            &geometry.coastline,
+            "look-above globe basemap coastline",
+            BufferKind::Index,
+        ),
+        index_count: globe_index_count(&geometry.coastline),
+        color_bind_group: create_color_bind_group(
+            device,
+            &color_layout,
+            color::coastline_stroke_color(format),
+            "look-above globe basemap coastline color",
+        ),
+        pipeline: coastline_pipeline,
+    };
+
+    GlobeBasemapResources {
+        view_proj_buffer,
+        view_proj_bind_group,
+        land,
+        coastline,
+    }
+}
+
+/// [`create_mesh_buffer`]'s globe-plane twin, operating on [`basemap::GlobeMeshData`]/
+/// [`GlobeVertex`] instead of [`MeshData`]/[`Vertex`].
+fn create_globe_mesh_buffer(
+    device: &wgpu::Device,
+    mesh: &basemap::GlobeMeshData,
+    label: &str,
+    kind: BufferKind,
+) -> wgpu::Buffer {
+    match kind {
+        BufferKind::Vertex => device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        BufferKind::Index => device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+    }
+}
+
+/// [`index_count`]'s globe-plane twin.
+fn globe_index_count(mesh: &basemap::GlobeMeshData) -> u32 {
+    u32::try_from(mesh.indices.len()).expect("globe basemap mesh index count fits in u32")
+}
+
+/// Builds one of the two globe base-map render pipelines: `TriangleList`, `SAMPLE_COUNT`-
+/// multisampled like every other pass, no depth/stencil, alpha-blended (unlike
+/// [`create_basemap_pipeline`]'s opaque Mercator pipelines) — the globe basemap draws over
+/// whatever the Mercator basemap already painted and must fade with `blend`, not replace it
+/// outright.
+fn create_globe_basemap_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(GlobeVertex::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// The raw bytes behind `globe_basemap.wgsl`/`density.wgsl`'s shared `GlobeViewProj` uniform:
+/// sub-observer center (radians), the unit-disk-to-clip-space scale, and this frame's blend —
+/// see [`Renderer::set_globe_params`]'s own doc comment for the derivation.
+///
+/// Mirrors [`camera_view_proj`]'s own scale derivation: a point at the globe's visible edge
+/// (`UnitDiskXy` magnitude 1, i.e. `globe_camera.radius_px()` physical pixels from the viewport
+/// center) must land exactly at the clip-space edge — `scale = 2 * radius_px / width_px` (the
+/// same "world unit spans this many pixels, clip space spans `width_px / 2` pixels per unit"
+/// shape `camera_view_proj`'s own `scale_x`/`scale_y` use, just with the globe's disk radius
+/// standing in for `camera_view_proj`'s `meters_per_pixel`-derived world span).
+fn globe_view_proj_bytes(globe_camera: &GlobeCamera, blend: f64) -> [f32; 8] {
+    let center = globe_camera.center();
+    let radius_px = globe_camera.radius_px();
+    let scale_x = 2.0 * radius_px / globe_camera.width_px();
+    let scale_y = 2.0 * radius_px / globe_camera.height_px();
+
+    // `f64` results of division/multiplication narrowed to the uniform's `f32` storage type —
+    // same reasoning `camera_view_proj`'s own final cast documents.
+    #[allow(clippy::cast_possible_truncation)]
+    [
+        center.lat_deg.to_radians() as f32,
+        center.lon_deg.to_radians() as f32,
+        scale_x as f32,
+        scale_y as f32,
+        blend as f32,
+        0.0,
+        0.0,
+        0.0,
+    ]
+}
+
+/// Builds the L0 density-dot pass's GPU resources (M4 item 4.3): the shared unit-quad mesh, the
+/// per-frame params uniform (color + screen-constant dot scale), an initial (empty,
+/// [`density::MIN_DENSITY_INSTANCE_CAPACITY`]-sized) instance buffer, and the pipeline itself.
+/// Runs once, in [`Renderer::new`]/`new_headless`, alongside [`build_globe_basemap_resources`].
+///
+/// `view_proj_layout` must be the exact same object [`build_globe_basemap_resources`] was given
+/// — see [`build_basemap_resources`]'s own doc comment on why every pass sharing one bind group
+/// must be built from the same `BindGroupLayout` object.
+fn build_density_resources(
+    device: &wgpu::Device,
+    view_proj_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> DensityLayer {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("look-above density shader"),
+        source: wgpu::ShaderSource::Wgsl(DENSITY_SHADER.into()),
+    });
+
+    let params_layout = create_uniform_bind_group_layout(
+        device,
+        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+        "look-above density params bind group layout",
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("look-above density pipeline layout"),
+        bind_group_layouts: &[Some(view_proj_layout), Some(&params_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = create_density_pipeline(device, &shader, &pipeline_layout, format);
+
+    let quad_vertices = density::quad_vertices();
+    let quad_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above density quad vertices"),
+        contents: bytemuck::cast_slice(&quad_vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above density quad indices"),
+        contents: bytemuck::cast_slice(&density::QUAD_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    let color = color::density_dot_color(format);
+    let (params_buffer, params_bind_group) =
+        build_density_params_resources(device, &params_layout, color);
+
+    let instance_buffer =
+        create_density_instance_buffer(device, density::MIN_DENSITY_INSTANCE_CAPACITY);
+
+    DensityLayer {
+        pipeline,
+        params_buffer,
+        params_bind_group,
+        quad_vertex_buffer,
+        quad_index_buffer,
+        instance_buffer,
+        instance_capacity: density::MIN_DENSITY_INSTANCE_CAPACITY,
+        color,
+        instance_scratch: Vec::new(),
+    }
+}
+
+/// The `@group(1)` density params uniform (color + scale) and its bind group, seeded with
+/// `color` and a zero scale — the same "nothing reads this before `Renderer::record_draw_passes`
+/// has already rewritten the scale for the frame" shape [`build_marker_params_resources`] uses.
+fn build_density_params_resources(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color: [f32; 4],
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("look-above density params uniform"),
+        contents: bytemuck::bytes_of(&density_params_bytes(color, 0.0)),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-above density params bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
+}
+
+/// The raw bytes behind `density.wgsl`'s `DotParams` uniform: `color` (`vec4<f32>`) followed by
+/// `scale` (`f32`), padded to WGSL's 16-byte uniform alignment — same idiom as
+/// [`marker_params_bytes`].
+fn density_params_bytes(color: [f32; 4], scale: f32) -> [f32; 8] {
+    [color[0], color[1], color[2], color[3], scale, 0.0, 0.0, 0.0]
+}
+
+/// An empty density-dot instance buffer sized for `capacity` instances —
+/// [`DensityLayer::upload_instances`] recreates this at a larger capacity if a frame's packed
+/// aircraft outgrow it.
+fn create_density_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("look-above density instance buffer"),
+        size: (capacity * size_of::<DensityDotInstanceRaw>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Builds the density pipeline: `TriangleList` over the shared unit quad ([`DensityQuadVertex`]
+/// per-vertex, [`DensityDotInstanceRaw`] per-instance), `SAMPLE_COUNT`-multisampled like every
+/// other pass, no depth/stencil, **additively** blended — unlike every other pass's
+/// `ALPHA_BLENDING`, this is what makes overlapping dots over a busy region sum their brightness
+/// in the framebuffer instead of merely occluding each other, the mechanism docs/01's "brightness
+/// proportional to local count" depends on (see `density.rs`'s own module doc comment).
+fn create_density_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("look-above density pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[
+                Some(DensityQuadVertex::LAYOUT),
+                Some(DensityDotInstanceRaw::LAYOUT),
+            ],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Which of a mesh's two buffers [`create_mesh_buffer`] should build.
@@ -2121,6 +2869,10 @@ fn create_uniform_bind_group_layout(
 
 /// One layer's fixed `@group(1)` color uniform and its bind group. Never rewritten after
 /// creation — unlike the view-proj buffer, a layer's color does not change with the window.
+/// [`RunwayLayer`]/[`GlobeBasemapLayer`] both use this (their colors are genuinely fixed for the
+/// pipeline's lifetime) — [`BasemapLayer`]'s own land/coastline color needs its alpha rewritten
+/// every frame instead (M4 item 4.3's cross-fade), so it uses
+/// [`create_rewritable_color_bind_group`] below rather than this function.
 fn create_color_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2142,9 +2894,38 @@ fn create_color_bind_group(
     })
 }
 
-/// Builds one of the two (currently identical) base-map render pipelines: `TriangleList`,
-/// `SAMPLE_COUNT`-multisampled to match every other pass, no depth/stencil (there is none yet),
-/// drawing into a surface of `format`.
+/// [`create_color_bind_group`]'s rewritable twin (M4 item 4.3): identical shape, except the
+/// buffer carries `COPY_DST` and is handed back alongside the bind group so the caller
+/// ([`build_basemap_resources`]) can stash it on [`BasemapLayer`] for
+/// [`BasemapLayer::set_alpha_multiplier`] to rewrite every frame.
+fn create_rewritable_color_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color: [f32; 4],
+    label: &str,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::bytes_of(&color),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
+}
+
+/// Builds [`RunwayLayer`]'s pipeline: `TriangleList`, `SAMPLE_COUNT`-multisampled to match every
+/// other pass, no depth/stencil (there is none yet), opaque (`blend: None` — a runway outline
+/// only ever matters at L2/Regional, where `mode_blend` is always `0.0`, so it has no transition
+/// to participate in), drawing into a surface of `format`. Was also [`BasemapLayer`]'s own land/
+/// coastline pipeline before M4 item 4.3, which moved those two to
+/// [`create_basemap_pipeline_blended`] instead — see that function's own doc comment.
 fn create_basemap_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -2177,6 +2958,53 @@ fn create_basemap_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// [`create_basemap_pipeline`]'s alpha-blended twin (M4 item 4.3), for [`BasemapLayer`]'s own
+/// land/coastline pipelines only: identical shape (same shader, same vertex layout, same
+/// multisample/no-depth setup), except `blend: Some(wgpu::BlendState::ALPHA_BLENDING)` so
+/// [`BasemapLayer::set_alpha_multiplier`]'s per-frame alpha actually fades the layer instead of
+/// unconditionally overwriting the framebuffer — the "cross-faded during transition" half of the
+/// plan's own 4.3 line that this layer originally lacked (see [`BasemapLayer`]'s own doc
+/// comment).
+fn create_basemap_pipeline_blended(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(basemap::Vertex::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -3615,6 +4443,113 @@ mod tests {
             "1,000 aircraft painted implausibly many pixels ({aircraft_non_background}) over the \
              base map alone ({baseline_non_background} of {expected_pixel_count}) — looks like \
              \"renders garbage everywhere\""
+        );
+    }
+
+    /// Regression test for a live visual bug found after M4 item 4.3 first landed: at full L0
+    /// (`blend: 1.0`), the pre-existing flat Mercator `BasemapLayer` (land/coastline) kept
+    /// drawing fully opaque — never gated by `blend` at all — so it stayed visible in the screen
+    /// corners outside the globe's inscribed disk (most visibly the Mercator-stretched polar
+    /// regions, e.g. Greenland, right where a circle inscribed in a square leaves its corners
+    /// exposed), making the view read as "the whole flat world map" rather than a clipped
+    /// hemisphere. The existing smoke test above never caught this: it never calls
+    /// `set_globe_params`, so `globe_blend` stays at its default `0.0` and
+    /// `GlobeBasemapLayer::draw`'s own early return meant the globe pass — and the bug in what
+    /// sits *underneath* it — was never actually exercised.
+    ///
+    /// At a window wider than it is tall (mirroring `App::draw`'s real default framing, where the
+    /// globe's inscribed-circle disk leaves the widest margin), asserts two things at `blend:
+    /// 1.0`: every pixel outside the disk (with a small margin past `radius_px` to tolerate MSAA
+    /// edge antialiasing right at the boundary) is *exactly* the background/clear color — proving
+    /// the flat map is now fully faded out there, not just visually similar — and a meaningful
+    /// share of pixels *inside* the disk are non-background, guarding against the opposite
+    /// regression (the globe pass itself silently drawing nothing).
+    #[test]
+    fn globe_mode_fades_out_the_flat_mercator_map_outside_the_disk() {
+        const WIDTH: u32 = 1_200;
+        const HEIGHT: u32 = 600;
+
+        let mut renderer = match Renderer::new_headless(WIDTH, HEIGHT) {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(error)) => {
+                eprintln!(
+                    "SKIP globe_mode_fades_out_the_flat_mercator_map_outside_the_disk: no \
+                     fallback GPU adapter available ({error})"
+                );
+                return;
+            }
+            Err(error) => panic!("headless renderer setup failed: {error}"),
+        };
+
+        let camera = Camera::new(WIDTH, HEIGHT);
+        let globe_camera = GlobeCamera::new(WIDTH, HEIGHT);
+        renderer.set_globe_params(&globe_camera, 1.0);
+        let background = color_bytes(color::clear_color(renderer.format()));
+
+        let empty_feed = RenderFeed {
+            frame_ts: 0.0,
+            ..RenderFeed::default()
+        };
+        let outcome = renderer.render_headless(&empty_feed, &camera);
+        assert_eq!(outcome, FrameOutcome::Presented);
+        let pixels = renderer.read_offscreen_pixels();
+
+        let width = WIDTH as usize;
+        let height = HEIGHT as usize;
+        let radius_px = globe_camera.radius_px();
+        // A few pixels past the true edge: MSAA-resolved antialiasing at the disk boundary can
+        // legitimately blend land/coastline color into pixels a fraction of a pixel outside the
+        // mathematical radius; this test cares about the corners well beyond that, not the seam.
+        let outside_margin_px = 4.0;
+
+        let mut outside_non_background = 0usize;
+        let mut inside_non_background = 0usize;
+        let mut inside_total = 0usize;
+        // Pixel coordinates here are at most a few thousand — far inside f64's exact-integer
+        // range, so every `usize as f64` narrowing below loses nothing in practice.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "pixel coordinates are far inside f64's exact-integer range"
+        )]
+        for row in 0..height {
+            for col in 0..width {
+                let dx = col as f64 - width as f64 / 2.0;
+                let dy = row as f64 - height as f64 / 2.0;
+                let dist = dx.hypot(dy);
+                let pixel = pixels[row * width + col];
+
+                if dist > radius_px + outside_margin_px {
+                    if pixel != background {
+                        outside_non_background += 1;
+                    }
+                } else if dist < radius_px - outside_margin_px {
+                    inside_total += 1;
+                    if pixel != background {
+                        inside_non_background += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            outside_non_background, 0,
+            "at blend: 1.0, {outside_non_background} pixel(s) outside the globe's disk (radius \
+             {radius_px}px + {outside_margin_px}px margin) were not background — the flat \
+             Mercator map is leaking through instead of fading out"
+        );
+        // Generous floor: the near hemisphere from (0, 0) is mostly ocean, but real bundled
+        // coastline/land data should still paint a clearly non-trivial share of the disk's
+        // interior — 1% is far below any plausible land coverage and well above "renders nothing".
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "pixel counts here are far inside f64's exact-integer range"
+        )]
+        let inside_fraction = inside_non_background as f64 / inside_total as f64;
+        assert!(
+            inside_fraction > 0.01,
+            "at blend: 1.0, only {inside_non_background}/{inside_total} \
+             ({inside_fraction:.4}) pixels inside the globe's disk were non-background — looks \
+             like the globe pass itself is drawing nothing"
         );
     }
 }

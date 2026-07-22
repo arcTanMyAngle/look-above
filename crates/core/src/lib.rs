@@ -13,6 +13,8 @@ pub mod camera;
 pub mod contracts;
 pub mod error;
 pub mod geo;
+pub mod globe_camera;
+pub mod lod;
 pub mod merge;
 pub mod secret;
 pub mod sim;

@@ -24,10 +24,11 @@ struct Migration {
 ///
 /// Migration 0001 creates `aircraft` and `source_status` — the pair item 1.11's writer thread
 /// needs. Migration 0002 adds `airports` and `runways` (M3 item 3.1, the `OurAirports` import).
-/// Migration 0003 adds `metars` (M3 item 3.3). The rest of docs/08's eventual schema
-/// (`positions`, `flights`, `airlines`) is tagged there with its own milestone (M3/M5) and
-/// lands as its own numbered migration when that milestone needs it, rather than being created
-/// ahead of time with nothing to do.
+/// Migration 0003 adds `metars` (M3 item 3.3). Migration 0004 adds `flights` (M3 item 3.4,
+/// pulled forward from its originally planned M5 milestone — `DECISION_LOG` 2026-07-21, M3 3.4).
+/// The rest of docs/08's eventual schema (`positions`, `airlines`) is tagged there with its own
+/// milestone (M5, M3+ respectively) and lands as its own numbered migration when that milestone
+/// needs it, rather than being created ahead of time with nothing to do.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -40,6 +41,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("../migrations/0003_metars.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../migrations/0004_flights.sql"),
     },
 ];
 
@@ -172,14 +177,30 @@ mod tests {
     }
 
     #[test]
+    fn migration_0004_adds_exactly_flights() {
+        let conn = memory_conn();
+        apply_through(&conn, 4);
+        assert!(table_exists(&conn, "flights"), "flights was not created");
+        // 0001's two tables, 0002's two tables, 0003's one, and 0004's one, nothing more.
+        assert_eq!(table_count(&conn), 6);
+    }
+
+    #[test]
     fn applying_all_migrations_creates_exactly_the_tables_defined_so_far() {
         let conn = memory_conn();
         apply(&conn).expect("migrations apply");
-        for table in ["aircraft", "source_status", "airports", "runways", "metars"] {
+        for table in [
+            "aircraft",
+            "source_status",
+            "airports",
+            "runways",
+            "metars",
+            "flights",
+        ] {
             assert!(table_exists(&conn, table), "{table} was not created");
         }
-        // No other table (positions/flights/airlines/...) is created ahead of its milestone.
-        assert_eq!(table_count(&conn), 5);
+        // No other table (positions/airlines/...) is created ahead of its milestone.
+        assert_eq!(table_count(&conn), 6);
     }
 
     #[test]
@@ -195,7 +216,7 @@ mod tests {
             user_version(&conn).expect("reads user_version"),
             after_first
         );
-        assert_eq!(table_count(&conn), 5, "tables were not re-created");
+        assert_eq!(table_count(&conn), 6, "tables were not re-created");
     }
 
     #[test]

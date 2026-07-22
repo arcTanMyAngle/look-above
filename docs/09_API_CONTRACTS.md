@@ -43,10 +43,16 @@ pub struct RegionQuery { pub bbox: Option<BBox>, }
 pub trait Store {
     fn insert_positions(&mut self, batch: &[StateVector]) -> Result<(), StoreError>;
     fn upsert_aircraft_meta(&mut self, meta: &AircraftMeta) -> Result<(), StoreError>;
-    fn airports_in_bbox(&self, bbox: BBox, min_size: AirportSize) -> Result<Vec<Airport>, StoreError>;
     // New contract, added at M3 item 3.2 (not part of M0's original forward-declared shape):
     // runway outlines need their own bbox+size query, mirroring airports_in_bbox exactly.
+    fn airports_in_bbox(&self, bbox: BBox, min_size: AirportSize) -> Result<Vec<Airport>, StoreError>;
     fn runways_in_bbox(&self, bbox: BBox, min_size: AirportSize) -> Result<Vec<Runway>, StoreError>;
+    // New at M3 item 3.4: the read side of upsert_aircraft_meta (the 24h negative-cache gate
+    // reads this before calling adsbdb) and the `flights` table's write/read pair — `flights`
+    // was originally M5-tagged; pulled forward here (DECISION_LOG 2026-07-21, M3 3.4).
+    fn aircraft_meta(&self, icao24: Icao24) -> Result<Option<AircraftMeta>, StoreError>;
+    fn insert_flight(&mut self, flight: &Flight) -> Result<(), StoreError>;
+    fn latest_flight(&self, icao24: Icao24) -> Result<Option<Flight>, StoreError>;
     fn prune(&mut self, keep_after: UnixSeconds) -> Result<u64, StoreError>;
 }
 

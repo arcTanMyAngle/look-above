@@ -2675,3 +2675,272 @@ recoverable from this log and Git rather than recurring startup context.
   (correctly so — a runway is sub-pixel at that scale), so the runway-outline half stays open,
   needing the same closer-zoom-on-a-specific-airport pass 3.2 itself could not get scripted
   navigation to reach.
+
+## 2026-07-21 — M3 item 3.4: `flights` table pulled forward from M5
+
+- 3.4's checklist wording ("Upserts `AircraftMeta`/`flights`") and 3.5's ("sourced from 3.4's
+  cached `AircraftMeta`/`flights` lookup") both name the `flights` table for on-selection route
+  caching, and docs/13's info-card acceptance line expects a route or "—" — but docs/08 tagged
+  `flights` M5, and the project's own established rule (migration 0001's own comment, this log's
+  2026-07-20 M0 entry) is to never create a table ahead of the milestone that needs it, since
+  migrations are append-only and cannot be walked back. Raised to the owner rather than guessed
+  (CLAUDE.md's "stop on missing/ambiguous milestone scope" rule) — three options were: (a) defer
+  route to M5, upsert only `AircraftMeta` now; (b) a new, narrower M3-scoped cache table separate
+  from M5's session-tracking `flights`; (c) pull `flights` into M3 now, as originally specified.
+  Owner chose (c).
+- **Scope of the pull-forward is deliberately narrow**: the table is created verbatim from
+  docs/08 (now re-tagged M3, with a note explaining the pull-forward), but 3.4 only ever
+  *inserts* a new row per successfully resolved, non-cached adsbdb callsign→route lookup — never
+  an upsert-by-(icao24, callsign) merge. `flights`' own shape (`first_seen`/`last_seen`, "callsign
+  sessions") implies session-boundary merging (extending `last_seen`, detecting gaps) that is
+  fundamentally driven by continuous `positions` history M5 hasn't built yet; faking that logic
+  now would mean guessing at M5's own design. `Store::latest_flight` (highest `last_seen`) is
+  what 3.5 reads, so this is invisible to the info card either way. Same "flag the tension, don't
+  silently fake the future milestone" shape as 3.2's LOD-tier carve-out.
+- **Two-layer cache design for the adsbdb lookups** (3.4's "LRU + 24h negative cache" line):
+  the persistent layer is exactly what migration 0001 already ships for this — the `aircraft`
+  table's `fetched_at`/`lookup_failed_at` columns, unused until now, are the 24h negative-cache
+  `Store::aircraft_meta` reads before deciding whether a hex is worth fetching. An in-memory
+  `lru::LruCache` in `ingest::adsbdb` sits in front of that (both the aircraft-hex and the
+  callsign-route lookups) purely to skip a store round-trip on repeat selections within one
+  process run — `flights` has no `lookup_failed_at`-equivalent column (docs/08 never gave it
+  one), so route negative-caching is in-memory-only, bounded by the same LRU.
+
+## 2026-07-21 — M3 item 3.4 lands: adsbdb selection lookups
+
+- Two parallel subagent lanes (`data-source-agent` for `crates/ingest`, `storage-agent` for
+  `crates/store`), each scoped to one crate with the `core::contracts` seam (`Flight`, the four
+  new `Store` trait methods) written first so neither had to guess the other's shape. Both
+  finished clean against their own crate's tests/clippy/fmt independently; the orchestration
+  (`crates/app/src/enrichment.rs`, `App::maybe_select` wiring) and the final workspace-wide
+  verification were done directly, not delegated — the two crates meeting is exactly the seam
+  this session's own read of CLAUDE.md's delegation-budget rule says stays in the main session.
+- **`ingest::adsbdb::AdsbdbSource`** (`crates/ingest/src/adsbdb.rs`): pure adapter, same shape as
+  `MetarSource`. adsbdb's real response shapes were unknown going in (docs/09 only names the
+  endpoints) — recorded live via an extended `scripts/record_fixture.rs` (`adsbdb aircraft
+  <hex> <name>` / `adsbdb callsign <callsign> <name>`), against a real registered Cirrus SR22
+  (`a4b213`) and a real United Airlines route (`UAL123`, ANC→ORD at record time). Found:
+  `response.aircraft.{icao_type, registration, registered_owner, ...}` (icao_type is the short
+  ICAO type designator; a sibling `type` field is a longer non-ICAO description, deliberately
+  not read) and `response.flightroute.{airline, callsign, origin{icao_code,...},
+  destination{...}}`. An unknown hex/callsign answers a plain HTTP 404 with no body — caught at
+  the `SourceError::Request{status:404}` level and mapped to `Ok(None)`, distinct from every
+  other error (which still propagates), so a transient failure can never poison the negative
+  cache the way a confirmed miss should.
+- **`store`**: migration 0004 creates `flights` verbatim from docs/08 (now re-tagged M3);
+  `aircraft.category` needed a string round-trip it didn't have yet
+  (`AircraftCategory::as_str`/`from_store_str`, added to `core::contracts` alongside the type
+  it classifies, mirroring `FlightCategory`'s existing pair) — the one contract addition beyond
+  what was scoped up front, flagged and added in the same pass rather than a follow-up. `Writer`
+  gained `upsert_aircraft_meta`/`aircraft_meta`/`insert_flight`/`latest_flight`, same
+  `Command`-enum-plus-reply-channel shape every existing method uses.
+- **`app::enrichment::Enrichment`** is the only thing allowed to call either
+  `AdsbdbSource::fetch_*` method (privacy rule 2.2's gate, `should_enrich`, is the literal first
+  line of `on_selection`). Two cache layers: the persistent one is the `aircraft` table's own
+  `fetched_at`/`lookup_failed_at` (shipped unused since M1's migration 0001, now finally read);
+  an in-memory `lru::LruCache` (capacity 256) sits in front of it per lookup kind so a repeat
+  selection within one process run never round-trips to the store thread. A route's persistent
+  check has no negative half (`flights` has no `lookup_failed_at`-equivalent column) — instead
+  `latest_flight(icao24)` counts as a hit only when its `callsign` still matches the current
+  selection, so a genuine callsign change (a new flight segment) is always worth a fresh lookup
+  while a re-select of the same still-current flight is not. `flights` writes are plain inserts,
+  never upserts — one row per resolved, non-cached lookup; the session-boundary merge the
+  table's own shape (`first_seen`/`last_seen`) implies is still M5's, once `positions` exists to
+  drive it.
+- **Testing `Enrichment` without wiremock**: `ingest::http::HttpClient::build` and
+  `AdsbdbSource::build` (the allowlist-widening, mock-server-pointed constructors every other
+  adapter's tests use) are deliberately `pub(crate)` — privacy rule 1.1's "the only way to a
+  client outside `ingest` is `HttpClient::new`, which cannot be talked out of the allowlist."
+  That meant `app`'s own tests could not build a mock-backed `AdsbdbSource` the way
+  `crates/ingest`'s own tests do. Resolved with a small `EnrichmentSource` trait (`#[async_trait]`,
+  same dyn-compatibility reason `core::contracts::LiveSource` already uses it) that `AdsbdbSource`
+  implements for production and a call-counting `FakeSource` (behind `Arc`, so a test keeps its
+  own handle to the same counters `Enrichment` calls into) implements for tests — `AdsbdbSource`'s
+  own HTTP/parsing correctness stays `ingest`'s tested responsibility; `app`'s tests exercise only
+  the gate/cache/persistence orchestration, transport-independent. The acceptance line itself
+  ("selecting an anonymous aircraft fires zero enrichment HTTP requests") is
+  `enrichment::tests::selecting_an_anonymous_aircraft_fires_zero_enrichment_requests`, asserting
+  the fake's call counters directly rather than a wiremock `expect(0)`.
+- Verification: full workspace `cargo fmt --check` / `cargo clippy --workspace --all-targets -D
+  warnings` / `cargo test --workspace` — 625 passed, 8 ignored (live-only: 6 pre-existing plus
+  the two new `live_adsbdb_*` tests, both separately confirmed passing against the real
+  `api.adsbdb.com` during the `ingest` lane's own work), 0 failed. A real window-mode boot (real
+  `credentials.json`, real OpenSky poll cycle, 12196 aircraft tracked) confirmed
+  `App::start`'s new `AdsbdbSource`/`Enrichment` construction path does not panic or otherwise
+  fail; an actual click-triggered selection was not exercised live — the same scripted-navigation
+  reliability gap 3.2's and 3.3's own gate records already carry, not a new one.
+
+## 2026-07-21 — M3 item 3.5 lands: selection info card enrichment fields
+
+- **`UNKNOWN` instead of a dash for unresolved fields**: 3.5's checklist wording ("'—' for any
+  unknown field") and docs/13's own acceptance line both write a dash, but
+  `render::label_atlas::CHARSET` (the stroke-font glyph set every on-screen text line is checked
+  against, `info_card`'s own charset test included) has no dash character of any kind — only
+  `A`-`Z`, `0`-`9`, space, and the two lowercase letters `label`'s unit suffixes need. Widening
+  the charset for one placeholder glyph was rejected the same way 2.8b rejected it for
+  lat/lon punctuation: out of scope for what this item's own wording names. `UNKNOWN` reads the
+  same, costs nothing in the atlas, and matches "UNIDENTIFIED"'s existing convention for "nothing
+  to show here" one line up.
+- **The enrichment fields (`TYPE`/`OPR`/`RTE`) are always shown, never omitted** — the opposite of
+  2.8b's original callsign/altitude/speed convention (omitted when unknown). Both conventions now
+  coexist in the same `format_lines` deliberately: 3.5's own checklist line ("'—' for any unknown
+  field, *never an error state*") reads as "always show something," while 2.8b's fields were
+  never given that requirement and changing their existing, tested behavior wasn't in scope here.
+- **`app::window::App` reads the store synchronously in `maybe_select`, not per-frame** —
+  `store::Writer`'s methods block on a channel round-trip to the writer thread (`Writer::call`),
+  which is exactly the kind of I/O ADR-005 says must never sit in the render loop. Per-frame was
+  never seriously considered; the design that shipped mirrors `maybe_retarget`'s own already-
+  established shape (a synchronous store read at a debounced trigger — camera-settle there,
+  click-to-select here — cached into a plain `App` field, read cheaply every frame after). Two
+  new fields, `selected_meta`/`selected_flight`, reset on every selection change including a
+  deselect. Consequence accepted, not hidden: a first-ever selection of a given aircraft shows
+  `UNKNOWN` for type/operator/route even after 3.4's background adsbdb fetch later completes and
+  persists — nothing re-triggers the card to refresh mid-selection, only a fresh reselect reads
+  the now-populated store row. `app::enrichment`'s own doc comment already anticipated this split
+  ("3.5 reads the persisted data when it builds the info card, not from this cache"); a live
+  push-on-fetch-completion channel was considered and rejected as more machinery than this item's
+  scope asked for.
+- **Privacy rule 2.2, defense in depth**: the store read in `maybe_select` is itself gated on
+  `!instance.anonymous`, so `selected_meta`/`selected_flight` are never even populated for an
+  anonymized target — belt-and-suspenders alongside `format_lines`' own anonymous branch, which
+  returns before reading those fields regardless of what they hold.
+- Verification: full workspace `cargo fmt` / `cargo clippy --workspace --all-targets` / `cargo
+  test --workspace` — 629 passed (4 net new: `unresolved_enrichment_fields_show_unknown_never_
+  omitted_or_an_error`, `a_route_with_only_one_known_end_shows_unknown_in_the_other_slot`,
+  `with_enrichment_fills_type_operator_and_route_from_a_meta_and_flight_lookup`,
+  `with_enrichment_leaves_fields_unknown_when_meta_and_flight_are_none`), 8 ignored (live-only,
+  unchanged), 0 failed. Not live-verified by an actual click-triggered selection showing real
+  type/operator/route text on screen — the same scripted-navigation reliability gap 3.2/3.3/3.4's
+  own gate records already carry, not a new one; the underlying GPU text path
+  (`pack_overlay_instances`) is unchanged from 2.8b's own already-confirmed rendering.
+
+## 2026-07-21 — M3 item 3.6 gate: acceptance lines, docs/13 QA, kill-switch test
+
+- **Baseline re-verified before checking anything else**: full workspace `cargo fmt --check` /
+  `cargo clippy --workspace --all-targets` / `cargo test --workspace` — 629 passed, 8 ignored,
+  0 failed, identical to 3.5's own recorded count, confirming the working tree hadn't drifted
+  since 3.5's last live verification (no code changed this session; 3.1–3.5 remain uncommitted).
+- **Kill-switch test, live-verified.** The owner blocked `api.adsbdb.com` and
+  `aviationweather.gov` via the Windows hosts file (an admin-only system edit outside this
+  process's own privileges, so the owner applied and later reverted it; `Resolve-DnsName`
+  confirmed both the block and the revert). `OurAirports` was not hosts-blocked: 3.1 already
+  bundles it at build time (`store` has no network deps by design), so nothing at runtime ever
+  contacts it — blocking a host nothing calls would prove nothing.
+  - A live `look-above.exe` (release) window-mode run kept OpenSky live positions flowing
+    normally throughout (10k+ aircraft tracked across several poll cycles, credits accruing
+    normally) while the METAR poller's next cycle hit the blocked host and logged
+    `metar poll cycle failed; retrying next cycle error=network error: error sending request` —
+    a plain `tracing::warn!`, not a panic. No retry storm: `ingest::metar::run_metar_poller`
+    structurally cannot produce one — on any error it just logs and sleeps the normal
+    `MIN_POLL_INTERVAL` (≥10 min), the same wait as a successful cycle, regardless of error kind.
+  - Getting the METAR poller to actually attempt a fetch required a real camera-settle event
+    first (`app::window::App::maybe_retarget` only retargets the METAR station list — and only
+    if the resulting query differs from `last_sent_region` — on a genuine camera change, which
+    the app's default launch state never produces on its own). Synthetic Win32 `SendMessage`
+    (`WM_MOUSEWHEEL`) reliably reached the running window and changed the camera zoom/region —
+    more reliable than the drag-based automation 3.2's gate record found unreliable for precise
+    targeting, since no precision was needed here, only *some* change. One side effect
+    reproduced, live, the already-known carried renderer blocker (whole-world trails exceeding
+    wgpu's 256 MiB buffer panic) when a first zoom pulse landed while the view was still at
+    global scale with dense trails; the second attempt zoomed in immediately after launch,
+    avoided lingering at global scale, and completed cleanly. This is confirmation the blocker
+    is still live, not a new finding — already tracked in CURRENT_STATUS, unrelated to 3.6's own
+    scope, and not fixed here (M4/renderer LOD work owns it).
+  - adsbdb's own network-error handling was **not** exercised live — enrichment only fires from
+    `App::maybe_select`, which needs an actual click, the same scripted-navigation automation gap
+    3.2/3.4/3.5 already carry (re-attempting the identical approach that already failed three
+    times was judged not worth another try this session; docs/13's own "one focused attempt, then
+    record the gap" instruction was followed instead). Static/code-level evidence stands in:
+    `app::enrichment`'s `Err(error) => tracing::warn!(...)` arms (both `fetch_aircraft` and
+    `fetch_route`) never populate the LRU or persistent negative-cache on a network error — only
+    a confirmed 404 does — so a blocked host cannot poison the cache, and retries are bounded by
+    user click rate, not any machine-paced loop.
+- **docs/13 §Selection & overlays QA — not a fresh full pass, evidence reused deliberately.**
+  METAR badge colors were already live-verified in 3.3 and nothing render-relevant changed since
+  (confirmed by the identical 629-test count above) — re-running that check would have been pure
+  overhead. Click hit-testing and info-card content still carry 3.2/3.4/3.5's own recorded
+  automation gap. **Emergency squawk styling is not carried-gap territory — it does not exist**:
+  no `squawk` field anywhere in `core::contracts`, `ingest`, or `render`, and no M1–M4 checklist
+  item scopes building it, despite docs/01 (line 66) and privacy rule 6.1 both documenting the
+  intended behavior and docs/13 listing it under "required at M3/M4." Per CLAUDE.md's own
+  instruction not to guess or hunt for missing milestones, this is recorded here as an open
+  question for the owner (which milestone should own it) rather than assumed into M4's plan.
+- **Acceptance record (docs/11 §M3), evidence per line:**
+  1. OurAirports import/count — done, 3.1 (evidence: DECISION_LOG 2026-07-20, M3 3.1). Rendering
+     half done, 3.2. **L1/L2 tier-switching half stays open into M4** — recorded when M3 opened
+     (tension note at the top of the M3 plan) and reconfirmed here, not a new gap.
+  2. METAR badges (age/cadence) — done and live-verified, 3.3.
+  3. Selecting a normal aircraft shows type/operator/route — implemented and unit-tested, 3.4/3.5.
+     **Live click-triggered confirmation stays open** — same carried gap as above.
+  4. Zero enrichment requests for an anonymous selection — done, unit-tested, 3.4
+     (`enrichment::tests::selecting_an_anonymous_aircraft_fires_zero_enrichment_requests`).
+  5. Kill-switch test — done and live-verified, this item.
+- Gate table updated in `plans/CURRENT_STATUS.md`: "5/5 acceptance lines evidenced; 2 carry open
+  halves (L1/L2 tier-switching → M4; click-triggered live verification), both pre-existing." Per
+  CLAUDE.md, M3 is now gated and M4 is not started unprompted.
+
+## 2026-07-21 — M4 item 4.2: orthographic globe camera, cursor-anchored zoom scoped as a linear
+approximation
+
+- **Cursor-anchored zoom on `GlobeCamera` uses a per-frame first-order correction, not an exact
+  spherical-rotation solve.** True anchoring (keeping the world point under a moving cursor fixed
+  on screen through the whole zoom ease) is a 2-unknown/2-constraint nonlinear system (solve for
+  the sub-observer lat/lon that puts a given world point at a given disk position) with no closed
+  form found in the time this item warrants. Instead `correct_toward_anchor` nudges `center` each
+  frame using the small-angle partials of `orthographic_forward` near the observer point
+  (`∂x/∂λ₀ ≈ -cos(φ₀)`, `∂y/∂φ₀ ≈ -1`), which is exact for anchors near screen center and
+  converges over the ease's remaining frames otherwise. Off-globe cursor clicks (no world point
+  under the cursor) fall back to center-anchored scaling. Documented in the module doc and
+  `correct_toward_anchor`'s doc comment; item 4.2's acceptance criteria only test the projection
+  function's visibility/bounds/NaN properties, not zoom-anchor precision, so this was in scope to
+  defer. Revisit only if 4.3's manual QA finds the drift objectionable at typical zoom speeds.
+- **`GlobeCamera` has no drag-inertia (no `begin_drag`/`drag_to`/`end_drag`/coasting velocity)**,
+  unlike `Camera`. The 4.2 checklist item's wording ("pan/rotate + cursor-anchored zoom
+  analogues") only names those two capabilities; inertia is UX polish addressable during 4.3's
+  renderer wiring if wanted, not required by this item's property-test acceptance criteria.
+- **No upper zoom-in bound on `radius_px`** (only a `MIN_RADIUS_PX` floor against a degenerate
+  non-positive radius). Unlike `Camera`'s letterbox ceiling (a real "whole world visible" cap),
+  there is no equivalent meaningful constraint yet for the globe — L0 is a wide-framing tier by
+  definition, and any tier-transition-driven cap belongs with 4.3/4.4's tier wiring, not this
+  pure-math item.
+
+## 2026-07-21 — M4 item 4.3: globe scope, camera input routing, a real bug found live, one gap carried to 4.4
+
+- **Full spherical basemap, not a placeholder disk** — owner chose this explicitly (AskUserQuestion)
+  over a plain ocean-colored circle or no globe surface at all, even though the checklist line only
+  named the density-dot layer as new geometry. Cost: a second, independent tessellation path
+  (`basemap::tessellate_globe`, raw lon/lat radians, no Mercator projection) and a new shader
+  (`globe_basemap.wgsl`) doing the orthographic projection per-vertex with a per-fragment `cos_c`
+  discard (not a per-vertex all-or-nothing test) so a triangle straddling the true horizon clips
+  along the correct curve instead of popping/jagging.
+- **Both cameras (`Camera`, `GlobeCamera`) receive every raw drag/wheel/resize input
+  unconditionally**, independent of which one is currently visible. Rationale: `LodTier`/
+  `mode_blend` must keep deriving from `Camera::viewport_span_km()` alone (no change to 4.1's
+  contract, no invented Mercator-`meters_per_pixel`-to-globe-`radius_px` conversion), while
+  `GlobeCamera` needs to stay live and controllable the instant it's visible. Known consequence,
+  owner-accepted rather than silently shipped: because the two cameras' framings diverge freely
+  (Mercator pan/zoom vs. globe rotate/zoom are unrelated degrees of freedom), the still-ungated
+  aircraft-glyph/trail/label layers (drawn via the Mercator camera; gating them is explicitly 4.4's
+  job) visibly float disconnected from whatever the globe is currently showing once a user drags/
+  scrolls to explore the globe. Confirmed live in a windowed run against real OpenSky traffic
+  (~7,000 aircraft) and left as-is rather than pulled forward into 4.3 — see the carried line below.
+- **Bug found and fixed during the live visual pass, not by automated tests**: the first
+  implementation faded the *new* globe basemap in correctly but never faded the *pre-existing* flat
+  Mercator basemap out, so at full L0 the flat map stayed opaque and visible in the four corners
+  outside the globe's inscribed disk — read, at a glance, as "the whole world is still flat," even
+  though the disk's interior was already a correctly-clipped hemisphere. Root-caused by rendering a
+  headless frame to PNG and inspecting it, plus an independent property test round-tripping the
+  globe mesh through `core::geo::orthographic_forward` (53/47 near/far split — ruled out a
+  degrees/radians or lat/lon mixup). Fixed by giving the Mercator land/coastline pipeline a
+  rewritable alpha (`BasemapLayer::set_alpha_multiplier`, driven by `1.0 - mode_blend` every frame)
+  instead of leaving it permanently opaque. Regression test
+  (`globe_mode_fades_out_the_flat_mercator_map_outside_the_disk`) verified to fail against the
+  pre-fix code and pass with the fix — this class of "renders something, but the wrong shape" bug is
+  exactly what the existing headless smoke test's "some pixels are non-background" assertion doesn't
+  catch, so the new test asserts pixel color *outside* the expected disk specifically.
+- **Carried gap → explicitly scoped into 4.4, not reopened as new**: aircraft glyphs/trails/labels
+  float independently of the globe's current rotation while a user is actively exploring L0 (see the
+  input-routing point above). 4.4's own "gate `TrailLayer`/`LabelLayer` to `Regional` only... glyph
+  vs. density-dot drawing to the correct tier" already covers the fix (once glyphs simply don't draw
+  at `Global`, there's nothing to float disconnected). Owner confirmed accepting this as a temporary
+  4.3→4.4 rough edge rather than pulling gating work forward.

@@ -20,10 +20,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::unbounded;
 use look_above_core::camera::Camera;
-use look_above_core::contracts::{Airport, AirportSize, Metar, MetarBadge, RegionQuery, Runway};
+use look_above_core::contracts::{
+    AircraftMeta, Airport, AirportSize, Flight, Metar, MetarBadge, RegionQuery, Runway,
+};
+use look_above_core::globe_camera::GlobeCamera;
+use look_above_core::lod::{self, LodTier};
 use look_above_core::merge::SessionTable;
 use look_above_core::sim::{RenderFeed, Simulator};
 use look_above_core::types::{Icao24, SourceId};
+use look_above_ingest::adsbdb::AdsbdbSource;
 use look_above_ingest::budget::CreditLedger;
 use look_above_ingest::http::HttpClient;
 use look_above_ingest::metar::{self, MetarSource, run_metar_poller};
@@ -43,6 +48,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::Config;
 use crate::double_buffer::{self, Consumer};
+use crate::enrichment::Enrichment;
 use crate::frame_stats::{FrameStats, FrameSummary};
 use crate::simulation;
 
@@ -70,6 +76,36 @@ const CLICK_MAX_MOVEMENT_PX: f64 = 5.0;
 /// drag that happens to end near its start point (e.g. a hesitant pan) must not be read as a
 /// click just because it didn't move far.
 const CLICK_MAX_DURATION: Duration = Duration::from_millis(300);
+
+/// Exponential time constant for [`App::mode_blend`]'s eased approach to its target (M4 item
+/// 4.3) — chosen so a full `0.0 -> 1.0` (or `1.0 -> 0.0`) transition reads as visually converged
+/// well inside docs/13's ≤ 500 ms ceiling; see [`ease_mode_blend`]'s own unit test for the exact
+/// bound this is checked against.
+const MODE_BLEND_EASE_TAU_S: f64 = 0.1;
+
+/// One frame's step of [`App::mode_blend`]'s ease toward `target` — the exact same
+/// exponential-ease-toward-target shape `Camera::update`'s zoom ease and `GlobeCamera::update`'s
+/// radius ease already use (`value += (target - value) * (1 - exp(-dt / tau))`), including the
+/// same floating-point snap-to-target guard those eases have. A free function, not inlined into
+/// [`App::draw`], so it has a plain-Rust unit test independent of the rest of `App`'s
+/// winit/tokio-heavy construction — the same "free function for testability" reasoning
+/// [`metar_badges_for`] documents for itself.
+///
+/// This eased-toward-a-retargetable-value shape is what makes the globe<->Mercator transition
+/// "interruptible" for free: a tier flip mid-ease just changes which direction `target` pulls,
+/// exactly like `Camera`'s own zoom-ease/pan-inertia already behave — no separate fixed-duration
+/// timer or interrupt-handling code is needed anywhere in `App`.
+fn ease_mode_blend(value: f64, target: f64, dt_s: f64) -> f64 {
+    if value == target {
+        return value;
+    }
+    let mut eased = value + (target - value) * (1.0 - (-dt_s / MODE_BLEND_EASE_TAU_S).exp());
+    // Floating point should not leave this converging forever.
+    if (eased - target).abs() <= 1e-9 {
+        eased = target;
+    }
+    eased
+}
 
 /// Open the window and pump events until the user closes it.
 pub fn run(config: &Config) -> Result<()> {
@@ -102,6 +138,30 @@ struct App {
     /// needs winit input events and `render` must stay winit-free (ADR-002). Built in
     /// [`App::start`] alongside the renderer, at the same physical size.
     camera: Option<Camera>,
+    /// M4 item 4.3's orthographic globe camera (M4 item 4.2's `GlobeCamera`, unwired until now),
+    /// built in [`App::start`] alongside `camera` at the same physical size. Lives here for the
+    /// same reason `camera` does (winit input, ADR-002).
+    ///
+    /// Every drag/wheel/resize input event feeds *both* cameras unconditionally, with the same
+    /// raw pixel deltas/notches (see `window_event`'s handlers) — deliberate, not an oversight:
+    /// `camera.viewport_span_km()` stays the single continuous source of truth driving
+    /// `lod::next_tier` (no change to 4.1's contract), while `globe_camera` independently stays
+    /// live and controllable the moment it becomes visible, without needing to invent a
+    /// cross-camera unit conversion between Mercator `meters_per_pixel` and globe `radius_px`. A
+    /// future reader might otherwise "fix" this by gating input to only the currently-visible
+    /// camera — don't; that would leave the globe camera stale/jumpy the instant it faded in.
+    globe_camera: Option<GlobeCamera>,
+    /// The current LOD tier (M4 item 4.1's hysteresis state machine), recomputed every frame in
+    /// [`App::draw`] from `camera.viewport_span_km()`. This field's value here (before
+    /// [`App::start`] runs) is never observed — `start` immediately reseeds it against the real
+    /// initial camera (see that method's own comment), so any placeholder tier works.
+    lod_tier: LodTier,
+    /// 0.0 = fully Mercator/flat, 1.0 = fully globe (M4 item 4.3) — eased every frame in
+    /// [`App::draw`] toward whichever target `lod_tier` implies (1.0 at [`LodTier::Global`], 0.0
+    /// otherwise), via [`ease_mode_blend`]. Like `lod_tier` above, this field's value here is a
+    /// placeholder [`App::start`] immediately overwrites, seeded to match the seeded `lod_tier`
+    /// exactly so there is no spurious animation on the very first frame.
+    mode_blend: f64,
     /// The most recent cursor position, in physical pixels. Needed for two things: computing
     /// per-move drag deltas, and anchoring wheel-zoom (a `MouseWheel` event carries no position
     /// of its own in winit — it always accompanies cursor movement, so the last tracked
@@ -189,9 +249,26 @@ struct App {
     /// anything on the render side (no outline/info card until 2.8b); kept here so `app` has a
     /// single source of truth for "what's selected" rather than only living inside the worker.
     selected_icao24: Option<Icao24>,
+    /// [`App::selected_icao24`]'s cached aircraft/route enrichment (M3 item 3.5) — read
+    /// synchronously from `store` once, in [`App::maybe_select`], the same "read at the
+    /// debounced trigger, not every frame" shape [`App::maybe_retarget`] already uses for
+    /// `current_airports`/`current_metar_badges` (never a per-frame store round-trip off the
+    /// render loop, ADR-005). `None` for either half simply means "nothing cached yet" — the
+    /// info card shows `UNKNOWN`, never an error (this item's own acceptance line). Cleared
+    /// alongside `selected_icao24` on every selection change, including a deselect.
+    selected_meta: Option<AircraftMeta>,
+    /// [`App::selected_icao24`]'s cached route (M3 item 3.5) — see
+    /// [`App::selected_meta`]'s own doc comment; same trigger, same "`None` means unknown, not
+    /// an error" shape.
+    selected_flight: Option<Flight>,
     /// The live handle used to push a new selection to the simulation worker — mirrors
     /// `retarget_tx`'s shape exactly. `None` until [`App::start`] has spawned the worker.
     select_tx: Option<watch::Sender<Option<Icao24>>>,
+    /// The adsbdb enrichment gate/cache (M3 item 3.4) — [`App::maybe_select`]'s only call into
+    /// it, and only for a non-anonymous selection. `Arc` because each selection spawns its own
+    /// short-lived lookup task on `runtime_handle`, independent of the render/event loop
+    /// (ADR-005: never block the render loop on I/O). `None` until [`App::start`] has built it.
+    enrichment: Option<Arc<Enrichment>>,
     /// Set on exit to stop the simulation worker; it checks this once per iteration.
     sim_shutdown: Option<Arc<AtomicBool>>,
     /// The simulation worker's join handle, so [`App::exiting`] waits for its final DB writes
@@ -231,6 +308,11 @@ impl App {
             window: None,
             renderer: None,
             camera: None,
+            globe_camera: None,
+            // Placeholders — `App::start` reseeds both against the real initial camera before
+            // anything reads them (see the field docs above).
+            lod_tier: LodTier::Regional,
+            mode_blend: 0.0,
             last_cursor_pos: None,
             last_drag_instant: None,
             press_pos: None,
@@ -253,7 +335,10 @@ impl App {
             feed_consumer: None,
             current_feed: RenderFeed::default(),
             selected_icao24: None,
+            selected_meta: None,
+            selected_flight: None,
             select_tx: None,
+            enrichment: None,
             sim_shutdown: None,
             sim_handle: None,
         }
@@ -299,6 +384,23 @@ impl App {
         let camera = Camera::new(size.width, size.height);
         renderer.set_view_proj(camera_view_proj(&camera));
 
+        // M4 item 4.3: the orthographic globe camera, built alongside `camera` at the same
+        // physical size. `lod_tier`/`mode_blend` are seeded here — not left at `App::new`'s
+        // placeholders — against this camera's real initial `viewport_span_km()`;
+        // `lod::next_tier`'s own doc comment already covers why a fast zoom from any seed tier
+        // resolves straight to the correct one in a single call, so the placeholder previous-tier
+        // value passed in below never actually matters. `mode_blend` is seeded to match exactly
+        // (`1.0` if `Global`, else `0.0`) so there is no spurious animation on the very first
+        // frame.
+        let globe_camera = GlobeCamera::new(size.width, size.height);
+        self.lod_tier = lod::next_tier(self.lod_tier, camera.viewport_span_km());
+        self.mode_blend = if self.lod_tier == LodTier::Global {
+            1.0
+        } else {
+            0.0
+        };
+        renderer.set_globe_params(&globe_camera, self.mode_blend);
+
         // The same three ingest pieces `headless::run` builds — see that module's doc comment
         // for why each is required, not just the poller. A failure here is fatal, the same way
         // a renderer-init failure above is: a broken DB or client cannot degrade gracefully into
@@ -332,6 +434,12 @@ impl App {
         // comment), not part of the live-position failover chain, but it shares the same
         // allowlist-enforcing `HttpClient`.
         let metar_source = MetarSource::new(client.clone());
+        // M3 item 3.4: the on-selection adsbdb gate/cache. Built from its own `client.clone()`
+        // the same way `metar_source` is, before `client` is moved into the poller chain below.
+        let enrichment = Arc::new(Enrichment::new(
+            AdsbdbSource::new(client.clone()),
+            store_handle.clone(),
+        ));
         let mut poller =
             Poller::with_default_chain(client, auth, retarget_rx, sender, Arc::clone(&clock));
 
@@ -406,19 +514,35 @@ impl App {
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.camera = Some(camera);
+        self.globe_camera = Some(globe_camera);
         self.retarget_tx = Some(retarget_tx);
         self.last_sent_region = initial_query;
         self.store = Some(store_handle);
         self.metar_retarget_tx = Some(metar_retarget_tx);
         self.feed_consumer = Some(consumer);
         self.select_tx = Some(select_tx);
+        self.enrichment = Some(enrichment);
         self.sim_shutdown = Some(shutdown);
         self.sim_handle = Some(sim_handle);
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the per-frame sequence (advance both cameras, recompute the LOD tier/blend \
+                  ease — M4 4.3 — retarget the poller, swap the feed, build the HUD/info-card \
+                  content, then render and log stats) is one linear frame-start-to-present \
+                  pipeline; splitting it into sub-functions would mean passing most of these same \
+                  locals through another layer of parameters rather than reducing what this \
+                  method actually does, the same reasoning `App::start`'s own too_many_lines \
+                  allow already documents"
+    )]
     fn draw(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(renderer), Some(camera)) = (self.renderer.as_mut(), self.camera.as_mut()) else {
+        let (Some(renderer), Some(camera), Some(globe_camera)) = (
+            self.renderer.as_mut(),
+            self.camera.as_mut(),
+            self.globe_camera.as_mut(),
+        ) else {
             return;
         };
 
@@ -432,8 +556,22 @@ impl App {
 
         let before = (camera.center_m(), camera.meters_per_pixel());
         camera.update(dt_s);
+        globe_camera.update(dt_s);
         let changed = before != (camera.center_m(), camera.meters_per_pixel());
         renderer.set_view_proj(camera_view_proj(camera));
+
+        // M4 item 4.3: recompute the LOD tier from the just-updated camera's viewport span
+        // (4.1's hysteresis state machine), then ease `mode_blend` toward whichever
+        // globe<->Mercator target that tier implies — see `ease_mode_blend`'s own doc comment
+        // for why this one eased value is what makes the transition interruptible for free.
+        self.lod_tier = lod::next_tier(self.lod_tier, camera.viewport_span_km());
+        let target_blend = if self.lod_tier == LodTier::Global {
+            1.0
+        } else {
+            0.0
+        };
+        self.mode_blend = ease_mode_blend(self.mode_blend, target_blend, dt_s);
+        renderer.set_globe_params(globe_camera, self.mode_blend);
 
         Self::maybe_retarget(
             camera,
@@ -483,6 +621,10 @@ impl App {
                 .iter()
                 .find(|instance| instance.icao24 == icao24)
                 .map(InfoCardContent::from_instance)
+                .map(|content| {
+                    content
+                        .with_enrichment(self.selected_meta.as_ref(), self.selected_flight.as_ref())
+                })
         });
 
         match renderer.render(
@@ -678,6 +820,61 @@ impl App {
         if let Some(select_tx) = &self.select_tx {
             let _ = select_tx.send(selected);
         }
+
+        // M3 item 3.5: the info card's type/operator/route fields — a direct, synchronous
+        // `store` read at this trigger, the same shape `maybe_retarget` already uses for
+        // `current_airports`/`current_metar_badges` (a fast local read at a debounced trigger,
+        // never a per-frame round-trip off the render loop, ADR-005). Reset on every selection
+        // change, including a deselect, so a stale card never survives past its own selection;
+        // gated on `!anonymous` — privacy rule 2.2 covers the enrichment *lookup* itself, not
+        // just this read, so an anonymized target's card is never even given the chance to show
+        // a stale pre-anonymization row. `None` from a query error or an unresolved lookup both
+        // simply mean "not cached yet" to `render::info_card`, never an error state.
+        self.selected_meta = None;
+        self.selected_flight = None;
+        if let Some(icao24) = selected
+            && let Some(store) = self.store.as_ref()
+            && let Some(instance) = self
+                .current_feed
+                .aircraft
+                .iter()
+                .find(|instance| instance.icao24 == icao24)
+            && !instance.anonymous
+        {
+            match store.aircraft_meta(icao24) {
+                Ok(meta) => self.selected_meta = meta,
+                Err(error) => {
+                    tracing::warn!(%error, %icao24, "aircraft_meta query failed for the info card");
+                }
+            }
+            match store.latest_flight(icao24) {
+                Ok(flight) => self.selected_flight = flight,
+                Err(error) => {
+                    tracing::warn!(%error, %icao24, "latest_flight query failed for the info card");
+                }
+            }
+        }
+
+        // M3 item 3.4: on-selection adsbdb enrichment. Spawned onto `runtime_handle`, not run
+        // inline — a network lookup must never block the render/event loop (ADR-005). The
+        // instance is cloned so the task owns everything it touches; `Enrichment::on_selection`
+        // itself applies the privacy-rule-2.2 gate as its first action; a deselect
+        // (`selected: None`) or an instance that has already faded out of `current_feed` simply
+        // has nothing to spawn.
+        if let Some(icao24) = selected
+            && let Some(enrichment) = self.enrichment.clone()
+            && let Some(instance) = self
+                .current_feed
+                .aircraft
+                .iter()
+                .find(|instance| instance.icao24 == icao24)
+                .cloned()
+        {
+            let now = SystemWallClock.now();
+            self.runtime_handle.spawn(async move {
+                enrichment.on_selection(&instance, now).await;
+            });
+        }
     }
 
     /// Park a fatal error and stop the loop. The first one wins: later failures are usually
@@ -728,6 +925,17 @@ impl ApplicationHandler for App {
                     // a resize (with no accompanying pan/zoom) still eventually retarget.
                     self.last_camera_change_instant = Some(Instant::now());
                 }
+                // M4 item 4.3: `GlobeCamera::resize` has no zoom ceiling to reclamp (unlike
+                // `Camera::resize` above — see that method's own doc comment), but its
+                // width/height still feed `set_globe_params`'s scale derivation, so it's
+                // refreshed here too rather than left stale until the next `draw` — same
+                // immediate-rebuild reasoning as the Mercator camera just above.
+                if let (Some(renderer), Some(globe_camera)) =
+                    (self.renderer.as_mut(), self.globe_camera.as_mut())
+                {
+                    globe_camera.resize(size.width, size.height);
+                    renderer.set_globe_params(globe_camera, self.mode_blend);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = (position.x, position.y);
@@ -739,6 +947,12 @@ impl ApplicationHandler for App {
                     let now = Instant::now();
                     let dt_s = now.saturating_duration_since(last_instant).as_secs_f64();
                     camera.drag_to(x - last_x, y - last_y, dt_s);
+                    // M4 item 4.3: feed the same raw pixel delta to the globe camera
+                    // unconditionally — see the field doc on `App::globe_camera` for why this
+                    // isn't gated to only the currently-visible camera.
+                    if let Some(globe_camera) = self.globe_camera.as_mut() {
+                        globe_camera.rotate_by_pixels(x - last_x, y - last_y);
+                    }
                     self.last_drag_instant = Some(now);
                 }
 
@@ -787,6 +1001,11 @@ impl ApplicationHandler for App {
                         .last_cursor_pos
                         .unwrap_or((camera.width_px() / 2.0, camera.height_px() / 2.0));
                     camera.zoom_by_notches(notches, cursor_x, cursor_y);
+                    // M4 item 4.3: same raw notch count and cursor position, fed to the globe
+                    // camera unconditionally — see the field doc on `App::globe_camera`.
+                    if let Some(globe_camera) = self.globe_camera.as_mut() {
+                        globe_camera.zoom_by_notches(notches, cursor_x, cursor_y);
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -928,5 +1147,65 @@ mod tests {
         let badges = metar_badges_for(&airports, &metars);
         assert_eq!(badges.len(), 1);
         assert_eq!(badges[0].category, FlightCategory::Mvfr);
+    }
+
+    // ---- `ease_mode_blend` (M4 item 4.3) -----------------------------------------------------
+
+    #[test]
+    fn ease_mode_blend_converges_within_docs13s_500ms_ceiling() {
+        let mut value = 0.0;
+        let target = 1.0;
+        let frame_dt_s = 1.0 / 60.0;
+        let mut elapsed_s = 0.0;
+
+        while elapsed_s < 0.5 {
+            value = ease_mode_blend(value, target, frame_dt_s);
+            elapsed_s += frame_dt_s;
+        }
+
+        // Not bit-exact equality (a plain exponential ease never truly reaches its target in
+        // finite time) — "converged" here means visually indistinguishable from the target well
+        // inside the 500 ms ceiling, the same generous-but-meaningful bound
+        // `GlobeCamera`'s/`Camera`'s own ease convergence tests use.
+        assert!(
+            (value - target).abs() < 0.01,
+            "mode_blend only reached {value} after 500ms of simulated time, expected within \
+             0.01 of {target}"
+        );
+    }
+
+    #[test]
+    fn ease_mode_blend_moves_toward_target_but_does_not_overshoot_it() {
+        let mut value = 0.0;
+        for _ in 0..5 {
+            let next = ease_mode_blend(value, 1.0, 1.0 / 60.0);
+            assert!(next > value, "each step must move strictly toward target");
+            assert!(next <= 1.0, "the ease must never overshoot its target");
+            value = next;
+        }
+    }
+
+    #[test]
+    fn ease_mode_blend_is_a_no_op_once_already_at_target() {
+        assert_eq!(ease_mode_blend(1.0, 1.0, 1.0 / 60.0), 1.0);
+        assert_eq!(ease_mode_blend(0.0, 0.0, 1.0 / 60.0), 0.0);
+    }
+
+    #[test]
+    fn ease_mode_blend_is_interruptible_a_retargeted_ease_changes_direction_immediately() {
+        // Ease partway toward 1.0, then retarget to 0.0 mid-flight (the "tier flipped back"
+        // case) — the very next step must move back down, not continue coasting upward or
+        // require any separate cancel/interrupt call.
+        let mut value = 0.0;
+        for _ in 0..10 {
+            value = ease_mode_blend(value, 1.0, 1.0 / 60.0);
+        }
+        assert!(value > 0.0, "should have made some progress toward 1.0");
+
+        let retargeted = ease_mode_blend(value, 0.0, 1.0 / 60.0);
+        assert!(
+            retargeted < value,
+            "retargeting to 0.0 mid-ease must immediately start pulling the value back down"
+        );
     }
 }

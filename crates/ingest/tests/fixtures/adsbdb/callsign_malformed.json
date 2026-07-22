@@ -1,0 +1,20 @@
+[
+  {},
+  {
+    "response": {}
+  },
+  {
+    "response": {
+      "flightroute": null
+    }
+  },
+  {
+    "response": {
+      "flightroute": {
+        "origin": {
+          "icao_code": "PANC"
+        }
+      }
+    }
+  }
+]

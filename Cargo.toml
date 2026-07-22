@@ -48,6 +48,7 @@ crossbeam-channel = "0.5.16"
 fastrand = "2.4.1"
 
 # store: bundled SQLite, no system dependency (ADR-004).
+
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 # import/store: streaming CSV parsing for the OurAirports snapshot (M3 item 3.1) — import
@@ -73,6 +74,12 @@ anyhow = "1.0.103"
 toml = "1.1.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# app: bounds the in-memory adsbdb lookup cache (M3 item 3.4, `app::enrichment`) — the
+# hot-path front of the persistent `aircraft.fetched_at`/`lookup_failed_at` negative-cache
+# `crates/store` already carries. Lives in `app`, not `ingest`, because persisting a lookup's
+# result means calling `store::Writer`, and `ingest`/`store` may not depend on each other
+# (dependency direction above). Default features only.
+lru = "0.18.1"
 
 # dev-only. docs/10 §2 mandates wiremock for adapter tests: assert the request we send
 # (params, auth header, User-Agent), not just the parse of a canned reply.

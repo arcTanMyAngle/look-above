@@ -13,7 +13,13 @@ look-above-store.workspace = true
 look-above-render.workspace = true
 
 anyhow.workspace = true
+# `enrichment::EnrichmentSource` is dyn-compatible via async-trait, the same reason and shape
+# `core::contracts::LiveSource` already uses it — a fake, in-process implementation stands in
+# for `ingest::adsbdb::AdsbdbSource` in tests without needing a real HTTP client (which cannot
+# be pointed at a mock: `ingest`'s allowlist-widening constructors are `pub(crate)` on purpose).
+async-trait.workspace = true
 crossbeam-channel.workspace = true
+lru.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

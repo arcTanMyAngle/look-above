@@ -71,6 +71,23 @@ pub fn coastline_stroke_color(format: wgpu::TextureFormat) -> [f32; 4] {
     layer_color(COASTLINE_STROKE_SRGB, format)
 }
 
+/// The L0 density-dot color (M4 item 4.3), authored as nonlinear sRGB (`#FFFFFF`) with a low
+/// per-dot alpha — unlike [`layer_color`]'s usual opaque `1.0`, since the globe density pass's
+/// additive `BlendState` (`renderer.rs`) sums overlapping instances in the framebuffer: a low
+/// per-dot alpha is what lets a handful of dots over a busy region visibly out-brighten an
+/// isolated one — "brightness proportional to local count" (docs/01), not a fixed per-dot
+/// brightness regardless of traffic. Neither doc fixes a shade or an alpha; both are ours, tuned
+/// by eye (M4 item 4.3).
+const DENSITY_DOT_SRGB: [u8; 3] = [0xFF, 0xFF, 0xFF];
+const DENSITY_DOT_ALPHA: f32 = 0.25;
+
+/// The density-dot color as a shader-ready linear RGBA, alpha included (see
+/// [`DENSITY_DOT_ALPHA`]'s own doc comment on why it isn't opaque).
+pub fn density_dot_color(format: wgpu::TextureFormat) -> [f32; 4] {
+    let [r, g, b, _] = layer_color(DENSITY_DOT_SRGB, format);
+    [r, g, b, DENSITY_DOT_ALPHA]
+}
+
 fn layer_color(srgb: [u8; 3], format: wgpu::TextureFormat) -> [f32; 4] {
     let [r, g, b] = linearize_for_format(srgb, format);
     // `f64 as f32`: colors are 8-bit-per-channel sRGB run through a bounded transfer function,

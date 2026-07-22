@@ -30,6 +30,10 @@
 //!
 //! # aviationweather.gov: a comma-separated station id list. Keyless and free (NOAA).
 //! cargo run -p look-above-ingest --bin record-fixture -- aviationweather KJFK,KLAX,KORD metar_nominal
+//!
+//! # adsbdb: a hex (aircraft) or a callsign (route). Keyless and free.
+//! cargo run -p look-above-ingest --bin record-fixture -- adsbdb aircraft a1b2c3 aircraft_nominal
+//! cargo run -p look-above-ingest --bin record-fixture -- adsbdb callsign UAL123 callsign_nominal
 //! ```
 //!
 //! The file lands in `crates/ingest/tests/fixtures/<source>/<name>.json`. Re-record a
@@ -44,7 +48,7 @@ use look_above_ingest::http::{HttpClient, send_json};
 use look_above_ingest::opensky::states::STATES_ENDPOINT;
 use look_above_ingest::opensky::{Credentials, OpenSkyAuth};
 use look_above_ingest::point::MAX_RADIUS_NM;
-use look_above_ingest::{adsb_lol, airplanes_live};
+use look_above_ingest::{adsb_lol, adsbdb, airplanes_live};
 use serde_json::Value;
 
 /// The trim ceiling docs/10 §2 sets: fixtures carry a handful of records, never a live crowd.
@@ -90,27 +94,41 @@ enum Source {
     AirplanesLive,
     AdsbLol,
     AviationWeather,
+    /// `GET /v0/aircraft/{hex}` — one JSON object, not an array (see [`Source::records_key`]'s
+    /// own doc comment for why this variant, unlike every other one, is never truncated there).
+    AdsbdbAircraft,
+    /// `GET /v0/callsign/{callsign}` — same one-object shape as `AdsbdbAircraft`.
+    AdsbdbCallsign,
 }
 
 impl Source {
-    /// The fixture subdirectory, matching the existing layout.
+    /// The fixture subdirectory, matching the existing layout. Both adsbdb endpoints share one
+    /// directory (`adsbdb/`), same as the readsb fallbacks share `ingest::readsb`'s parser —
+    /// the CLI subcommand (`aircraft`/`callsign`) and the caller's own `<name>` are what keep
+    /// the two recordings apart on disk.
     fn dir(self) -> &'static str {
         match self {
             Source::OpenSky => "opensky",
             Source::AirplanesLive => "airplaneslive",
             Source::AdsbLol => "adsblol",
             Source::AviationWeather => "aviationweather",
+            Source::AdsbdbAircraft | Source::AdsbdbCallsign => "adsbdb",
         }
     }
 
     /// The top-level array holding the per-record array — `states` for `OpenSky`'s positional
     /// arrays, `ac` for the readsb feeds. `None` means the response body *is* the array
-    /// (`aviationweather.gov`'s METAR endpoint returns a bare JSON array, not an object).
+    /// (`aviationweather.gov`'s METAR endpoint returns a bare JSON array, not an object) — and,
+    /// for the two adsbdb variants, that the body is a single JSON *object*, not an array at
+    /// all: [`prepare`]'s array-truncation branch simply does not match a `Value::Object`, so
+    /// nothing is truncated (there is nothing to trim a lone object down to), and [`main`]
+    /// computes the printed count for these two variants separately rather than through
+    /// [`records_len`], which would otherwise report a real object as zero records.
     fn records_key(self) -> Option<&'static str> {
         match self {
             Source::OpenSky => Some("states"),
             Source::AirplanesLive | Source::AdsbLol => Some("ac"),
-            Source::AviationWeather => None,
+            Source::AviationWeather | Source::AdsbdbAircraft | Source::AdsbdbCallsign => None,
         }
     }
 }
@@ -129,13 +147,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             fetch_point(adsb_lol::POINT_ENDPOINT, &args).await?,
         ),
         Some("aviationweather") => (Source::AviationWeather, fetch_metar(&args).await?),
+        Some("adsbdb") => match args.get(1).map(String::as_str) {
+            Some("aircraft") => (Source::AdsbdbAircraft, fetch_adsbdb_aircraft(&args).await?),
+            Some("callsign") => (Source::AdsbdbCallsign, fetch_adsbdb_callsign(&args).await?),
+            _ => return Err(usage().into()),
+        },
         _ => return Err(usage().into()),
     };
 
     // Trim, then scrub — trimming first keeps the scrub off the discarded records.
     let name = out_name(&args)?;
     let prepared = prepare(body, source.records_key());
-    let kept = records_len(&prepared, source.records_key());
+    let kept = match source {
+        // A single object, not an array of records: "1" if adsbdb answered with something,
+        // "0" for a body that came back null (see each variant's own doc comment above).
+        Source::AdsbdbAircraft | Source::AdsbdbCallsign => usize::from(!prepared.is_null()),
+        _ => records_len(&prepared, source.records_key()),
+    };
     let path = write_fixture(source, name, &prepared)?;
 
     // Counts and a path only — never the payload (docs/06).
@@ -194,6 +222,20 @@ async fn fetch_metar(args: &[String]) -> Result<Value, Box<dyn Error>> {
         .get(look_above_ingest::metar::METAR_ENDPOINT)?
         .query(&[("ids", ids.as_str()), ("format", "json")]);
     Ok(send_json(request).await?)
+}
+
+/// `adsbdb aircraft <hex> <name>` — `GET /v0/aircraft/{hex}`, keyless.
+async fn fetch_adsbdb_aircraft(args: &[String]) -> Result<Value, Box<dyn Error>> {
+    let hex = args.get(2).ok_or_else(usage)?;
+    let url = format!("{}/aircraft/{hex}", adsbdb::BASE_URL);
+    Ok(send_json(HttpClient::new()?.get(&url)?).await?)
+}
+
+/// `adsbdb callsign <callsign> <name>` — `GET /v0/callsign/{callsign}`, keyless.
+async fn fetch_adsbdb_callsign(args: &[String]) -> Result<Value, Box<dyn Error>> {
+    let callsign = args.get(2).ok_or_else(usage)?;
+    let url = format!("{}/callsign/{callsign}", adsbdb::BASE_URL);
+    Ok(send_json(HttpClient::new()?.get(&url)?).await?)
 }
 
 /// Trim the record array to [`MAX_FIXTURE_RECORDS`], then scrub credential-shaped keys.
@@ -273,11 +315,14 @@ fn bbox_args(args: &[String]) -> Result<[f64; 4], Box<dyn Error>> {
 }
 
 /// The output name is always the argument after the region parameters — index 5 for the bbox
-/// source, index 4 for the point sources, index 2 for the METAR source (just a station list).
+/// source, index 4 for the point sources, index 2 for the METAR source (just a station list),
+/// index 3 for adsbdb (`adsbdb <aircraft|callsign> <id> <name>` — one more argument than the
+/// point sources' `<lat> <lon> <radius>`, since adsbdb takes a single id instead of three).
 fn out_name(args: &[String]) -> Result<&str, Box<dyn Error>> {
     let index = match args.first().map(String::as_str) {
         Some("opensky") => 5,
         Some("aviationweather") => 2,
+        Some("adsbdb") => 3,
         _ => 4,
     };
     args.get(index)
@@ -317,7 +362,9 @@ fn usage() -> String {
      record-fixture opensky <lamin> <lomin> <lamax> <lomax> <name>\n  \
      record-fixture airplaneslive <lat> <lon> <radius_nm> <name>\n  \
      record-fixture adsblol <lat> <lon> <radius_nm> <name>\n  \
-     record-fixture aviationweather <station,station,...> <name>"
+     record-fixture aviationweather <station,station,...> <name>\n  \
+     record-fixture adsbdb aircraft <hex> <name>\n  \
+     record-fixture adsbdb callsign <callsign> <name>"
         .to_owned()
 }
 
@@ -439,6 +486,26 @@ mod tests {
         assert_eq!(Source::AdsbLol.records_key(), Some("ac"));
         assert_eq!(Source::AviationWeather.dir(), "aviationweather");
         assert_eq!(Source::AviationWeather.records_key(), None);
+        assert_eq!(Source::AdsbdbAircraft.dir(), "adsbdb");
+        assert_eq!(Source::AdsbdbCallsign.dir(), "adsbdb");
+        assert_eq!(Source::AdsbdbAircraft.records_key(), None);
+        assert_eq!(Source::AdsbdbCallsign.records_key(), None);
+    }
+
+    /// adsbdb's response is one object, not a truncatable array: `prepare` must leave it
+    /// whole (there is nothing in it shaped like [`MAX_FIXTURE_RECORDS`] rows to trim), and the
+    /// printed count (computed in `main`, not through `records_len`) is 1 for any answered
+    /// object and 0 only for a literal JSON `null`.
+    #[test]
+    fn an_adsbdb_object_body_survives_prepare_untruncated() {
+        let body = json!({ "response": { "icao_type": "B738", "registration": "N12345" } });
+        let prepared = prepare(body.clone(), Source::AdsbdbAircraft.records_key());
+        assert_eq!(prepared, body, "a single object has nothing to truncate");
+        assert!(!prepared.is_null(), "an answered object is not null");
+        assert!(
+            Value::Null.is_null(),
+            "the not-found sentinel this crate checks for"
+        );
     }
 
     /// A name that could escape the fixtures directory is refused before any write.
@@ -465,6 +532,9 @@ mod tests {
 
         let metar = strings(&["aviationweather", "KJFK,KLAX", "metar_nominal"]);
         assert_eq!(out_name(&metar).expect("named"), "metar_nominal");
+
+        let adsbdb = strings(&["adsbdb", "aircraft", "a1b2c3", "aircraft_nominal"]);
+        assert_eq!(out_name(&adsbdb).expect("named"), "aircraft_nominal");
 
         let missing = strings(&["adsblol", "47", "8", "73"]);
         assert!(

@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use crate::error::{SourceError, StoreError};
-use crate::types::{BBox, Icao24, SourceId, StateVector, UnixSeconds};
+use crate::types::{BBox, CallSign, Icao24, SourceId, StateVector, UnixSeconds};
 
 /// What to ask a source for: a bounding box, or the whole world.
 ///
@@ -67,6 +67,26 @@ pub trait Store {
     /// enrichment is gated before lookup (privacy rule 2.2).
     fn upsert_aircraft_meta(&mut self, meta: &AircraftMeta) -> Result<(), StoreError>;
 
+    /// The cached airframe metadata row for `icao24`, or `None` if it has never been looked
+    /// up. Read side of [`upsert_aircraft_meta`](Self::upsert_aircraft_meta) — callers use
+    /// `fetched_at`/`lookup_failed_at` to decide whether a fresh adsbdb lookup is warranted
+    /// (M3 item 3.4's 24 h negative-cache gate).
+    fn aircraft_meta(&self, icao24: Icao24) -> Result<Option<AircraftMeta>, StoreError>;
+
+    /// Inserts one resolved flight/route observation (`flights` table, docs/08).
+    ///
+    /// A plain insert, not an upsert: M3 item 3.4 pulled this table forward from its
+    /// originally planned M5 milestone to back on-selection route caching (`DECISION_LOG`
+    /// 2026-07-21, M3 3.4), but the session-boundary merge M5's own "observed flights"
+    /// design implies (extending `last_seen`, detecting gaps via `positions`) still awaits
+    /// the `positions` table M5 brings. Each successful, non-cached adsbdb route lookup is
+    /// its own row.
+    fn insert_flight(&mut self, flight: &Flight) -> Result<(), StoreError>;
+
+    /// The most recently observed [`Flight`] row for `icao24` (highest `last_seen`), or
+    /// `None` if none has ever been recorded.
+    fn latest_flight(&self, icao24: Icao24) -> Result<Option<Flight>, StoreError>;
+
     /// Airports within `bbox` at or above `min_size` (see [`AirportSize`]).
     fn airports_in_bbox(
         &self,
@@ -120,6 +140,39 @@ pub enum AircraftCategory {
     /// Not yet looked up, or looked up and unclassified — both draw the fallback glyph.
     #[default]
     Unknown,
+}
+
+impl AircraftCategory {
+    /// The stable wire/DB spelling stored in `aircraft.category` (docs/08) — the inverse of
+    /// [`from_store_str`](Self::from_store_str). Same shape as
+    /// [`FlightCategory::as_str`](FlightCategory::as_str).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jet => "jet",
+            Self::Turboprop => "turboprop",
+            Self::Piston => "piston",
+            Self::Heli => "heli",
+            Self::Glider => "glider",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Maps `aircraft.category` (docs/08) back to a category. Unlike
+    /// [`FlightCategory::from_metar_str`](FlightCategory::from_metar_str), this never fails to
+    /// produce a value: `Unknown` is already this type's own documented catch-all for "not yet
+    /// looked up, or looked up and unclassified", so an unrecognized or foreign string (upstream
+    /// drift, or a value written by a future version) maps to `Unknown` rather than requiring
+    /// callers to handle a second "absent" case on top of it.
+    pub fn from_store_str(raw: &str) -> Self {
+        match raw {
+            "jet" => Self::Jet,
+            "turboprop" => Self::Turboprop,
+            "piston" => Self::Piston,
+            "heli" => Self::Heli,
+            "glider" => Self::Glider,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// An airport from the `OurAirports` import (`airports` table, docs/08). M3.
@@ -258,6 +311,24 @@ pub struct MetarBadge {
     pub category: FlightCategory,
 }
 
+/// One observed flight/route (`flights` table, docs/08) — adsbdb's callsign→route answer,
+/// cached against the icao24 that was selected when it was resolved. M3 item 3.4; see
+/// [`Store::insert_flight`]'s doc comment for why this is a plain insert per lookup rather
+/// than a merged session, and `DECISION_LOG` 2026-07-21 (M3 3.4) for why the table exists this
+/// early at all (docs/08 originally tagged it M5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Flight {
+    pub icao24: Icao24,
+    /// `None` when the feed reports no identity — mirrors [`StateVector::callsign`]
+    /// (`crate::types`), never populated for an anonymous target (privacy rule 2.2).
+    pub callsign: Option<CallSign>,
+    /// ICAO airport code, from adsbdb; best-effort, absent when adsbdb has no route on file.
+    pub origin: Option<String>,
+    pub destination: Option<String>,
+    pub first_seen: UnixSeconds,
+    pub last_seen: UnixSeconds,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +405,33 @@ mod tests {
     #[test]
     fn unlooked_up_aircraft_default_to_the_fallback_glyph() {
         assert_eq!(AircraftCategory::default(), AircraftCategory::Unknown);
+    }
+
+    #[test]
+    fn aircraft_category_as_str_round_trips_through_from_store_str() {
+        for category in [
+            AircraftCategory::Jet,
+            AircraftCategory::Turboprop,
+            AircraftCategory::Piston,
+            AircraftCategory::Heli,
+            AircraftCategory::Glider,
+            AircraftCategory::Unknown,
+        ] {
+            assert_eq!(
+                AircraftCategory::from_store_str(category.as_str()),
+                category
+            );
+        }
+    }
+
+    #[test]
+    fn aircraft_category_from_store_str_falls_back_to_unknown_for_unrecognized_values() {
+        for unrecognized in ["", "JET", "rocket", "N/A"] {
+            assert_eq!(
+                AircraftCategory::from_store_str(unrecognized),
+                AircraftCategory::Unknown
+            );
+        }
     }
 
     /// The traits must be usable as trait objects: the poller keeps a failover
