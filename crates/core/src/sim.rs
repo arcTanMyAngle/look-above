@@ -197,6 +197,16 @@ pub struct TrailVertex {
     /// one — the skill's "colored by the altitude ramp" per vertex, so a climbing aircraft's
     /// trail shows its real historical bands rather than one repeated current color.
     pub altitude_bucket: AltitudeBucket,
+    /// This sample's own altitude in feet, at the same full precision and same on-ground-or-
+    /// unknown-is-`None` convention as [`AircraftInstance::altitude_ft`] (M4 item 4.5 — the
+    /// perceptual ramp interpolates continuously by this value; `altitude_bucket` above stays for
+    /// callers that only need the named band).
+    pub altitude_ft: Option<f64>,
+    /// This sample's own on-ground state, at the time it was recorded — needed alongside
+    /// `altitude_ft` because a low-but-known `altitude_ft` while on the ground must still render
+    /// as the ramp's ground stop, not ease into the airborne interpolation (same rule
+    /// [`AltitudeBucket::classify`] already applies when computing `altitude_bucket`).
+    pub on_ground: bool,
     /// Seconds since this sample was recorded: 0 at the aircraft, up to [`TRAIL_DURATION_S`] at
     /// the tail. The render side derives width/alpha taper from this.
     pub age_s: f64,
@@ -554,6 +564,8 @@ impl Track {
                     sample.alt_known,
                     sample.alt_m,
                 ),
+                altitude_ft: sample.alt_known.then_some(sample.alt_m * FT_PER_M),
+                on_ground: sample.on_ground,
                 age_s: now_s - sample.t_s,
             })
             .collect()
@@ -1343,6 +1355,16 @@ mod tests {
             .expect("a sample");
         assert_eq!(oldest.altitude_bucket, AltitudeBucket::Below2000Ft);
         assert_eq!(newest.altitude_bucket, AltitudeBucket::To10000Ft);
+
+        // M4 item 4.5: the same per-sample precision AircraftInstance::altitude_ft carries, not
+        // just which bucket it lands in — the perceptual ramp interpolates continuously by this.
+        let oldest_ft = oldest.altitude_ft.expect("known altitude while airborne");
+        let newest_ft = newest.altitude_ft.expect("known altitude while airborne");
+        assert!(
+            newest_ft > oldest_ft,
+            "a climbing aircraft's later trail sample must carry a higher recorded altitude"
+        );
+        assert!(!oldest.on_ground && !newest.on_ground);
     }
 
     #[test]

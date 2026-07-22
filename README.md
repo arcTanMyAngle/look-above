@@ -124,14 +124,15 @@ Network I/O is `tokio` and lives only in `ingest`. Compute is `rayon`. The two
 talk through `crossbeam` channels. The render loop never blocks on either — a slow
 API call must never cost a frame.
 
-Five crates, and the dependencies only point one direction:
+Six crates, and the dependencies only point one direction:
 
 | Crate | Job | Knows about |
 |---|---|---|
-| [`core`](crates/core/) | Types, geo math, contracts | Nothing. No network, no DB, no GPU. |
-| [`ingest`](crates/ingest/) | Feed adapters, polling, budgets | `core` |
-| [`store`](crates/store/) | SQLite, migrations, writer thread | `core` |
-| [`render`](crates/render/) | wgpu pipelines, shaders, camera | `core` |
+| [`core`](crates/core/) | Types, geo math, contracts, sim, camera/LOD | Nothing. No network, no DB, no GPU. |
+| [`ingest`](crates/ingest/) | Feed adapters, polling, budgets, METAR, adsbdb | `core` |
+| [`store`](crates/store/) | SQLite, migrations, writer thread, enrichment tables | `core` |
+| [`render`](crates/render/) | wgpu pipelines, shaders, camera, LOD tiers, labels | `core` |
+| [`import`](crates/import/) | One-shot fetch/convert of bundled OurAirports + basemap data | `core` |
 | [`app`](crates/app/) | The binary: wiring, config, window | all of them |
 
 `core` staying ignorant is the load-bearing constraint. It's why the whole
@@ -141,21 +142,34 @@ vocabulary and both trait seams can be unit-tested without a socket or a GPU.
 
 ## Where it stands
 
-Honest answer: aircraft data flows and is deduplicated, but nothing is drawn yet.
+Honest answer: it draws the live sky. A native window renders real aircraft, in two
+view modes, with pixels changing under your cursor as you pan and zoom.
 
 - **Done — M0 (foundation):** the cargo workspace, pinned dependencies, the `core`
   vocabulary (`StateVector`, `Icao24`, `CallSign`, `BBox`), the `LiveSource` / `Store`
   trait seams, the geo math (haversine, initial bearing, destination point, Web
   Mercator forward and inverse), config loading, a native window, and CI.
-- **Done — M1 so far (live ingestion):** a shared HTTP client that enforces the host
-  allowlist, OpenSky OAuth2, and three live position sources normalized into one
-  `StateVector` stream — OpenSky `/states/all` (credit-metered) plus the keyless readsb
-  feeds airplanes.live and adsb.lol, all three verified against the real sky. On top of
-  them: a daily credit budget with a cadence controller, a failover poller, cross-source
-  dedup with sticky anonymity, and the fixture recorder below. 313 tests, all offline.
-- **Next — the rest of M1:** SQLite persistence, a headless mode that logs per-cycle
-  counts, then the milestone's supervised live run.
-- **Not yet** — no pixels. First frame is M2.
+- **Done — M1 (live ingestion):** a shared HTTP client that enforces the host allowlist,
+  OpenSky OAuth2, and live position sources normalized into one `StateVector` stream —
+  OpenSky `/states/all` (credit-metered) plus the keyless readsb feeds airplanes.live and
+  adsb.lol. A daily credit budget with a cadence controller, a failover poller,
+  cross-source dedup with sticky anonymity, SQLite persistence, and the fixture recorder
+  below.
+- **Done — M2 (renderer):** the wgpu surface, tessellated Natural Earth base map,
+  instanced heading-aware aircraft glyphs, rayon-parallel dead-reckoning/interpolation
+  feeding a double-buffered render path, and a pan/zoom regional (Web Mercator) camera.
+- **Done — M3 (enrichment):** OurAirports import (airports/runways into SQLite), METAR
+  polling with flight-category badges, adsbdb selection lookups behind the anonymity
+  gate, and the selection info card.
+- **In progress — M4 (dual-mode LOD & interaction):** the orthographic globe (L0) with
+  density rendering, L0↔L1↔L2 tier switching, the globe↔regional camera transition,
+  label collision culling, and the final altitude color ramp are in place and
+  live-verified. Two acceptance lines remain open: a tier-boundary cross-fade that still
+  reads as a pop rather than a fade, and a fresh 8,000+-aircraft global performance
+  reading (the last attempt was invalidated by an OpenSky failover mid-run). See
+  [plans/M4_DUAL_MODE_LOD_AND_INTERACTION.md](plans/M4_DUAL_MODE_LOD_AND_INTERACTION.md).
+- **Not yet** — position-history replay and the time scrubber (M5); settings UI, themes,
+  and packaging (M6).
 
 The truthful status always lives in [plans/CURRENT_STATUS.md](plans/CURRENT_STATUS.md),
 and every non-obvious decision, with its reasoning, is in
@@ -165,6 +179,43 @@ believe those.
 ---
 
 ## Running it
+
+### Quick start (no coding knowledge needed)
+
+Three steps, and step 1 only happens once.
+
+**1. Install Rust.** This gives your computer the tools it needs to build the app.
+Go to [rustup.rs](https://rustup.rs), download the installer for your operating
+system, and run it, accepting the defaults. (Windows note: the installer may ask you
+to also install "Visual Studio Build Tools" — say yes to that if prompted.)
+
+**2. Get the code.** Open a terminal (Windows: PowerShell; Mac/Linux: Terminal) and
+run:
+
+```sh
+git clone https://github.com/arcTanMyAngle/look-above.git
+cd look-above
+```
+
+**3. Run it:**
+
+```sh
+cargo run -p look-above
+```
+
+The first run downloads and builds everything, which can take several minutes and
+looks like nothing is happening — that's normal, let it finish. After that, a window
+opens and starts drawing real aircraft currently in the sky. No account, no API key,
+and no extra setup is required — it works immediately using free, keyless data feeds.
+Running it again later is fast, since the build is only redone when the code changes.
+
+To close the app, just close its window.
+
+*Optional:* a free [OpenSky Network](https://opensky-network.org) account gives the
+app a higher-coverage data source. Not required to use the app — see
+`config.example.toml` for how to add the credentials if you want them.
+
+### For developers
 
 ```sh
 cargo test --workspace     # all offline; the default

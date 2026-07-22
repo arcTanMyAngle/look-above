@@ -15,7 +15,9 @@
 //! letterboxed" scale — doubles as both the initial framing and the zoom-out ceiling; zooming
 //! out further would show empty space with nothing to fill it.
 
-use crate::geo::{MercatorXy, WEB_MERCATOR_EXTENT_M, web_mercator_inverse};
+use crate::geo::{
+    LatLon, MercatorXy, WEB_MERCATOR_EXTENT_M, web_mercator_forward, web_mercator_inverse,
+};
 use crate::types::BBox;
 
 /// An arbitrary conservative close-zoom floor. There is no aircraft content to zoom in on yet
@@ -164,6 +166,21 @@ impl Camera {
     /// inertia-coast velocity that [`Camera::update`] applies from here on.
     pub fn end_drag(&mut self) {
         self.is_dragging = false;
+    }
+
+    /// Hard-teleports the center to `latlon` and clears any in-flight pan inertia.
+    ///
+    /// M4 item 4.4a: this camera keeps receiving raw pointer input even while the globe camera
+    /// is the visible one (see `App::globe_camera`'s field doc in `crates/app/src/window.rs`),
+    /// but orthographic rotation and Mercator panning aren't the same geometry, so its
+    /// accumulated `center_m`/`velocity_m_per_s` can't be trusted to match where the user was
+    /// actually looking on the globe. Called once, at the moment the LOD tier leaves `Global`,
+    /// to snap this camera to the globe's sub-observer point instead. Clearing
+    /// `velocity_m_per_s` matters as much as setting `center_m`: any inertia carried over from
+    /// stale drag input would immediately coast the camera away from the point just landed on.
+    pub fn set_center_latlon(&mut self, latlon: LatLon) {
+        self.center_m = web_mercator_forward(latlon);
+        self.velocity_m_per_s = (0.0, 0.0);
     }
 
     /// Mouse-wheel zoom, anchored on the cursor: positive `notches` (scroll up/away) zooms in,
@@ -516,6 +533,36 @@ mod tests {
             }
         }
         assert!(snapped_to_zero, "velocity never snapped to exactly zero");
+    }
+
+    // --- set_center_latlon: M4 item 4.4a's globe->Mercator sync ------------------
+
+    #[test]
+    fn set_center_latlon_matches_the_forward_projection_of_the_same_point() {
+        let mut cam = Camera::new(1000, 800);
+        let latlon = LatLon {
+            lat_deg: 40.64,
+            lon_deg: -73.78,
+        };
+        cam.set_center_latlon(latlon);
+        let expected = web_mercator_forward(latlon);
+        assert_close(cam.center_m().x_m, expected.x_m, EPS_M);
+        assert_close(cam.center_m().y_m, expected.y_m, EPS_M);
+    }
+
+    #[test]
+    fn set_center_latlon_discards_any_in_flight_pan_inertia() {
+        let mut cam = Camera::new(1000, 800);
+        cam.begin_drag();
+        cam.drag_to(5.0, 0.0, 1.0 / 60.0);
+        cam.end_drag();
+        assert_ne!(cam.velocity_m_per_s, (0.0, 0.0));
+
+        cam.set_center_latlon(LatLon {
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+        });
+        assert_eq!(cam.velocity_m_per_s, (0.0, 0.0));
     }
 
     // --- viewport_bbox: M2 item 2.3b's poller retarget input ---------------------

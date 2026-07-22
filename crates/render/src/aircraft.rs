@@ -237,12 +237,12 @@ pub fn glyph_scale_normalized(meters_per_pixel: f64) -> f32 {
 
 /// Packs one `RenderFeed` aircraft into its GPU instance attributes: position narrowed to the
 /// normalized plane, heading converted to radians, category resolved to its atlas tile, and the
-/// altitude-bucket tint's alpha multiplied by the instance's own stale-fade `alpha` — the one
+/// altitude ramp tint's alpha multiplied by the instance's own stale-fade `alpha` — the one
 /// place those two independent alphas combine before reaching the shader.
 ///
-/// `tint_table` is indexed by [`color::altitude_bucket_index`] — built once per surface format
-/// in `renderer.rs` (the six colors don't change frame to frame, only which one applies).
-pub fn pack_instance(instance: &AircraftInstance, tint_table: &[[f32; 4]; 6]) -> InstanceRaw {
+/// `ramp` (M4 item 4.5's [`color::AltitudeRamp`]) is built once per surface format in
+/// `renderer.rs` — its per-instance cost here is a lerp plus one Oklab conversion, not a rebuild.
+pub fn pack_instance(instance: &AircraftInstance, ramp: &color::AltitudeRamp) -> InstanceRaw {
     let world_xy = world_xy_normalized(instance.position);
 
     #[allow(
@@ -259,7 +259,7 @@ pub fn pack_instance(instance: &AircraftInstance, tint_table: &[[f32; 4]; 6]) ->
     )]
     let category_index = glyph_atlas::category_index(instance.category) as f32;
 
-    let mut tint = tint_table[color::altitude_bucket_index(instance.altitude_bucket)];
+    let mut tint = ramp.tint(instance.on_ground, instance.altitude_ft);
     #[allow(
         clippy::cast_possible_truncation,
         reason = "core::sim already clamps alpha to (0, 1] before an instance ever reaches the \
@@ -331,7 +331,7 @@ fn pack_selection_outline_instance(instance: &AircraftInstance) -> InstanceRaw {
 /// (defensively; nothing in this crate requires exactly one) identically.
 pub fn pack_instances(
     aircraft: &[AircraftInstance],
-    tint_table: &[[f32; 4]; 6],
+    ramp: &color::AltitudeRamp,
     out: &mut Vec<InstanceRaw>,
 ) {
     out.clear();
@@ -344,7 +344,7 @@ pub fn pack_instances(
     out.extend(
         aircraft
             .iter()
-            .map(|instance| pack_instance(instance, tint_table)),
+            .map(|instance| pack_instance(instance, ramp)),
     );
 }
 
@@ -357,6 +357,13 @@ mod tests {
     use super::*;
 
     const EPS: f32 = 1e-5;
+
+    /// The altitude ramp used across these tests — its exact colors are `color`'s own concern
+    /// (see `color.rs`'s tests); here it's only a stand-in for "some real ramp", used to check
+    /// that `pack_instance`/`pack_instances` consult it correctly.
+    fn ramp() -> color::AltitudeRamp {
+        color::AltitudeRamp::new(wgpu::TextureFormat::Bgra8UnormSrgb)
+    }
 
     #[track_caller]
     fn assert_close2(actual: [f32; 2], expected: [f32; 2]) {
@@ -450,7 +457,7 @@ mod tests {
 
     #[test]
     fn pack_instance_carries_position_heading_category_and_folds_in_the_stale_fade_alpha() {
-        let opaque_white_table = [[1.0_f32, 1.0, 1.0, 1.0]; 6];
+        let ramp = ramp();
         let instance = AircraftInstance {
             icao24: some_icao(),
             position: MercatorXy::new(1_000.0, 2_000.0),
@@ -461,13 +468,13 @@ mod tests {
             on_ground: false,
             anonymous: false,
             callsign: None,
-            altitude_ft: None,
+            altitude_ft: Some(19_000.0),
             ground_speed_kt: None,
             selected: false,
             source: SourceId::OpenSky,
         };
 
-        let raw = pack_instance(&instance, &opaque_white_table);
+        let raw = pack_instance(&instance, &ramp);
 
         #[allow(
             clippy::cast_possible_truncation,
@@ -487,20 +494,21 @@ mod tests {
         )]
         let expected_category_index = glyph_atlas::category_index(AircraftCategory::Heli) as f32;
         assert!((raw.category_index - expected_category_index).abs() < 1e-6);
+
+        let ramp_tint = ramp.tint(instance.on_ground, instance.altitude_ft);
         assert!(
-            (raw.tint[3] - 0.5).abs() < 1e-6,
+            (raw.tint[3] - ramp_tint[3] * 0.5).abs() < 1e-6,
             "the instance's stale-fade alpha must reach the packed tint"
         );
         assert!(
-            (raw.tint[0] - 1.0).abs() < 1e-6,
-            "rgb passes through the tint table untouched"
+            (raw.tint[0] - ramp_tint[0]).abs() < 1e-6,
+            "rgb comes from the altitude ramp, untouched by the fade"
         );
     }
 
     #[test]
-    fn pack_instance_selects_the_tint_table_entry_for_its_altitude_bucket() {
-        let mut table = [[0.0_f32; 4]; 6];
-        table[color::altitude_bucket_index(AltitudeBucket::Above40000Ft)] = [0.5, 0.6, 0.7, 1.0];
+    fn pack_instance_gets_its_rgb_from_the_altitude_ramp() {
+        let ramp = ramp();
         let instance = AircraftInstance {
             icao24: some_icao(),
             position: MercatorXy::new(0.0, 0.0),
@@ -511,21 +519,21 @@ mod tests {
             on_ground: false,
             anonymous: false,
             callsign: None,
-            altitude_ft: None,
+            altitude_ft: Some(45_000.0),
             ground_speed_kt: None,
             selected: false,
             source: SourceId::OpenSky,
         };
 
-        let raw = pack_instance(&instance, &table);
-        assert!((raw.tint[0] - 0.5).abs() < 1e-6);
-        assert!((raw.tint[1] - 0.6).abs() < 1e-6);
-        assert!((raw.tint[2] - 0.7).abs() < 1e-6);
+        let raw = pack_instance(&instance, &ramp);
+        let expected = ramp.tint(false, Some(45_000.0));
+        assert!((raw.tint[0] - expected[0]).abs() < 1e-6);
+        assert!((raw.tint[1] - expected[1]).abs() < 1e-6);
+        assert!((raw.tint[2] - expected[2]).abs() < 1e-6);
     }
 
     #[test]
     fn pack_instance_leaves_scale_mul_at_one() {
-        let opaque_white_table = [[1.0_f32; 4]; 6];
         let instance = AircraftInstance {
             icao24: some_icao(),
             position: MercatorXy::new(0.0, 0.0),
@@ -541,7 +549,7 @@ mod tests {
             selected: true,
             source: SourceId::OpenSky,
         };
-        assert!((pack_instance(&instance, &opaque_white_table).scale_mul - 1.0).abs() < 1e-9);
+        assert!((pack_instance(&instance, &ramp()).scale_mul - 1.0).abs() < 1e-9);
     }
 
     // ---- Selection outline (M2 item 2.8b) --------------------------------------------------------
@@ -582,7 +590,7 @@ mod tests {
             "the outline must be larger than a normal glyph"
         );
 
-        let normal = pack_instance(&instance, &[[0.0; 4]; 6]);
+        let normal = pack_instance(&instance, &ramp());
         assert_eq!(raw.world_xy, normal.world_xy);
         assert!((raw.heading_rad - normal.heading_rad).abs() < 1e-6);
         assert!((raw.category_index - normal.category_index).abs() < 1e-6);
@@ -595,9 +603,8 @@ mod tests {
         plain.icao24 = Icao24::from_hex("111111").expect("valid test ICAO24");
         let selected = selected_instance();
 
-        let table = [[0.2_f32; 4]; 6];
         let mut out = Vec::new();
-        pack_instances(&[plain, selected], &table, &mut out);
+        pack_instances(&[plain, selected], &ramp(), &mut out);
 
         // One outline (the selected aircraft only) plus two normal glyphs (one per aircraft).
         assert_eq!(out.len(), 3);
@@ -619,7 +626,7 @@ mod tests {
         let mut instance = selected_instance();
         instance.selected = false;
         let mut out = Vec::new();
-        pack_instances(&[instance], &[[0.0; 4]; 6], &mut out);
+        pack_instances(&[instance], &ramp(), &mut out);
         assert_eq!(out.len(), 1);
         assert!((out[0].scale_mul - 1.0).abs() < 1e-9);
     }
@@ -627,9 +634,9 @@ mod tests {
     #[test]
     fn pack_instances_reuses_the_output_buffer() {
         let mut out = Vec::new();
-        pack_instances(&[selected_instance()], &[[0.0; 4]; 6], &mut out);
+        pack_instances(&[selected_instance()], &ramp(), &mut out);
         assert_eq!(out.len(), 2);
-        pack_instances(&[], &[[0.0; 4]; 6], &mut out);
+        pack_instances(&[], &ramp(), &mut out);
         assert!(out.is_empty());
     }
 

@@ -15,8 +15,8 @@
 //! each joint are shared between the two adjacent segments (one vertex, one color, one alpha), so
 //! the ribbon has no gap and — crucially for an alpha-blended pass — no double-blended overlap at
 //! joints. Width and alpha both **taper** front-to-tail with each sample's age (the skill's
-//! "3 px → 0.5 px, alpha 0.8 → 0"), and each vertex is altitude-ramp colored from 2.6a's
-//! per-sample `altitude_bucket`.
+//! "3 px → 0.5 px, alpha 0.8 → 0"), and each vertex is altitude-ramp colored (M4 item 4.5's
+//! continuous Oklab interpolation, [`color::AltitudeRamp`]) from 2.6a's per-sample `altitude_ft`.
 //!
 //! Draw order (docs/01): map base → map lines → **trails** → aircraft glyphs → labels → UI. The
 //! trail pass runs *before* the aircraft pass so a glyph is never occluded by its own trail.
@@ -135,11 +135,11 @@ pub fn half_width_normalized(width_px: f64, meters_per_pixel: f64) -> f32 {
 /// (cleared first, its capacity reused frame to frame per ADR-002's no-per-frame-allocation rule).
 ///
 /// `trails` is grouped contiguously per aircraft (2.6a's invariant); this walks those runs and
-/// builds one continuous ribbon per aircraft. `tint_table` is the six altitude-bucket tints for
-/// the surface format, indexed by [`color::altitude_bucket_index`] (built once in `renderer.rs`).
+/// builds one continuous ribbon per aircraft. `ramp` is the Oklab altitude ramp for the surface
+/// format (M4 item 4.5, [`color::AltitudeRamp`] — built once in `renderer.rs`).
 pub fn tessellate_trails(
     trails: &[TrailVertex],
-    tint_table: &[[f32; 4]; 6],
+    ramp: &color::AltitudeRamp,
     meters_per_pixel: f64,
     out: &mut Vec<TrailVertexRaw>,
 ) {
@@ -151,7 +151,7 @@ pub fn tessellate_trails(
         while end < trails.len() && trails[end].icao24 == icao {
             end += 1;
         }
-        tessellate_run(&trails[start..end], tint_table, meters_per_pixel, out);
+        tessellate_run(&trails[start..end], ramp, meters_per_pixel, out);
         start = end;
     }
 }
@@ -160,13 +160,14 @@ pub fn tessellate_trails(
 struct RibbonPoint {
     xy: [f64; 2],
     age_s: f64,
-    bucket_index: usize,
+    on_ground: bool,
+    altitude_ft: Option<f64>,
 }
 
 /// Tessellates one aircraft's contiguous run of samples into a continuous ribbon.
 fn tessellate_run(
     run: &[TrailVertex],
-    tint_table: &[[f32; 4]; 6],
+    ramp: &color::AltitudeRamp,
     meters_per_pixel: f64,
     out: &mut Vec<TrailVertexRaw>,
 ) {
@@ -188,7 +189,8 @@ fn tessellate_run(
         points.push(RibbonPoint {
             xy,
             age_s: vertex.age_s,
-            bucket_index: color::altitude_bucket_index(vertex.altitude_bucket),
+            on_ground: vertex.on_ground,
+            altitude_ft: vertex.altitude_ft,
         });
     }
     // A single distinct point (or none) is a dot, not a ribbon — nothing to widen.
@@ -237,7 +239,7 @@ fn tessellate_run(
             ]);
         }
 
-        let mut color = tint_table[point.bucket_index];
+        let mut color = ramp.tint(point.on_ground, point.altitude_ft);
         color[3] = taper_alpha(point.age_s);
         colors.push(color);
     }
@@ -305,28 +307,33 @@ mod tests {
 
     use super::*;
 
+    /// The ramp used across these tests — its exact colors don't matter here, only that
+    /// [`tessellate_run`] consults it per-vertex rather than reusing one color for a whole run.
+    fn ramp() -> color::AltitudeRamp {
+        color::AltitudeRamp::new(wgpu::TextureFormat::Bgra8UnormSrgb)
+    }
+
     fn hex(s: &str) -> Icao24 {
         Icao24::from_hex(s).expect("valid ICAO24 in test")
     }
 
-    /// A tint table whose entries are distinguishable by their red channel, so a vertex's color
-    /// can be traced back to the bucket it was classified into.
-    fn probe_table() -> [[f32; 4]; 6] {
-        let mut table = [[0.0_f32; 4]; 6];
-        for (index, row) in table.iter_mut().enumerate() {
-            #[allow(clippy::cast_precision_loss, reason = "index is 0..=5, exact in f32")]
-            let r = index as f32 / 10.0;
-            *row = [r, 0.2, 0.3, 1.0];
-        }
-        table
-    }
-
-    /// A trail vertex on the equator `x_m` metres east, `age_s` old, in `bucket`.
-    fn vertex(icao: &str, x_m: f64, age_s: f64, bucket: AltitudeBucket) -> TrailVertex {
+    /// A trail vertex on the equator `x_m` metres east, `age_s` old, at `altitude_ft` (or on the
+    /// ground/unknown if `None`). `altitude_bucket` is filled with a placeholder — tessellation
+    /// (M4 item 4.5) colors purely from `on_ground`/`altitude_ft` now, so the bucket itself is
+    /// inert here, kept only because [`TrailVertex`] still carries it for other consumers.
+    fn vertex(
+        icao: &str,
+        x_m: f64,
+        age_s: f64,
+        on_ground: bool,
+        altitude_ft: Option<f64>,
+    ) -> TrailVertex {
         TrailVertex {
             icao24: hex(icao),
             position: MercatorXy::new(x_m, 0.0),
-            altitude_bucket: bucket,
+            altitude_bucket: AltitudeBucket::Ground,
+            altitude_ft,
+            on_ground,
             age_s,
         }
     }
@@ -375,12 +382,12 @@ mod tests {
         // Three samples moving due east; oldest first (the feed's order), ages decreasing to the
         // head at age 0.
         let trails = vec![
-            vertex("3c6444", 0.0, 100.0, AltitudeBucket::To28000Ft),
-            vertex("3c6444", 20_000.0, 50.0, AltitudeBucket::To28000Ft),
-            vertex("3c6444", 40_000.0, 0.0, AltitudeBucket::To28000Ft),
+            vertex("3c6444", 0.0, 100.0, false, Some(19_000.0)),
+            vertex("3c6444", 20_000.0, 50.0, false, Some(19_000.0)),
+            vertex("3c6444", 40_000.0, 0.0, false, Some(19_000.0)),
         ];
         let mut out = Vec::new();
-        tessellate_trails(&trails, &probe_table(), mpp, &mut out);
+        tessellate_trails(&trails, &ramp(), mpp, &mut out);
 
         // Two segments × two triangles × three vertices.
         assert_eq!(out.len(), 12);
@@ -424,20 +431,25 @@ mod tests {
         reason = "test expectations narrow the same metres-to-normalized-plane value tessellate \
                   itself narrows"
     )]
-    fn head_vertices_are_more_opaque_and_colored_by_their_own_bucket() {
+    fn head_vertices_are_more_opaque_and_colored_by_their_own_altitude() {
         let mpp = 5_000.0;
-        let table = probe_table();
-        // Head sample in a high band, tail sample on the ground — different buckets, so the
+        let ramp = ramp();
+        // Head sample high and airborne, tail sample on the ground — distinct altitudes, so the
         // per-vertex coloring (not one repeated color) is observable.
         let trails = vec![
-            vertex("3c6444", 0.0, 100.0, AltitudeBucket::Ground),
-            vertex("3c6444", 40_000.0, 0.0, AltitudeBucket::Above40000Ft),
+            vertex("3c6444", 0.0, 100.0, true, Some(0.0)),
+            vertex("3c6444", 40_000.0, 0.0, false, Some(45_000.0)),
         ];
         let mut out = Vec::new();
-        tessellate_trails(&trails, &table, mpp, &mut out);
+        tessellate_trails(&trails, &ramp, mpp, &mut out);
 
-        let ground_r = table[color::altitude_bucket_index(AltitudeBucket::Ground)][0];
-        let high_r = table[color::altitude_bucket_index(AltitudeBucket::Above40000Ft)][0];
+        let ground_rgb = ramp.tint(true, Some(0.0));
+        let high_rgb = ramp.tint(false, Some(45_000.0));
+        assert_ne!(
+            ground_rgb[0], high_rgb[0],
+            "the two samples must resolve to visibly different colors for this test to be \
+             meaningful"
+        );
 
         let x_head = (40_000.0_f64 / WEB_MERCATOR_EXTENT_M) as f32;
         let head: Vec<_> = out
@@ -449,15 +461,15 @@ mod tests {
 
         for v in head {
             assert!(
-                (v.color[0] - high_r).abs() < 1e-6,
-                "head not its own bucket color"
+                (v.color[0] - high_rgb[0]).abs() < 1e-6,
+                "head not its own altitude's color"
             );
             assert!((v.color[3] - taper_alpha(0.0)).abs() < 1e-6);
         }
         for v in tail {
             assert!(
-                (v.color[0] - ground_r).abs() < 1e-6,
-                "tail not its own bucket color"
+                (v.color[0] - ground_rgb[0]).abs() < 1e-6,
+                "tail not its own altitude's color"
             );
             assert!((v.color[3] - taper_alpha(100.0)).abs() < 1e-6);
             assert!(
@@ -469,9 +481,9 @@ mod tests {
 
     #[test]
     fn a_single_sample_run_produces_no_geometry() {
-        let trails = vec![vertex("3c6444", 0.0, 0.0, AltitudeBucket::To10000Ft)];
+        let trails = vec![vertex("3c6444", 0.0, 0.0, false, Some(6_000.0))];
         let mut out = Vec::new();
-        tessellate_trails(&trails, &probe_table(), 5_000.0, &mut out);
+        tessellate_trails(&trails, &ramp(), 5_000.0, &mut out);
         assert!(out.is_empty(), "a lone point is a dot, not a ribbon");
     }
 
@@ -479,12 +491,12 @@ mod tests {
     fn a_stationary_run_of_coincident_samples_produces_no_geometry() {
         // On-ground/holding: repeated identical displayed positions, distinct ages.
         let trails = vec![
-            vertex("3c6444", 1_000.0, 20.0, AltitudeBucket::Ground),
-            vertex("3c6444", 1_000.0, 10.0, AltitudeBucket::Ground),
-            vertex("3c6444", 1_000.0, 0.0, AltitudeBucket::Ground),
+            vertex("3c6444", 1_000.0, 20.0, true, Some(0.0)),
+            vertex("3c6444", 1_000.0, 10.0, true, Some(0.0)),
+            vertex("3c6444", 1_000.0, 0.0, true, Some(0.0)),
         ];
         let mut out = Vec::new();
-        tessellate_trails(&trails, &probe_table(), 5_000.0, &mut out);
+        tessellate_trails(&trails, &ramp(), 5_000.0, &mut out);
         assert!(
             out.is_empty(),
             "coincident samples collapse to one distinct point, so no ribbon"
@@ -496,21 +508,21 @@ mod tests {
         let mpp = 5_000.0;
         // Two aircraft, each a straight two-sample run: two segments total → 12 vertices.
         let trails = vec![
-            vertex("3c6444", 0.0, 10.0, AltitudeBucket::To10000Ft),
-            vertex("3c6444", 20_000.0, 0.0, AltitudeBucket::To10000Ft),
-            vertex("4b1815", 0.0, 10.0, AltitudeBucket::To28000Ft),
-            vertex("4b1815", 20_000.0, 0.0, AltitudeBucket::To28000Ft),
+            vertex("3c6444", 0.0, 10.0, false, Some(6_000.0)),
+            vertex("3c6444", 20_000.0, 0.0, false, Some(6_000.0)),
+            vertex("4b1815", 0.0, 10.0, false, Some(19_000.0)),
+            vertex("4b1815", 20_000.0, 0.0, false, Some(19_000.0)),
         ];
         let mut both = Vec::new();
-        tessellate_trails(&trails, &probe_table(), mpp, &mut both);
+        tessellate_trails(&trails, &ramp(), mpp, &mut both);
         assert_eq!(both.len(), 12);
 
         // The count is exactly the sum of the two runs tessellated alone — the run boundary is
         // respected (no phantom segment stitching one aircraft's tail to the next one's head).
         let mut first = Vec::new();
-        tessellate_trails(&trails[..2], &probe_table(), mpp, &mut first);
+        tessellate_trails(&trails[..2], &ramp(), mpp, &mut first);
         let mut second = Vec::new();
-        tessellate_trails(&trails[2..], &probe_table(), mpp, &mut second);
+        tessellate_trails(&trails[2..], &ramp(), mpp, &mut second);
         assert_eq!(both.len(), first.len() + second.len());
     }
 
@@ -518,13 +530,13 @@ mod tests {
     fn tessellate_reuses_the_output_buffer() {
         let mut out = Vec::new();
         let trails = vec![
-            vertex("3c6444", 0.0, 10.0, AltitudeBucket::To10000Ft),
-            vertex("3c6444", 20_000.0, 0.0, AltitudeBucket::To10000Ft),
+            vertex("3c6444", 0.0, 10.0, false, Some(6_000.0)),
+            vertex("3c6444", 20_000.0, 0.0, false, Some(6_000.0)),
         ];
-        tessellate_trails(&trails, &probe_table(), 5_000.0, &mut out);
+        tessellate_trails(&trails, &ramp(), 5_000.0, &mut out);
         assert_eq!(out.len(), 6);
         // A second call clears rather than appends — no per-frame growth (ADR-002).
-        tessellate_trails(&[], &probe_table(), 5_000.0, &mut out);
+        tessellate_trails(&[], &ramp(), 5_000.0, &mut out);
         assert!(out.is_empty());
     }
 }

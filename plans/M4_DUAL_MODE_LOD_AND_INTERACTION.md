@@ -86,13 +86,43 @@ Two more open items feed into this milestone rather than being new discoveries:
       panic path remains (e.g. mid-transition), record it as a reopened blocker rather than
       silently re-carrying it. Acceptance: docs/13 §L1/L0 lines 1, 4, 5 (continuous zoom
       cross-fade; L0 density honesty; 8,000+ aircraft global at p95 < 16.6 ms via frame-stats
-      overlay).
-- [ ] 4.5 Perceptual altitude ramp (`render`): replace `color.rs`'s six flat per-bucket tints with
-      Oklab interpolation between the same six stops, continuous by altitude value rather than
-      discrete bucket (the comment at `color.rs:84-88` already scopes this). Acceptance: docs/13
-      accessibility line — ramp ordering survives a deuteranopia simulation; existing
-      `altitude_bucket_tint*` unit tests updated to check interpolated continuity, not just the
-      six discrete stops.
+      overlay). Gating/cross-fade code implemented (`renderer.rs`, `aircraft.wgsl`,
+      `trail.rs`/`label.rs` alpha multipliers), workspace-clean; buffer blocker verified resolved
+      (reached ~12,500 tracked at Global, no panic, twice). Still open after two live passes: (a)
+      pop-free cross-fade — owner reports popping still occurring at both tier boundaries; no
+      gating/tint logic bug found on inspection, leading suspicion is `TIER_BLEND_EASE_TAU_S`'s
+      front-loaded exponential ease reading as a snap rather than a fade (owner declined an
+      experimental fix this session — see `DECISION_LOG` 2026-07-22); (b) the 8,000+-aircraft p95
+      line — attempted this session but the run's OpenSky call failed over to `airplaneslive`
+      (250 nm radius cap, only 3–5 aircraft), so no valid reading exists yet.
+- [x] 4.4a Camera-sync follow-up (`app`): `window.rs` feeds every wheel/drag input to both
+      `Camera` (Mercator) and `GlobeCamera` unconditionally (4.3's deliberate design), but nothing
+      keeps their *centers* aligned, so navigating via the globe doesn't reliably land the Mercator
+      camera — the one that actually decides `LodTier` and renders aircraft/trail/label — on the
+      same place. Confirmed live during 4.4 verification: a retargeted-bbox log showed ~1,000+ km
+      span at a point the owner believed was a runway-level Regional zoom. Fix: re-center the
+      Mercator camera to the globe's sub-observer point as tier leaves `Global` (`Camera::
+      set_center_latlon`, `crates/core/src/camera.rs`; called once from `App::draw`,
+      `crates/app/src/window.rs`). Not a 4.4 regression — pre-existing since 4.3, newly visible now
+      that tiers render differently. Acceptance met: live-pass log shows a globe-driven zoom onto
+      Sardinia/southern Italy landing a ~91 km × 132 km bbox (well under the 300 km Regional
+      threshold) at that exact real location, matching screenshots of full Regional-tier rendering
+      there — see `DECISION_LOG` 2026-07-22.
+- [x] 4.5 Perceptual altitude ramp (`render`): `color::AltitudeRamp` replaces the six flat
+      per-bucket tints with Oklab interpolation between the same six stops, anchored at each
+      bucket's midpoint altitude and continuous by the aircraft's/trail-sample's actual altitude
+      (`AircraftInstance`/new `TrailVertex::altitude_ft`+`on_ground` fields) rather than snapping
+      at a discrete bucket. Built once per surface format (mirrors the old tint-table shape);
+      per-instance/per-vertex cost is a lerp plus one inverse-only Oklab conversion. A real,
+      previously-unverified gap surfaced while writing the deuteranopia test: the M2/M3-authored
+      stops' Oklab lightness peaked at `To10000Ft` and declined afterward, so it could never have
+      passed docs/13's monotonic-lightness line — owner chose (asked directly, not assumed) to
+      nudge each stop's lightness by the minimal-L2-distance monotonic correction (isotonic
+      regression, hue/chroma unchanged), not a free re-authoring; see `DECISION_LOG` 2026-07-22.
+      Acceptance met: docs/13 accessibility line now covered by an automated deuteranopia-
+      simulation test; former `altitude_bucket_tint*` tests replaced with continuity/anchor/clamp/
+      range coverage for the new ramp. Full workspace fmt/clippy/`test --workspace` clean (684
+      passed across all crates, 8 ignored in `ingest`).
 - [ ] 4.6 Emergency squawk plumbing + styling (`ingest`, `core`, `render`): surface the squawk
       code already present in the raw ADS-B feed JSON (confirmed unused past ingest — see
       `crates/ingest/src/opensky/states.rs` and the adsblol/airplaneslive fixtures) through

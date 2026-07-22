@@ -529,10 +529,9 @@ struct AircraftLayer {
     quad_index_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
-    /// The six altitude-bucket tints for this renderer's surface format, built once (`renderer`
-    /// never changes format after `Renderer::new`) — see
-    /// [`color::altitude_bucket_tint_table`].
-    tint_table: [[f32; 4]; 6],
+    /// The Oklab altitude ramp for this renderer's surface format (M4 item 4.5), built once
+    /// (`renderer` never changes format after `Renderer::new`) — see [`color::AltitudeRamp`].
+    altitude_ramp: color::AltitudeRamp,
     /// Reused every frame so packing an instance list never allocates once capacity has warmed
     /// up (ADR-002: no per-frame allocation in the render loop) — cleared and refilled in
     /// [`AircraftLayer::upload_instances`], not reallocated.
@@ -542,12 +541,16 @@ struct AircraftLayer {
 impl AircraftLayer {
     /// Rewrites the glyph's constant screen-space size for this frame — see
     /// [`aircraft::glyph_scale_normalized`]'s doc comment for why this must be recomputed every
-    /// frame rather than once at startup (it depends on the camera's current zoom).
-    fn set_glyph_scale(&self, queue: &wgpu::Queue, glyph_scale: f32) {
+    /// frame rather than once at startup (it depends on the camera's current zoom) — and, from M4
+    /// item 4.4, `alpha_multiplier` alongside it: the glyph-vs-density-dot cross-fade's glyph-side
+    /// half (`aircraft.wgsl`'s `fs_main` multiplies its output alpha by this same uniform's `.y`),
+    /// fed `record_draw_passes`'s own `mercator_fade_multiplier` — see that call site's comment
+    /// for why reusing it (rather than a second blend) is deliberate.
+    fn set_glyph_scale(&self, queue: &wgpu::Queue, glyph_scale: f32, alpha_multiplier: f32) {
         queue.write_buffer(
             &self.glyph_params_buffer,
             0,
-            bytemuck::bytes_of(&[glyph_scale, 0.0_f32, 0.0, 0.0]),
+            bytemuck::bytes_of(&[glyph_scale, alpha_multiplier, 0.0, 0.0]),
         );
     }
 
@@ -561,7 +564,7 @@ impl AircraftLayer {
         queue: &wgpu::Queue,
         aircraft: &[AircraftInstance],
     ) -> u32 {
-        aircraft::pack_instances(aircraft, &self.tint_table, &mut self.instance_scratch);
+        aircraft::pack_instances(aircraft, &self.altitude_ramp, &mut self.instance_scratch);
 
         if self.instance_scratch.len() > self.instance_capacity {
             let new_capacity = self
@@ -616,9 +619,10 @@ impl AircraftLayer {
 
 /// The L0 density-dot pass's GPU resources (M4 item 4.3) — a screen-constant, additively-blended
 /// quad per visible aircraft, drawn right after the aircraft-glyph pass (see
-/// [`Renderer::record_draw_passes`]'s draw-order comment). *Not* gated against
-/// [`AircraftLayer`]'s own draw here — both draw unconditionally today; cross-fading glyphs vs.
-/// density dots by LOD tier is 4.4's job, not this item's (see the M4 plan's own 4.3 entry).
+/// [`Renderer::record_draw_passes`]'s draw-order comment). Its own fragment shader already fades
+/// this pass in via `globe.blend.x` (`density.wgsl`); from M4 item 4.4, [`AircraftLayer`]'s draw
+/// fades out over that same rise (`record_draw_passes`'s own `mercator_fade_multiplier` reuse),
+/// completing the cross-fade this doc comment used to flag as still outstanding.
 ///
 /// Shares [`Renderer`]'s `globe_view_proj_bind_group` for its own `@group(0)` — the same shared-
 /// bind-group shape [`GlobeBasemapLayer`] uses, since both are globe-space passes reading the
@@ -725,9 +729,9 @@ struct TrailLayer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
-    /// The six altitude-bucket tints for this renderer's surface format, built once (see
-    /// [`color::altitude_bucket_tint_table`]) — the same table the aircraft pass uses.
-    tint_table: [[f32; 4]; 6],
+    /// The Oklab altitude ramp for this renderer's surface format (M4 item 4.5, see
+    /// [`color::AltitudeRamp`]) — the same ramp the aircraft pass uses.
+    altitude_ramp: color::AltitudeRamp,
     /// Reused every frame so tessellating a feed's trails never allocates once capacity has warmed
     /// up (ADR-002) — cleared and refilled by [`trail::tessellate_trails`], not reallocated.
     vertex_scratch: Vec<TrailVertexRaw>,
@@ -736,19 +740,30 @@ struct TrailLayer {
 impl TrailLayer {
     /// Tessellates `trails` into this frame's ribbon vertices, growing the GPU buffer first if the
     /// frame produced more than it currently holds. Returns the vertex count to draw.
+    ///
+    /// `alpha_multiplier` (M4 item 4.4) scales every vertex's already-taper-baked alpha by this
+    /// frame's Regional-tier cross-fade — see `record_draw_passes`'s own call-site comment. A
+    /// second, cheap linear pass over `vertex_scratch` rather than a shader uniform (unlike
+    /// `AircraftLayer`'s `glyph_params`): trail color/alpha is CPU-baked per vertex already (this
+    /// module's own doc comment on why), so there is no per-frame uniform for a shader to read
+    /// this multiplier from.
     fn upload_trails(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         trails: &[TrailVertex],
         meters_per_pixel: f64,
+        alpha_multiplier: f32,
     ) -> u32 {
         trail::tessellate_trails(
             trails,
-            &self.tint_table,
+            &self.altitude_ramp,
             meters_per_pixel,
             &mut self.vertex_scratch,
         );
+        for vertex in &mut self.vertex_scratch {
+            vertex.color[3] *= alpha_multiplier;
+        }
 
         if self.vertex_scratch.len() > self.vertex_capacity {
             let new_capacity = self
@@ -867,15 +882,20 @@ impl LabelLayer {
     /// Split into [`LabelLayer::refresh_placements`] (the ≤ 5 Hz decision) and
     /// [`LabelLayer::upload`] (packing + GPU upload) purely to stay under clippy's line-count
     /// lint — the two are only ever called back to back, here.
+    ///
+    /// `alpha_multiplier` (M4 item 4.4) is the Regional-tier cross-fade — see
+    /// `record_draw_passes`'s own call-site comment; threaded straight through to
+    /// [`LabelLayer::upload`].
     fn update(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         feed: &RenderFeed,
         camera: &Camera,
+        alpha_multiplier: f32,
     ) -> (u32, u32) {
         self.refresh_placements(feed, camera);
-        self.upload(device, queue)
+        self.upload(device, queue, alpha_multiplier)
     }
 
     /// The ≤ 5 Hz-with-hysteresis re-evaluation, or (between evaluations) a cheap per-frame
@@ -943,15 +963,36 @@ impl LabelLayer {
 
     /// Packs [`LabelLayer::cached_placements`] into this frame's GPU buffers, growing them first
     /// if needed, and returns `(text_instance_count, leader_vertex_count)` to draw.
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> (u32, u32) {
+    ///
+    /// `alpha_multiplier` scales `text_color`/`leader_color`'s alpha for this frame only — the
+    /// stored fields themselves stay at their authored, fully-opaque value, the same
+    /// never-mutate-the-baseline shape [`BasemapLayer::set_alpha_multiplier`] uses.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        alpha_multiplier: f32,
+    ) -> (u32, u32) {
+        let text_color = [
+            self.text_color[0],
+            self.text_color[1],
+            self.text_color[2],
+            self.text_color[3] * alpha_multiplier,
+        ];
+        let leader_color = [
+            self.leader_color[0],
+            self.leader_color[1],
+            self.leader_color[2],
+            self.leader_color[3] * alpha_multiplier,
+        ];
         label::pack_text_instances(
             &self.cached_placements,
-            self.text_color,
+            text_color,
             &mut self.text_instance_scratch,
         );
         label::pack_leader_vertices(
             &self.cached_placements,
-            self.leader_color,
+            leader_color,
             &mut self.leader_vertex_scratch,
         );
 
@@ -1327,8 +1368,22 @@ pub struct Renderer {
     globe_center: LatLon,
     /// This frame's globe<->Mercator blend, stashed alongside `globe_center` for the same
     /// reason — [`GlobeBasemapLayer::draw`]'s own early-return and the density pass's
-    /// upload-gate (`record_draw_passes`) both read it.
+    /// upload-gate (`record_draw_passes`) both read it. From M4 item 4.4, also drives the
+    /// aircraft-glyph pass's own fade-out (the other half of the glyph<->density cross-fade
+    /// whose density-side half already existed) — see `record_draw_passes`'s own comment on why
+    /// that reuses this value rather than a second, independently-timed one.
     globe_blend: f64,
+    /// This frame's Regional-tier cross-fade multiplier (M4 item 4.4), set by
+    /// [`Renderer::set_regional_blend`] — `1.0` at full `LodTier::Regional`, `0.0` at
+    /// Continental/Global. Drives the trail-ribbon and label alpha fade in
+    /// [`Renderer::record_draw_passes`], and — once it settles at exactly `0.0` — gates their
+    /// per-frame CPU work (tessellation, collision resolution) off entirely, the same
+    /// zero-work-when-invisible shape `globe_blend`'s density gate already uses. This is also the
+    /// actual fix for the carried whole-world-trails-vs-256-MiB-buffer blocker (M2/M3): a
+    /// viewport zoomed out far enough to produce planet-scale trail data is never at `Regional`,
+    /// so this reaches `0.0` (and trail upload stops) well before the buffer could grow that
+    /// large.
+    regional_blend: f64,
     /// The runway-outline pass (M3 item 3.2) — docs/01's "map lines" step, drawn right after the
     /// coastline stroke and before the trail pass (see [`RunwayLayer`]'s own doc comment).
     runway: RunwayLayer,
@@ -1475,6 +1530,7 @@ impl Renderer {
             density,
             globe_center: LatLon::new(0.0, 0.0),
             globe_blend: 0.0,
+            regional_blend: 1.0,
             runway,
             badge,
             airport_marker,
@@ -1636,6 +1692,7 @@ impl Renderer {
             density,
             globe_center: LatLon::new(0.0, 0.0),
             globe_blend: 0.0,
+            regional_blend: 1.0,
             runway,
             badge,
             airport_marker,
@@ -1759,6 +1816,13 @@ impl Renderer {
         );
         self.globe_center = globe_camera.center();
         self.globe_blend = blend;
+    }
+
+    /// Uploads this frame's Regional-tier cross-fade multiplier (M4 item 4.4) — see the field doc
+    /// on [`Renderer::regional_blend`] for what it drives and why. Call once per frame, right
+    /// next to [`Renderer::set_globe_params`] — `app::window::App::draw` is the one caller.
+    pub fn set_regional_blend(&mut self, regional_blend: f64) {
+        self.regional_blend = regional_blend;
     }
 
     /// Follow the window to a new size.
@@ -2036,10 +2100,11 @@ impl Renderer {
     #[allow(
         clippy::too_many_lines,
         reason = "every pass's per-frame upload plus the full draw-order recording (M4 4.3's \
-                  globe basemap and density-dot passes now among them) — the same \
-                  one-place-everything-converges shape the too_many_arguments reason above \
-                  already documents; splitting the uploads from the draw calls would separate two \
-                  halves that must stay in the exact order they run in"
+                  globe basemap and density-dot passes, and 4.4's tier-gating around trail/label/ \
+                  aircraft upload, now among them) — the same one-place-everything-converges \
+                  shape the too_many_arguments reason above already documents; splitting the \
+                  uploads from the draw calls would separate two halves that must stay in the \
+                  exact order they run in"
     )]
     fn record_draw_passes(
         &mut self,
@@ -2074,8 +2139,16 @@ impl Renderer {
         // Both writes below are queue uploads, not render-pass work — they must land before the
         // pass's draw call reads them, which the queue's own call-order guarantee satisfies as
         // long as they run before `queue.submit`, same as `set_view_proj`'s writes always have.
+        // M4 item 4.4: `mercator_fade_multiplier` (above) already fades the flat Mercator base map
+        // out as `globe_blend` rises toward `Global` (M4 4.3); it now also fades the aircraft-
+        // glyph pass out over that same rise — the glyph-side half of the glyph<->density-dot
+        // cross-fade, whose density-side half (`globe.blend.x` in `density.wgsl`) shipped in 4.3.
+        // Reusing the exact same multiplier, rather than a second, independently-timed blend, is
+        // deliberate: it keeps both halves of the cross-fade in lockstep by construction, so
+        // neither can visibly outrun the other mid-transition.
         let glyph_scale = aircraft::glyph_scale_normalized(meters_per_pixel);
-        self.aircraft.set_glyph_scale(&self.queue, glyph_scale);
+        self.aircraft
+            .set_glyph_scale(&self.queue, glyph_scale, mercator_fade_multiplier);
         let airport_marker_scale = airport::airport_marker_scale_normalized(meters_per_pixel);
         self.airport_marker
             .set_params(&self.queue, airport_marker_scale);
@@ -2094,12 +2167,43 @@ impl Renderer {
         let airport_instance_count =
             self.airport_marker
                 .upload_instances(&self.device, &self.queue, airports);
-        let trail_vertex_count =
-            self.trail
-                .upload_trails(&self.device, &self.queue, &feed.trails, meters_per_pixel);
-        let instance_count =
+        // M4 item 4.4: trails are Regional-only (the skill's tier table) — skip tessellation and
+        // upload entirely once `regional_blend` has settled at exactly `0.0` (steady-state
+        // Continental/Global), the same zero-work-when-invisible shape the density gate below
+        // already uses. This is also the intended fix for the carried whole-world-trails-vs-256-
+        // MiB-buffer blocker (M2/M3): a viewport zoomed out far enough to produce planet-scale
+        // trail data is never at `Regional`, so `regional_blend` reaches `0.0` (and trail upload
+        // stops) well before the buffer could grow that large. Reasoned, not yet live-verified —
+        // this plan's own item calls for exercising a fast global-to-runway-and-back zoom to
+        // confirm rather than assume it; record the outcome in DECISION_LOG either way.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "an f64 already clamped to [0, 1] narrows to f32 losslessly at this \
+                      precision"
+        )]
+        let regional_alpha_multiplier = self.regional_blend.clamp(0.0, 1.0) as f32;
+        let trail_vertex_count = if self.regional_blend > 0.0 {
+            self.trail.upload_trails(
+                &self.device,
+                &self.queue,
+                &feed.trails,
+                meters_per_pixel,
+                regional_alpha_multiplier,
+            )
+        } else {
+            0
+        };
+        // M4 item 4.4: glyphs draw whenever the globe isn't *fully* opaque (`globe_blend < 1.0`)
+        // — the mirror image of the density gate just below, which draws whenever it isn't fully
+        // transparent (`globe_blend > 0.0`). Skipping the pack/upload at steady-state `Global`
+        // (not just fading the drawn alpha to zero) is what actually saves the CPU/GPU work
+        // docs/13's 8,000+-aircraft global p95 line needs.
+        let instance_count = if self.globe_blend < 1.0 {
             self.aircraft
-                .upload_instances(&self.device, &self.queue, &feed.aircraft);
+                .upload_instances(&self.device, &self.queue, &feed.aircraft)
+        } else {
+            0
+        };
         // M4 item 4.3: skip the CPU-side projection/packing entirely while the globe isn't even
         // partially visible (`globe_blend <= 0.0`, the common case at L1/L2) — the same
         // zero-work-when-invisible reasoning `GlobeBasemapLayer::draw`'s own early return has,
@@ -2115,10 +2219,25 @@ impl Renderer {
         } else {
             0
         };
-        self.label
-            .set_screen_params(&self.queue, camera.width_px(), camera.height_px());
-        let (label_text_count, label_leader_count) =
-            self.label.update(&self.device, &self.queue, feed, camera);
+        // M4 item 4.4: labels are Regional-only too — same gate as the trail upload above.
+        // Skipping label collision resolution entirely at Continental/Global matters more than
+        // the trail gate does: it's the single most expensive CPU step in this function (see
+        // `label.rs`'s own module doc comment on the ≤ 5 Hz throttle), so leaving it running
+        // unconditionally would itself threaten the same p95 budget the aircraft/density gates
+        // above protect.
+        let (label_text_count, label_leader_count) = if self.regional_blend > 0.0 {
+            self.label
+                .set_screen_params(&self.queue, camera.width_px(), camera.height_px());
+            self.label.update(
+                &self.device,
+                &self.queue,
+                feed,
+                camera,
+                regional_alpha_multiplier,
+            )
+        } else {
+            (0, 0)
+        };
         // F3 off: build/upload nothing for the HUD pass, not even an empty buffer write — see
         // `Renderer::render`'s own doc comment on `stats`.
         let stats_overlay_count = match stats {
@@ -2155,12 +2274,13 @@ impl Renderer {
         // docs/01 draw order: map base (Mercator, then the globe basemap cross-fading in/out on
         // top of it — M4 item 4.3), then map lines (runway outlines, then airport markers — M3
         // item 3.2; see `record_draw_passes`'s own doc comment on the marker-placement judgement
-        // call), then trails (2.6b), then aircraft glyphs (2.5; a selected one's own outline
-        // instance is packed first among them — 2.8b) with the L0 density dots layered on top of
-        // them (M4 item 4.3 — see `DensityLayer`'s own doc comment on why that overlap with the
-        // glyph pass is intentional here, not yet tier-gated), then labels (2.7b), then the F3
-        // debug HUD (2.1b), then the selected-aircraft info card (2.8b) last of all, on top of
-        // everything else.
+        // call), then trails (2.6b, Regional-only from M4 item 4.4), then aircraft glyphs (2.5; a
+        // selected one's own outline instance is packed first among them — 2.8b; cross-fading out
+        // toward `Global` from M4 item 4.4) with the L0 density dots layered on top of them
+        // (cross-fading in over that same rise since M4 item 4.3 — see `DensityLayer`'s own doc
+        // comment), then labels (2.7b, Regional-only from M4 item 4.4), then the F3 debug HUD
+        // (2.1b), then the selected-aircraft info card (2.8b) last of all, on top of everything
+        // else.
         self.basemap_land
             .draw(&mut pass, &self.basemap_view_proj_bind_group);
         self.basemap_coastline
@@ -3030,9 +3150,12 @@ fn build_aircraft_resources(
         source: wgpu::ShaderSource::Wgsl(AIRCRAFT_SHADER.into()),
     });
 
+    // Vertex *and* fragment (M4 item 4.4): `glyph_params.y` is now also read by `fs_main` as the
+    // glyph<->density-dot cross-fade multiplier — see `AircraftLayer::set_glyph_scale`'s own doc
+    // comment.
     let glyph_params_layout = create_uniform_bind_group_layout(
         device,
-        wgpu::ShaderStages::VERTEX,
+        wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
         "look-above aircraft glyph-params bind group layout",
     );
     let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3083,7 +3206,7 @@ fn build_aircraft_resources(
         quad_index_buffer,
         instance_buffer,
         instance_capacity: aircraft::MIN_INSTANCE_CAPACITY,
-        tint_table: color::altitude_bucket_tint_table(format),
+        altitude_ramp: color::AltitudeRamp::new(format),
         instance_scratch: Vec::new(),
     }
 }
@@ -3227,7 +3350,7 @@ fn build_trail_resources(
         pipeline,
         vertex_buffer,
         vertex_capacity: trail::MIN_TRAIL_VERTEX_CAPACITY,
-        tint_table: color::altitude_bucket_tint_table(format),
+        altitude_ramp: color::AltitudeRamp::new(format),
         vertex_scratch: Vec::new(),
     }
 }
@@ -4337,6 +4460,8 @@ mod tests {
                     icao24,
                     position: MercatorXy::new(x_m - offset_m, y_m - offset_m * 0.5),
                     altitude_bucket: bucket,
+                    altitude_ft: Some(altitude_ft),
+                    on_ground: bucket == AltitudeBucket::Ground,
                     age_s,
                 });
             }

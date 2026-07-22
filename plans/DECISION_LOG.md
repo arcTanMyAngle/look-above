@@ -2944,3 +2944,220 @@ approximation
   vs. density-dot drawing to the correct tier" already covers the fix (once glyphs simply don't draw
   at `Global`, there's nothing to float disconnected). Owner confirmed accepting this as a temporary
   4.3→4.4 rough edge rather than pulling gating work forward.
+
+## 2026-07-22 — M4 item 4.4: reused vs. new cross-fade blend, code-complete pending live verification
+
+- **The glyph<->density-dot cross-fade reuses 4.3's `globe_blend`/`mode_blend` (and its already-
+  shipped ~500 ms ease), rather than a new, independently-timed blend**, even though this item's own
+  checklist line asks for "cross-fade opacity over 250 ms at tier boundaries." Rationale: density's
+  own fade-in (`globe.blend.x` in `density.wgsl`) already shipped in 4.3 and is live-verified; had
+  the glyph-side fade-out used a second, faster-converging blend instead, the two halves of one
+  visual cross-fade would move at different speeds and *themselves* pop mid-transition — the exact
+  failure this item exists to prevent. Consistency between the two halves of a pair was judged more
+  important than hitting the literal 250 ms figure for this specific boundary; the 500 ms ceiling
+  that already governs `mode_blend` (docs/13's "Globe<->mercator camera animation ≤ 500 ms" line)
+  still satisfies "cross-fade... nothing pops," just at a slower, already-approved cadence.
+- **A genuinely new, 250 ms-tau blend (`App::regional_blend`/`Renderer::regional_blend`,
+  `ease_regional_blend`) was introduced for the trail/label boundary** instead, since that pair (trail
+  ribbon alpha, label text/leader alpha) had no prior blend to reuse or desync against — both sides
+  are driven by the one new value from scratch, so the 250 ms figure applies cleanly there.
+- **Both new/changed gates skip CPU work outright, not just draw with zero alpha**, once their
+  blend settles at the tier-off extreme (`regional_blend == 0.0` for trail/label, `globe_blend ==
+  1.0` for aircraft glyphs) — the same shape 4.3's density gate (`globe_blend > 0.0`) already used.
+  This is what the docs/13 8,000+-aircraft global p95 line actually needs (label collision
+  resolution in particular is the most expensive per-frame CPU step in `record_draw_passes`), not
+  just a visual nicety.
+- **`glyph_params`'s bind-group layout needed `wgpu::ShaderStages::FRAGMENT` added** (it was
+  vertex-only pre-4.4): `aircraft.wgsl`'s `fs_main` now reads `glyph_params.y` as the fade
+  multiplier. Missing this produced an immediate `wgpu` validation panic on pipeline creation,
+  caught by the pre-existing renderer smoke tests (`cargo test --workspace`) before any manual run —
+  not a live-pass finding.
+- **Not yet done, left for the owner**: this item's own "verify, don't assume" line — a fast
+  global-to-runway-and-back zoom in a live windowed session, checking (a) the carried whole-world-
+  trails-vs-256-MiB-buffer blocker is actually gone, not just reasoned away, (b) neither tier
+  boundary visibly pops, (c) dithering near a threshold doesn't flicker — plus the 8,000+-aircraft
+  global p95 < 16.6 ms frame-stats check (docs/13 §L1/L0 line 5). Full workspace fmt/clippy/
+  `test --workspace` is clean (681 passed) but that only covers what automated tests can reach;
+  none of it exercises a live zoom gesture or a real frame-stats reading.
+
+## 2026-07-22 — M4 item 4.4 live pass: buffer blocker gone, a real camera-sync gap found instead
+
+- **Live pass run by the owner** (not this session's agent — no interactive input tool available
+  here): reached whole-world extent (~6,700–6,760 tracked aircraft, bbox spanning the full lat/lon
+  range) then navigated back to selecting individual aircraft, twice, with no `wgpu` panic and a
+  clean shutdown both times. This is the specific scenario the carried whole-world-trails-vs-256-
+  MiB-buffer blocker (M2/M3) used to threaten — it did not reproduce. Treat that blocker as
+  resolved by 4.4's Regional-only trail gating; if it ever resurfaces, it needs a fresh repro, not
+  a re-carry of this same line.
+- **A different, real problem surfaced instead, from two screenshots**: a spherical L0 globe view
+  that looked correct (additive density, brighter over Europe/US, matching docs/13's "L0 density
+  honesty" line) and a flat Continental-tier view that showed only small uniform gray dots — no
+  labels, no trails, no visible per-altitude color — even after the owner reported zooming "all the
+  way in on an airport." Two hypotheses were on the table: (a) real data limits (most aircraft lack
+  a `category` from the feed, rendering the generic "unknown dart" shape, small and hard to read in
+  a screenshot) vs. (b) an actual gating regression from this session's work. The owner confirmed,
+  via a direct follow-up zoom test, that Regional tier *never* showed full glyphs/trails/labels
+  either — ruling out (a).
+- **Root cause, confirmed against the live session's own retarget-query log**: not a bug in this
+  item's new gating code (re-read line by line — `regional_blend`/`globe_blend` are set and
+  consumed exactly as designed). It's `window.rs`'s pre-existing (4.3) input routing: every
+  wheel/drag event feeds *both* `Camera` (Mercator, drives `LodTier` and the aircraft/trail/label
+  render) and `GlobeCamera` unconditionally, each interpreting the same cursor position and notch
+  count in its own coordinate system at its own zoom rate. Scrolling in "on an airport" via the
+  globe can look deeply zoomed there while the Mercator camera barely moves. The live session's own
+  retargeted-bbox log line, taken right around when the owner believed they'd reached a runway,
+  still spanned ~1,000+ km (`lat 49.26–59.17, lon 11.65–38.93`) — genuinely Continental, nowhere
+  near the <300 km Regional threshold. What was shown (small glyphs, no trails/labels) was in fact
+  *correct* L1 behavior for that real, if unintended, viewport — not a rendering bug.
+- **This item's plan text (`M4_DUAL_MODE_LOD_AND_INTERACTION.md`'s "known cross-milestone
+  inheritance" section) already predicted the risk in different words** ("the still-ungated
+  aircraft-glyph/trail/label layers... visibly float disconnected from whatever the globe is
+  currently showing"), and this session's own earlier notes (this file's 4.3 entry, and
+  `CURRENT_STATUS.md`'s pre-session-4.4 text) assumed 4.4's gating would resolve that "as a
+  consequence." **Correction, from actually verifying rather than assuming**: 4.4 only resolves the
+  Global-tier half of that gap (nothing draws there now, so nothing floats disconnected over the
+  globe) — it does *not* resolve the Continental/Regional half (you still can't navigate via the
+  globe and reliably land the Mercator camera, and therefore the tier-gated content, on the same
+  place). That needs the two cameras' centers actually synced (e.g. re-centering the Mercator
+  camera to the globe's sub-observer point as the tier leaves `Global`), which is a different,
+  more invasive change than "gate layers by tier."
+- **Owner decision (asked directly, not assumed)**: leave the camera-sync gap as-is for now: scope
+  it as its own new follow-up item rather than expand 4.4 or fix it in this session. 4.4's own
+  charter — gate `TrailLayer`/`LabelLayer`/aircraft-vs-density by tier, cross-fade opacity — stands
+  as implemented and buffer-blocker-verified regardless of this gap. The pop-free-cross-fade and
+  8,000+-aircraft p95 acceptance lines remain unconfirmed (Regional tier was never actually reached
+  in this live pass) and should be re-attempted once a future session gives the camera-sync gap its
+  own fix — see `CURRENT_STATUS.md`'s Now section for the explicit next-session instruction to add
+  it as a numbered plan item before starting 4.5.
+
+## 2026-07-22 — M4 item 4.5: continuous ramp shape, and a real lightness gap the new test caught
+
+- **Camera-sync gap promoted to plan item 4.4a** before starting 4.5, per the previous entry's own
+  instruction: `M4_DUAL_MODE_LOD_AND_INTERACTION.md` now carries it as a real unchecked checklist
+  item (fix sketch: re-center the Mercator camera to the globe's sub-observer point as tier leaves
+  `Global`), rather than leaving it as prose only in `CURRENT_STATUS.md`.
+- **Continuity shape: Oklab-interpolate between the ramp's five airborne stops, anchored at each
+  bucket's midpoint altitude** (e.g. `Below2000Ft`'s flat M2 color anchors at 1,000 ft) rather than
+  at bucket boundaries. Anchoring at boundaries would collapse each transition to a hairline right
+  at the old hard edge (two anchors meeting at the same altitude); midpoint anchoring spreads the
+  transition across the whole neighboring bucket instead — the actual point of item 4.5 ("no
+  bucket-boundary hitch"). `Ground` stays a flat categorical fallback (on-ground or altitude-
+  unknown), not a point on the numeric domain, mirroring `AltitudeBucket::classify`'s own rule.
+- **Built once per surface format, not per frame**: `color::AltitudeRamp::new(format)` resolves the
+  five stops to Oklab once (the only place `cbrt` runs); `AltitudeRamp::tint` is a lerp plus one
+  *inverse*-only Oklab conversion per aircraft/trail-vertex, the same "precompute what doesn't
+  change frame to frame" shape the old six-entry tint table used. `TrailVertex` gained
+  `altitude_ft: Option<f64>` and `on_ground: bool` (mirroring `AircraftInstance`'s existing fields)
+  so trail samples can interpolate continuously too, not just glyphs — the skill's ramp section is
+  headed "trails + optional glyph tint," so trails are the primary target, not an afterthought.
+- **A real, previously-unverified gap, not a bug in the new interpolation math**: writing the
+  deuteranopia-simulation test this item's acceptance line requires (docs/13: "ramp ordering
+  survives a deuteranopia simulation") revealed that the M2/M3-authored six hex stops were never
+  actually lightness-monotonic — Oklab `L` rises from `Ground` (0.545) through `To10000Ft` (0.748)
+  then *declines* through `To28000Ft`/`To40000Ft`/`Above40000Ft` (0.724/0.690/0.638). A sequence
+  that peaks and declines cannot survive any colorblindness simulation, independent of the
+  simulation matrix used — it was never ordered to begin with. This predates 4.5 entirely (the
+  colors are unchanged from M2); 4.5's new test is simply the first thing to mechanically check
+  the docs/13 line rather than take the "perceptually ordered" doc comment on faith.
+- **Owner decision (asked directly via options, not assumed)**: nudge each stop's Oklab lightness
+  by the minimal-L2-distance strictly-increasing correction (isotonic regression via the standard
+  pool-adjacent-violators algorithm, with a ~0.02 `L` margin per step so the corrected order has
+  headroom to survive the deuteranopia matrix too, verified computationally rather than assumed) —
+  hue and chroma (`a`, `b`) held fixed. Rejected: leaving the gap open as a carried follow-up (the
+  owner wanted docs/13 actually satisfied now, not deferred) and hand-picking replacement colors
+  (this stays closest to the original authored look; a free re-authoring wasn't asked for). New
+  hex: `Below2000Ft` `#C87A3C` (was `#C97B3D`, barely changed), `To10000Ft` `#91A02F` (was
+  `#A8B84B`, darkened — it had been the ramp's brightest stop and had the most room to give up),
+  `To28000Ft` `#41B385` (was `#4DBE8F`), `To40000Ft` `#47B0D7` (was `#3FA9D0`), `Above40000Ft`
+  `#A798F8` (was `#8B7BD8`, lightened the most — it had been the dimmest airborne stop despite
+  being the highest-altitude one). `Ground` (`#6E7076`) is unchanged; it never violated the
+  ordering.
+- **Former `altitude_bucket_tint`/`altitude_bucket_tint_table`/`altitude_bucket_index` removed**
+  from `color.rs` rather than kept alongside the new API — every production call site
+  (`aircraft::pack_instance`, `trail::tessellate_run`) switched to the continuous ramp, so the
+  discrete lookup had no remaining caller; `AltitudeBucket` itself (the enum/field) stays, since
+  `AircraftInstance`/`TrailVertex` still carry it and other modules' test fixtures still construct
+  it, even though nothing reads it for color anymore.
+- Full workspace fmt/clippy (`--all-targets`, workspace lints incl. `pedantic`)/`test --workspace`
+  clean: 684 passed, 8 pre-existing ignored in `ingest`, 0 new lints.
+
+## 2026-07-22 — M4 item 4.4a: hard teleport at the tier-exit edge, not continuous every-frame sync
+
+- **Fix shape: a one-time hard teleport of the Mercator camera's center, gated on the exact frame
+  `lod::next_tier` reports leaving `Global`** — not a continuous per-frame sync of the two cameras'
+  centers. Continuous sync was rejected: the two cameras' input semantics genuinely diverge (globe
+  rotation vs. Mercator panning aren't the same geometry even for identical raw pixel deltas — this
+  divergence is exactly what caused the gap per the previous entry), so forcing them to track each
+  other every frame while both are live in `Global` tier would fight the user's own Mercator-camera
+  input rather than just resolve the one moment that actually matters: the instant the Mercator
+  camera's state is about to start driving what renders.
+- **New `Camera::set_center_latlon` (`crates/core/src/camera.rs`)**: converts the given `LatLon` via
+  the existing `web_mercator_forward` and hard-sets `center_m`, and — deliberately, not incidentally —
+  also zeroes `velocity_m_per_s`. Without the velocity clear, whatever pan-inertia the Mercator camera
+  had accumulated from being fed raw drag deltas throughout `Global` tier (per 4.3's unconditional-
+  routing design) would immediately coast the just-teleported camera away from the point the user
+  landed on, defeating the fix on the very next frame.
+- **Call site placed in `App::draw` (`window.rs`) before the frame's `changed`/`set_view_proj`
+  reads, not after**: originally drafted after (matching the existing code's line order), but that
+  would let the teleport's own delta go unseen by both this frame's render matrix (a one-frame-late
+  view) and `maybe_retarget`'s change-detection (the region requery for the new location would lag
+  by a full debounce cycle for no reason). Reordered so the recenter runs immediately after
+  `next_tier`'s result is known and before either read.
+- **Trigger condition is `previous_tier == Global && new_tier != Global`, checked once per frame
+  from a locally-captured `previous_tier`** (not a stored "did we already recenter" flag) — cheap and
+  correct because `next_tier` already collapses a fast multi-tier zoom to one call, so this can only
+  fire once per actual Global-tier exit.
+- **Verification**: `Camera::set_center_latlon` unit-tested directly (matches `web_mercator_forward`
+  of the same point; clears a nonzero velocity) — the pure, deterministic half of the fix. The
+  integration half (the `App::draw` conditional call) is a 3-line change reviewed by hand rather than
+  tested in isolation, since `App` requires a live wgpu surface to construct and this repo has no
+  headless-`App` test harness. Full workspace fmt/clippy/`test --workspace` clean: 686 passed (+2
+  new), 8 pre-existing ignored in `ingest`. App launched standalone (Intel Arc/dx12 adapter, no panic
+  across 6s) as a startup smoke check only.
+- **Not live-verified this session**: the item's actual acceptance line (a live globe-driven zoom
+  into an airport reaches Regional tier at the point visually targeted) needs a human driving real
+  mouse input into the native winit window — no GUI-automation driver exists for this app in this
+  repo (unlike a browser or Electron target), and per this project's own token-management rule,
+  fighting to build one wasn't attempted. Needs the owner's own live pass, same shape as 4.4's own
+  gate.
+
+## 2026-07-22 — M4 item 4.4a live-verified; 4.4's two remaining acceptance lines: one evidenced, one open, one still unverified
+
+- **4.4a's acceptance line is now evidenced from the owner's own live-pass log**, not assumed: a
+  `retargeted mid-run` bbox line at `19:00:40.579Z` reads `lat 39.77–40.59, lon 13.88–15.60` — a
+  ~91 km × 132 km span (well under the 300 km Regional threshold) centered over Sardinia/southern
+  Italy, immediately following a globe-driven zoom to that same real location. This matches the
+  session's own screenshots showing full Regional-tier rendering there (heading-rotated colored
+  glyphs, labels, leader lines, a selection info card) — the hard teleport (`Camera::
+  set_center_latlon`, `App::draw`'s `previous_tier == Global && new_tier != Global` gate) is doing
+  its job. Checklist item 4.4a marked done on this evidence.
+- **4.4's whole-world-trails-vs-256-MiB-buffer blocker remains resolved** (unchanged from the
+  previous entry — reached ~12,500 tracked aircraft at Global with no panic).
+- **4.4's pop-free cross-fade line: owner reports popping still occurring at both the L0↔L1 and
+  L1↔L2 boundaries, from a fresh live pass this session.** Investigated but not resolved:
+  - Re-read `AircraftLayer`/`TrailLayer`/`LabelLayer`'s gating and tint code line by line — no
+    logic bug found. Every aircraft glyph's color comes from `AltitudeRamp::tint` keyed on its own
+    real altitude regardless of tier (verified in `aircraft.rs`); the plain, monochrome-looking
+    dots the owner's Continental-tier screenshots show are most likely the spec's own "unknown"
+    category dart (most feed aircraft lack a real `category`) at 8–12 px, not a color/gating bug —
+    but this is inference from screenshots, not a live-pixel-probe confirmation.
+  - Leading hypothesis for the *feel* of a pop: `TIER_BLEND_EASE_TAU_S = 0.05` s is an exponential
+    ease, which is inherently front-loaded (≈86% of the change lands within the first 100 ms of a
+    250 ms window) — plausible that this reads as a snap-then-settle rather than a graceful fade,
+    especially for labels/leader-lines, which don't fade perceptually the way continuous imagery
+    does. **Not acted on**: owner declined the experimental tau change this session (asked
+    directly, not assumed) — no code changed for this line. Left as an open, unresolved acceptance
+    line, not silently carried as fixed.
+- **4.4's 8,000+-aircraft global p95 line: attempted this session, result invalid.** A second run's
+  OpenSky poll failed to parse (`error decoding response body`) and failed over to
+  `airplaneslive`, whose 250 nm point-radius ceiling left only 3–5 aircraft tracked — nowhere near
+  8,000. The one F3 reading captured (p95 ≈ 11 ms) is real but meaningless for this line. The
+  *first* run this session did reach 11,000–12,500 tracked at Global, but F3 was never toggled
+  during it. Owner deferred a fresh attempt to a future pass rather than chasing OpenSky's failover
+  now.
+- **New idea surfaced by the owner, explicitly deferred, not scoped into any plan**: instead of
+  defaulting to whole-world density on launch, open to a location-search-driven view — type an
+  address or pick a point on the globe and see live flights overhead at that location. This is a
+  distinct feature (geocoding/reverse-geocoding, a new default-view/entry-point UX) from anything
+  in M4's tier-gating scope; recorded here only as a backlog note for scoping into a future
+  milestone, at the owner's own request to not pivot mid-session.

@@ -83,11 +83,34 @@ const CLICK_MAX_DURATION: Duration = Duration::from_millis(300);
 /// bound this is checked against.
 const MODE_BLEND_EASE_TAU_S: f64 = 0.1;
 
-/// One frame's step of [`App::mode_blend`]'s ease toward `target` — the exact same
-/// exponential-ease-toward-target shape `Camera::update`'s zoom ease and `GlobeCamera::update`'s
-/// radius ease already use (`value += (target - value) * (1 - exp(-dt / tau))`), including the
-/// same floating-point snap-to-target guard those eases have. A free function, not inlined into
-/// [`App::draw`], so it has a plain-Rust unit test independent of the rest of `App`'s
+/// Exponential time constant for [`App::regional_blend`]'s eased approach to its target (M4 item
+/// 4.4) — chosen so a full transition converges well inside the plan's own 250 ms cross-fade
+/// target for the trail/label tier boundary; see [`ease_regional_blend`]'s own unit test for the
+/// exact bound. Deliberately a *different* (faster) constant than [`MODE_BLEND_EASE_TAU_S`]: that
+/// one paces the already-shipped, live-verified globe<->Mercator camera animation (4.3), which
+/// this item does not touch — see [`ease_regional_blend`]'s own doc comment for why the two stay
+/// independent rather than sharing one blend.
+const TIER_BLEND_EASE_TAU_S: f64 = 0.05;
+
+/// The shared exponential-ease-toward-target step both [`ease_mode_blend`] and
+/// [`ease_regional_blend`] are thin, differently-timed wrappers around — the same shape
+/// `Camera::update`'s zoom ease and `GlobeCamera::update`'s radius ease already use
+/// (`value += (target - value) * (1 - exp(-dt / tau))`), including the same floating-point
+/// snap-to-target guard those eases have.
+fn ease_exponential(value: f64, target: f64, dt_s: f64, tau_s: f64) -> f64 {
+    if value == target {
+        return value;
+    }
+    let mut eased = value + (target - value) * (1.0 - (-dt_s / tau_s).exp());
+    // Floating point should not leave this converging forever.
+    if (eased - target).abs() <= 1e-9 {
+        eased = target;
+    }
+    eased
+}
+
+/// One frame's step of [`App::mode_blend`]'s ease toward `target`. A free function, not inlined
+/// into [`App::draw`], so it has a plain-Rust unit test independent of the rest of `App`'s
 /// winit/tokio-heavy construction — the same "free function for testability" reasoning
 /// [`metar_badges_for`] documents for itself.
 ///
@@ -96,15 +119,20 @@ const MODE_BLEND_EASE_TAU_S: f64 = 0.1;
 /// exactly like `Camera`'s own zoom-ease/pan-inertia already behave — no separate fixed-duration
 /// timer or interrupt-handling code is needed anywhere in `App`.
 fn ease_mode_blend(value: f64, target: f64, dt_s: f64) -> f64 {
-    if value == target {
-        return value;
-    }
-    let mut eased = value + (target - value) * (1.0 - (-dt_s / MODE_BLEND_EASE_TAU_S).exp());
-    // Floating point should not leave this converging forever.
-    if (eased - target).abs() <= 1e-9 {
-        eased = target;
-    }
-    eased
+    ease_exponential(value, target, dt_s, MODE_BLEND_EASE_TAU_S)
+}
+
+/// One frame's step of [`App::regional_blend`]'s ease toward `target` (M4 item 4.4) — same
+/// interruptible-for-free shape as [`ease_mode_blend`], just paced by [`TIER_BLEND_EASE_TAU_S`]
+/// instead of [`MODE_BLEND_EASE_TAU_S`].
+///
+/// Kept as its own eased value rather than reusing `mode_blend`: `regional_blend` tracks a
+/// different tier boundary entirely (`Regional` vs. everything else, the ~300/330 km threshold)
+/// from `mode_blend`'s (`Global` vs. everything else, the ~3,000/3,300 km threshold) — the two
+/// can be `1.0` and `0.0` in any combination depending on the live tier, so one shared scalar
+/// could not represent both independently.
+fn ease_regional_blend(value: f64, target: f64, dt_s: f64) -> f64 {
+    ease_exponential(value, target, dt_s, TIER_BLEND_EASE_TAU_S)
 }
 
 /// Open the window and pump events until the user closes it.
@@ -162,6 +190,12 @@ struct App {
     /// placeholder [`App::start`] immediately overwrites, seeded to match the seeded `lod_tier`
     /// exactly so there is no spurious animation on the very first frame.
     mode_blend: f64,
+    /// 1.0 = fully Regional (trails/labels fully shown), 0.0 = Continental/Global (both hidden
+    /// and their per-frame CPU work skipped) — M4 item 4.4. Eased every frame in [`App::draw`]
+    /// toward whichever target `lod_tier` implies (1.0 at [`LodTier::Regional`], 0.0 otherwise),
+    /// via [`ease_regional_blend`]; independent of `mode_blend` (see that function's own doc
+    /// comment for why). Seeded exactly like `mode_blend` in [`App::start`].
+    regional_blend: f64,
     /// The most recent cursor position, in physical pixels. Needed for two things: computing
     /// per-move drag deltas, and anchoring wheel-zoom (a `MouseWheel` event carries no position
     /// of its own in winit — it always accompanies cursor movement, so the last tracked
@@ -313,6 +347,7 @@ impl App {
             // anything reads them (see the field docs above).
             lod_tier: LodTier::Regional,
             mode_blend: 0.0,
+            regional_blend: 0.0,
             last_cursor_pos: None,
             last_drag_instant: None,
             press_pos: None,
@@ -400,6 +435,14 @@ impl App {
             0.0
         };
         renderer.set_globe_params(&globe_camera, self.mode_blend);
+        // M4 item 4.4: `regional_blend` seeded the same way, against the same real initial tier —
+        // see the field doc on `App::regional_blend`.
+        self.regional_blend = if self.lod_tier == LodTier::Regional {
+            1.0
+        } else {
+            0.0
+        };
+        renderer.set_regional_blend(self.regional_blend);
 
         // The same three ingest pieces `headless::run` builds — see that module's doc comment
         // for why each is required, not just the poller. A failure here is fatal, the same way
@@ -557,14 +600,28 @@ impl App {
         let before = (camera.center_m(), camera.meters_per_pixel());
         camera.update(dt_s);
         globe_camera.update(dt_s);
-        let changed = before != (camera.center_m(), camera.meters_per_pixel());
-        renderer.set_view_proj(camera_view_proj(camera));
 
         // M4 item 4.3: recompute the LOD tier from the just-updated camera's viewport span
         // (4.1's hysteresis state machine), then ease `mode_blend` toward whichever
         // globe<->Mercator target that tier implies — see `ease_mode_blend`'s own doc comment
         // for why this one eased value is what makes the transition interruptible for free.
+        let previous_tier = self.lod_tier;
         self.lod_tier = lod::next_tier(self.lod_tier, camera.viewport_span_km());
+        // M4 item 4.4a: the Mercator camera has been fed the same raw wheel/drag input as the
+        // globe camera throughout `Global` tier (see `globe_camera`'s field doc above), but
+        // orthographic rotation isn't Mercator panning, so its center can't be trusted to match
+        // where the user was actually looking on the globe. The instant the tier leaves
+        // `Global` — the point `lod_tier` itself decides what tier renders — snap it to the
+        // globe's sub-observer point instead, before `changed`/`set_view_proj` below read the
+        // camera, so both the frame's own matrix and `maybe_retarget`'s region requery see this
+        // jump rather than lagging a frame behind it.
+        if previous_tier == LodTier::Global && self.lod_tier != LodTier::Global {
+            camera.set_center_latlon(globe_camera.center());
+        }
+
+        let changed = before != (camera.center_m(), camera.meters_per_pixel());
+        renderer.set_view_proj(camera_view_proj(camera));
+
         let target_blend = if self.lod_tier == LodTier::Global {
             1.0
         } else {
@@ -572,6 +629,16 @@ impl App {
         };
         self.mode_blend = ease_mode_blend(self.mode_blend, target_blend, dt_s);
         renderer.set_globe_params(globe_camera, self.mode_blend);
+        // M4 item 4.4: ease `regional_blend` toward whichever trail/label target this frame's
+        // tier implies — same shape as `mode_blend` just above, independent tier boundary (see
+        // `ease_regional_blend`'s own doc comment).
+        let target_regional_blend = if self.lod_tier == LodTier::Regional {
+            1.0
+        } else {
+            0.0
+        };
+        self.regional_blend = ease_regional_blend(self.regional_blend, target_regional_blend, dt_s);
+        renderer.set_regional_blend(self.regional_blend);
 
         Self::maybe_retarget(
             camera,
@@ -1203,6 +1270,59 @@ mod tests {
         assert!(value > 0.0, "should have made some progress toward 1.0");
 
         let retargeted = ease_mode_blend(value, 0.0, 1.0 / 60.0);
+        assert!(
+            retargeted < value,
+            "retargeting to 0.0 mid-ease must immediately start pulling the value back down"
+        );
+    }
+
+    // ---- `ease_regional_blend` (M4 item 4.4) -------------------------------------------------
+
+    #[test]
+    fn ease_regional_blend_converges_within_250ms() {
+        let mut value = 0.0;
+        let target = 1.0;
+        let frame_dt_s = 1.0 / 60.0;
+        let mut elapsed_s = 0.0;
+
+        while elapsed_s < 0.25 {
+            value = ease_regional_blend(value, target, frame_dt_s);
+            elapsed_s += frame_dt_s;
+        }
+
+        assert!(
+            (value - target).abs() < 0.01,
+            "regional_blend only reached {value} after 250ms of simulated time, expected within \
+             0.01 of {target}"
+        );
+    }
+
+    #[test]
+    fn ease_regional_blend_moves_toward_target_but_does_not_overshoot_it() {
+        let mut value = 0.0;
+        for _ in 0..5 {
+            let next = ease_regional_blend(value, 1.0, 1.0 / 60.0);
+            assert!(next > value, "each step must move strictly toward target");
+            assert!(next <= 1.0, "the ease must never overshoot its target");
+            value = next;
+        }
+    }
+
+    #[test]
+    fn ease_regional_blend_is_a_no_op_once_already_at_target() {
+        assert_eq!(ease_regional_blend(1.0, 1.0, 1.0 / 60.0), 1.0);
+        assert_eq!(ease_regional_blend(0.0, 0.0, 1.0 / 60.0), 0.0);
+    }
+
+    #[test]
+    fn ease_regional_blend_is_interruptible_a_retargeted_ease_changes_direction_immediately() {
+        let mut value = 0.0;
+        for _ in 0..5 {
+            value = ease_regional_blend(value, 1.0, 1.0 / 60.0);
+        }
+        assert!(value > 0.0, "should have made some progress toward 1.0");
+
+        let retargeted = ease_regional_blend(value, 0.0, 1.0 / 60.0);
         assert!(
             retargeted < value,
             "retargeting to 0.0 mid-ease must immediately start pulling the value back down"

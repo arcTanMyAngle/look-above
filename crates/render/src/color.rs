@@ -1,7 +1,6 @@
 //! The map background and base-map palette, and the sRGB conversion they share.
 
 use look_above_core::contracts::FlightCategory;
-use look_above_core::sim::AltitudeBucket;
 
 /// Background of the map view, authored as nonlinear sRGB (`#0A0E14`).
 ///
@@ -31,6 +30,23 @@ fn srgb_to_linear(encoded: f64) -> f64 {
     } else {
         ((encoded + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// The sRGB opto-electronic transfer function: linear → encoded. [`srgb_to_linear`]'s inverse —
+/// needed by [`AltitudeRamp`], whose Oklab interpolation only ever produces a *linear* result,
+/// which then needs re-encoding for a non-`srgb` target the same way [`linearize_for_format`]
+/// passes flat colors' already-encoded values straight through.
+fn linear_to_srgb(linear: f64) -> f64 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// `srgb` (nonlinear, 8-bit-per-channel) widened to `[0, 1]` linear RGB.
+fn linear_from_srgb_u8(srgb: [u8; 3]) -> [f64; 3] {
+    srgb.map(|channel| srgb_to_linear(f64::from(channel) / 255.0))
 }
 
 /// `srgb`, linearized if `format` stores linear values, passed through unchanged if it stores
@@ -99,44 +115,180 @@ fn layer_color(srgb: [u8; 3], format: wgpu::TextureFormat) -> [f32; 4] {
 }
 
 /// The altitude ramp's six stops (M2 item 2.5), authored as flat nonlinear-sRGB hex per the
-/// high-fidelity-flight-visualization skill's table. docs/01's checklist parenthetical is
-/// explicit that the *perceptual* ramp (Oklab-interpolated between stops) lands in M4 — this
-/// wires the six discrete altitude-bucket tints the glyph attribute carries now, one flat color
-/// per bucket, no interpolation between them yet.
+/// high-fidelity-flight-visualization skill's table. [`AltitudeRamp`] (M4 item 4.5) Oklab-
+/// interpolates between the five airborne ones by the aircraft's actual altitude; `ALT_GROUND_SRGB`
+/// stays a flat fallback (on-ground or altitude-unknown is categorical, not a point on the
+/// altitude domain — see [`AltitudeRamp::tint`]).
+///
+/// M4 item 4.5 nudged these from their original M2/M3 hex (`#6E7076`/`#C97B3D`/`#A8B84B`/
+/// `#4DBE8F`/`#3FA9D0`/`#8B7BD8`): the originals' Oklab lightness peaked at `To10000Ft` and
+/// declined afterward (`Above40000Ft` was the *dimmest* airborne stop), which fails docs/13's
+/// "lightness ordering survives a deuteranopia simulation" line — that requires monotonic
+/// lightness, and a peak-then-decline shape can't survive any colorblindness simulation, since
+/// it was never actually ordered to begin with. Each stop's Oklab hue/chroma (`a`, `b`) is
+/// unchanged; only lightness (`L`) was corrected, by the minimal-L2-distance non-decreasing
+/// sequence (isotonic regression, ~0.02 `L` margin per step for a safe deuteranopia-simulated
+/// margin) that fits the original values — the smallest change that makes the ramp actually
+/// monotonic rather than a free re-authoring (`DECISION_LOG` 2026-07-22).
 const ALT_GROUND_SRGB: [u8; 3] = [0x6E, 0x70, 0x76];
-const ALT_BELOW_2000FT_SRGB: [u8; 3] = [0xC9, 0x7B, 0x3D];
-const ALT_TO_10000FT_SRGB: [u8; 3] = [0xA8, 0xB8, 0x4B];
-const ALT_TO_28000FT_SRGB: [u8; 3] = [0x4D, 0xBE, 0x8F];
-const ALT_TO_40000FT_SRGB: [u8; 3] = [0x3F, 0xA9, 0xD0];
-const ALT_ABOVE_40000FT_SRGB: [u8; 3] = [0x8B, 0x7B, 0xD8];
+const ALT_BELOW_2000FT_SRGB: [u8; 3] = [0xC8, 0x7A, 0x3C];
+const ALT_TO_10000FT_SRGB: [u8; 3] = [0x91, 0xA0, 0x2F];
+const ALT_TO_28000FT_SRGB: [u8; 3] = [0x41, 0xB3, 0x85];
+const ALT_TO_40000FT_SRGB: [u8; 3] = [0x47, 0xB0, 0xD7];
+const ALT_ABOVE_40000FT_SRGB: [u8; 3] = [0xA7, 0x98, 0xF8];
 
-/// [`AltitudeBucket`]'s stop index in the skill's ramp order (ground up to FL400+) — the single
-/// place that ordering is encoded; both [`altitude_bucket_tint_table`] (which builds an ordered
-/// array) and `aircraft::pack_instance` (which indexes into it) go through this function so
-/// there is exactly one place that could disagree with itself.
-pub(crate) fn altitude_bucket_index(bucket: AltitudeBucket) -> usize {
-    match bucket {
-        AltitudeBucket::Ground => 0,
-        AltitudeBucket::Below2000Ft => 1,
-        AltitudeBucket::To10000Ft => 2,
-        AltitudeBucket::To28000Ft => 3,
-        AltitudeBucket::To40000Ft => 4,
-        AltitudeBucket::Above40000Ft => 5,
-    }
+/// The five airborne ramp stops, each anchored at its bucket's midpoint altitude (feet) — e.g.
+/// `ALT_BELOW_2000FT_SRGB` (the `[0, 2,000)` ft bucket's flat M2 color) anchors at 1,000 ft, the
+/// point that bucket's flat tint was truest to. Anchoring at bucket midpoints rather than
+/// boundaries spreads each transition evenly across the *whole* neighboring bucket instead of
+/// collapsing it to a hairline right at the old hard edge. The `Above40000Ft` band has no upper
+/// bound, so it anchors at its own lower boundary (40,000 ft) and stays flat above it —
+/// [`AltitudeRamp::tint`] clamps there rather than extrapolating past the ramp's last color.
+const RAMP_STOPS_FT: [(f64, [u8; 3]); 5] = [
+    (1_000.0, ALT_BELOW_2000FT_SRGB),
+    (6_000.0, ALT_TO_10000FT_SRGB),
+    (19_000.0, ALT_TO_28000FT_SRGB),
+    (34_000.0, ALT_TO_40000FT_SRGB),
+    (40_000.0, ALT_ABOVE_40000FT_SRGB),
+];
+
+/// Björn Ottosson's Oklab forward transform (<https://bottosson.github.io/posts/oklab/>),
+/// linear sRGB → Oklab. The perceptual space [`AltitudeRamp`] interpolates in: a straight RGB
+/// lerp between, say, amber and yellow-green dips through a muddy, less legible in-between hue;
+/// Oklab keeps the ramp's lightness monotonic (docs/13's colorblind-safety line) at every
+/// intermediate altitude, not just the six authored stops.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "r/g/b, l/m/s, l_/m_/s_ are Oklab's own published names (bottosson.github.io/posts/\
+              oklab) — renaming them to satisfy the lint would make this harder to check against \
+              its source, not easier"
+)]
+fn linear_srgb_to_oklab(rgb: [f64; 3]) -> [f64; 3] {
+    let [r, g, b] = rgb;
+    let l = 0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b;
+    let m = 0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b;
+    let s = 0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b;
+
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
+
+    [
+        0.210_454_255_3 * l_ + 0.793_617_785_0 * m_ - 0.004_072_046_8 * s_,
+        1.977_998_495_1 * l_ - 2.428_592_205_0 * m_ + 0.450_593_709_9 * s_,
+        0.025_904_037_1 * l_ + 0.782_771_766_2 * m_ - 0.808_675_766_0 * s_,
+    ]
 }
 
-/// The altitude-bucket tint for `bucket`, opaque, in shader-ready linear RGBA (same
-/// linearize-if-`srgb` reasoning as [`land_fill_color`]/[`coastline_stroke_color`]).
-pub fn altitude_bucket_tint(bucket: AltitudeBucket, format: wgpu::TextureFormat) -> [f32; 4] {
-    let srgb = match bucket {
-        AltitudeBucket::Ground => ALT_GROUND_SRGB,
-        AltitudeBucket::Below2000Ft => ALT_BELOW_2000FT_SRGB,
-        AltitudeBucket::To10000Ft => ALT_TO_10000FT_SRGB,
-        AltitudeBucket::To28000Ft => ALT_TO_28000FT_SRGB,
-        AltitudeBucket::To40000Ft => ALT_TO_40000FT_SRGB,
-        AltitudeBucket::Above40000Ft => ALT_ABOVE_40000FT_SRGB,
-    };
-    layer_color(srgb, format)
+/// [`linear_srgb_to_oklab`]'s inverse, Oklab → linear sRGB.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    reason = "same as linear_srgb_to_oklab: these are Oklab's own published variable names"
+)]
+fn oklab_to_linear_srgb(lab: [f64; 3]) -> [f64; 3] {
+    let [l, a, b] = lab;
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548_0 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    [
+        4.076_741_662_1 * l3 - 3.307_711_591_3 * m3 + 0.230_969_929_2 * s3,
+        -1.268_438_004_6 * l3 + 2.609_757_401_1 * m3 - 0.341_319_396_5 * s3,
+        -0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701_0 * s3,
+    ]
+}
+
+/// The Oklab-interpolated altitude tint (M4 item 4.5), built once per surface format — the same
+/// "precompute what doesn't change frame to frame" shape the old `altitude_bucket_tint_table`
+/// used, just resolving to Oklab-space stops instead of six flat RGBA values, so the per-frame,
+/// per-instance/per-vertex cost of [`AltitudeRamp::tint`] is a lerp plus one *inverse* Oklab
+/// conversion (no `cbrt`) rather than a full forward+inverse round trip.
+#[derive(Debug, Clone, Copy)]
+pub struct AltitudeRamp {
+    ground_tint: [f32; 4],
+    /// [`RAMP_STOPS_FT`], pre-converted to Oklab — altitude (feet) paired with its Oklab color.
+    stops_oklab: [(f64, [f64; 3]); 5],
+    linear_output: bool,
+}
+
+impl AltitudeRamp {
+    /// Resolves [`RAMP_STOPS_FT`] to Oklab for `format` — call once per surface format (mirrors
+    /// the old `altitude_bucket_tint_table(format)` call site in `renderer.rs`), not per frame.
+    pub fn new(format: wgpu::TextureFormat) -> Self {
+        let stops_oklab =
+            RAMP_STOPS_FT.map(|(ft, srgb)| (ft, linear_srgb_to_oklab(linear_from_srgb_u8(srgb))));
+        Self {
+            ground_tint: layer_color(ALT_GROUND_SRGB, format),
+            stops_oklab,
+            linear_output: format.is_srgb(),
+        }
+    }
+
+    /// The tint for an aircraft/trail-sample at `altitude_ft`, opaque. `on_ground` or an unknown
+    /// `altitude_ft` (`None`) reads as the flat ground stop — mirroring
+    /// `look_above_core::sim::AltitudeBucket::classify`'s own on-ground-or-unknown fallback, since
+    /// neither case is a point on the airborne ramp's numeric domain. Otherwise, Oklab-
+    /// interpolates between the two [`RAMP_STOPS_FT`] bracketing `altitude_ft`, clamping flat
+    /// beyond the first/last anchor rather than extrapolating past the ramp's authored colors.
+    pub fn tint(&self, on_ground: bool, altitude_ft: Option<f64>) -> [f32; 4] {
+        let Some(ft) = (!on_ground).then_some(altitude_ft).flatten() else {
+            return self.ground_tint;
+        };
+
+        let stops = self.stops_oklab;
+        let (first_ft, first_oklab) = stops[0];
+        if ft <= first_ft {
+            return self.finish(first_oklab);
+        }
+        let (last_ft, last_oklab) = stops[stops.len() - 1];
+        if ft >= last_ft {
+            return self.finish(last_oklab);
+        }
+
+        for window in stops.windows(2) {
+            let (from_ft, from_oklab) = window[0];
+            let (to_ft, to_oklab) = window[1];
+            if ft <= to_ft {
+                let t = (ft - from_ft) / (to_ft - from_ft);
+                let blended = [
+                    from_oklab[0] + (to_oklab[0] - from_oklab[0]) * t,
+                    from_oklab[1] + (to_oklab[1] - from_oklab[1]) * t,
+                    from_oklab[2] + (to_oklab[2] - from_oklab[2]) * t,
+                ];
+                return self.finish(blended);
+            }
+        }
+        // Unreachable given the clamps above (ft is strictly between the first and last anchor,
+        // so some window's `to_ft` must reach it), but a flat fallback is still a correct color
+        // rather than a panic if the ramp's stop count ever changes without this loop keeping up.
+        self.finish(last_oklab)
+    }
+
+    /// Oklab → this ramp's target format, matching [`linearize_for_format`]'s dual path: pass a
+    /// linear result straight through for an `srgb` surface (the hardware re-applies the transfer
+    /// function on write), re-encode it for one that isn't.
+    fn finish(&self, oklab: [f64; 3]) -> [f32; 4] {
+        let linear = oklab_to_linear_srgb(oklab);
+        let out = if self.linear_output {
+            linear
+        } else {
+            linear.map(linear_to_srgb)
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "same as layer_color: an 8-10-bit-per-channel display color, nowhere near \
+                      f32's precision limits — clamped first since an Oklab round trip can \
+                      overshoot [0, 1] slightly for saturated colors"
+        )]
+        let narrow = |c: f64| c.clamp(0.0, 1.0) as f32;
+        [narrow(out[0]), narrow(out[1]), narrow(out[2]), 1.0]
+    }
 }
 
 /// Label text color (M2 item 2.7b), authored as nonlinear sRGB (`#EAF0F6`) — docs/01: "aircraft
@@ -190,9 +342,10 @@ pub fn info_card_text_color(format: wgpu::TextureFormat) -> [f32; 4] {
 ///
 /// docs/01: aircraft stay the brightest things on screen; docs/13 wants map furniture (this is
 /// static, not live traffic) legible without competing for attention. A cool, desaturated
-/// gray-blue — clearly dimmer than every [`altitude_bucket_tint`] (including
-/// [`AltitudeBucket::Ground`]'s own already-muted gray, the ramp's dimmest stop) and far below
-/// [`LABEL_TEXT_SRGB`]'s near-white — reads as a static point-of-interest marker, not an aircraft.
+/// gray-blue — clearly dimmer than every [`AltitudeRamp::tint`] output (including
+/// `ALT_GROUND_SRGB`'s own already-muted gray, the ramp's dimmest stop) and far below
+/// [`LABEL_TEXT_SRGB`]'s near-white — reads as a static point-of-interest marker, not an
+/// aircraft.
 const AIRPORT_MARKER_SRGB: [u8; 3] = [0x4A, 0x52, 0x5E];
 
 /// Runway outline stroke (M3 item 3.2), authored as nonlinear sRGB (`#363D48`).
@@ -222,7 +375,7 @@ pub fn runway_outline_color(format: wgpu::TextureFormat) -> [f32; 4] {
 /// convention, so hue is fixed; these are this project's own shades of it (`DECISION_LOG`).
 /// Moderately saturated and mid-brightness: distinguishable at a glance from
 /// [`AIRPORT_MARKER_SRGB`]'s desaturated gray and from each other, but dimmer than every
-/// [`altitude_bucket_tint`] stop so a badge still reads as map furniture, not live traffic
+/// [`AltitudeRamp::tint`] output so a badge still reads as map furniture, not live traffic
 /// (docs/01: aircraft stay the brightest things on screen).
 const FLIGHT_CATEGORY_VFR_SRGB: [u8; 3] = [0x22, 0x75, 0x3C];
 const FLIGHT_CATEGORY_MVFR_SRGB: [u8; 3] = [0x2E, 0x6F, 0xB0];
@@ -242,25 +395,6 @@ pub fn flight_category_badge_color(
         FlightCategory::Lifr => FLIGHT_CATEGORY_LIFR_SRGB,
     };
     layer_color(srgb, format)
-}
-
-/// All six bucket tints, indexed by [`altitude_bucket_index`] — built once per surface format in
-/// `renderer.rs` (the colors never change frame to frame, only which bucket applies), so the
-/// per-instance packing path (`aircraft::pack_instance`) is a plain array lookup rather than
-/// re-running the sRGB transfer function for every aircraft, every frame.
-pub fn altitude_bucket_tint_table(format: wgpu::TextureFormat) -> [[f32; 4]; 6] {
-    let mut table = [[0.0_f32; 4]; 6];
-    for bucket in [
-        AltitudeBucket::Ground,
-        AltitudeBucket::Below2000Ft,
-        AltitudeBucket::To10000Ft,
-        AltitudeBucket::To28000Ft,
-        AltitudeBucket::To40000Ft,
-        AltitudeBucket::Above40000Ft,
-    ] {
-        table[altitude_bucket_index(bucket)] = altitude_bucket_tint(bucket, format);
-    }
-    table
 }
 
 #[cfg(test)]
@@ -428,63 +562,156 @@ mod tests {
         assert!(srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2]);
     }
 
-    // ---- Altitude-bucket tint (M2 item 2.5) --------------------------------------------------
+    // ---- Perceptual altitude ramp (M4 item 4.5) ----------------------------------------------
 
-    const ALL_BUCKETS: [AltitudeBucket; 6] = [
-        AltitudeBucket::Ground,
-        AltitudeBucket::Below2000Ft,
-        AltitudeBucket::To10000Ft,
-        AltitudeBucket::To28000Ft,
-        AltitudeBucket::To40000Ft,
-        AltitudeBucket::Above40000Ft,
+    /// Ground/unknown plus a spread of airborne altitudes: the five [`RAMP_STOPS_FT`] anchors
+    /// (where the ramp must reproduce the authored flat color exactly) and four in-between
+    /// values (where it must not).
+    const SAMPLE_ALTITUDES_FT: [Option<f64>; 9] = [
+        None,
+        Some(1_000.0),
+        Some(3_500.0),
+        Some(6_000.0),
+        Some(12_500.0),
+        Some(19_000.0),
+        Some(31_000.0),
+        Some(34_000.0),
+        Some(45_000.0),
     ];
 
     #[test]
-    fn altitude_bucket_tint_covers_all_six_buckets_with_distinct_opaque_colors() {
-        let mut seen = Vec::new();
-        for bucket in ALL_BUCKETS {
-            let color = altitude_bucket_tint(bucket, wgpu::TextureFormat::Bgra8UnormSrgb);
-            assert!(
-                (color[3] - 1.0).abs() < 1e-6,
-                "{bucket:?} tint must be opaque"
-            );
-            for channel in &color[..3] {
-                assert!(
-                    (0.0..=1.0).contains(channel),
-                    "{bucket:?} channel {channel} out of range"
-                );
-            }
-            seen.push(color);
-        }
-        for i in 0..seen.len() {
-            for j in (i + 1)..seen.len() {
-                assert_ne!(
-                    seen[i], seen[j],
-                    "buckets {:?} and {:?} share a tint",
-                    ALL_BUCKETS[i], ALL_BUCKETS[j]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn altitude_bucket_index_is_a_bijection_onto_zero_through_five() {
-        let mut indices: Vec<usize> = ALL_BUCKETS
-            .iter()
-            .map(|&b| altitude_bucket_index(b))
-            .collect();
-        indices.sort_unstable();
-        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn altitude_bucket_tint_table_matches_the_per_bucket_lookup() {
+    fn altitude_tint_is_ground_gray_when_on_ground_or_altitude_unknown() {
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let table = altitude_bucket_tint_table(format);
-        for bucket in ALL_BUCKETS {
-            assert_eq!(
-                table[altitude_bucket_index(bucket)],
-                altitude_bucket_tint(bucket, format)
+        let ramp = AltitudeRamp::new(format);
+        let ground = layer_color(ALT_GROUND_SRGB, format);
+
+        assert_eq!(ramp.tint(true, Some(35_000.0)), ground, "on the ground");
+        assert_eq!(ramp.tint(false, None), ground, "altitude unknown");
+        assert_eq!(ramp.tint(true, None), ground, "on the ground, also unknown");
+    }
+
+    #[test]
+    fn altitude_tint_reproduces_the_authored_stop_at_each_anchor() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
+        for &(anchor_ft, srgb) in &RAMP_STOPS_FT {
+            let expected = layer_color(srgb, format);
+            let actual = ramp.tint(false, Some(anchor_ft));
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() < 1e-4,
+                    "at {anchor_ft} ft: {actual:?} != authored {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn altitude_tint_clamps_flat_beyond_the_ramp_ends() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
+        let below_first = ramp.tint(false, Some(-500.0));
+        let at_first = ramp.tint(false, Some(RAMP_STOPS_FT[0].0));
+        assert_eq!(below_first, at_first);
+
+        let above_last = ramp.tint(false, Some(60_000.0));
+        let at_last = layer_color(ALT_ABOVE_40000FT_SRGB, format);
+        for channel in 0..4 {
+            assert!((above_last[channel] - at_last[channel]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn altitude_tint_is_continuous_across_a_dense_sweep() {
+        // The whole point of M4 item 4.5: no bucket-boundary hitch. A straight-RGB lerp of these
+        // stops can jump as much as ~0.2 per channel between two samples 100 ft apart right at an
+        // old bucket edge; Oklab interpolation at this sample density should stay an order of
+        // magnitude smoother than that everywhere on the ramp.
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
+        let step_ft = 100.0;
+        let mut previous = ramp.tint(false, Some(0.0));
+        let mut ft = step_ft;
+        while ft <= 41_000.0 {
+            let current = ramp.tint(false, Some(ft));
+            for channel in 0..3 {
+                let delta = (current[channel] - previous[channel]).abs();
+                assert!(
+                    delta < 0.02,
+                    "channel {channel} jumped {delta} between {} and {ft} ft",
+                    ft - step_ft
+                );
+            }
+            previous = current;
+            ft += step_ft;
+        }
+    }
+
+    #[test]
+    fn altitude_tint_is_opaque_and_in_range_across_every_sample() {
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
+        for on_ground in [false, true] {
+            for altitude_ft in SAMPLE_ALTITUDES_FT {
+                let color = ramp.tint(on_ground, altitude_ft);
+                assert!((color[3] - 1.0).abs() < 1e-6, "{color:?} must be opaque");
+                for channel in &color[..3] {
+                    assert!(
+                        (0.0..=1.0).contains(channel),
+                        "{color:?} channel {channel} out of range"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn altitude_tint_darkens_on_an_srgb_surface_too() {
+        let srgb_ramp = AltitudeRamp::new(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let plain_ramp = AltitudeRamp::new(wgpu::TextureFormat::Bgra8Unorm);
+        for altitude_ft in SAMPLE_ALTITUDES_FT {
+            let srgb = srgb_ramp.tint(false, altitude_ft);
+            let plain = plain_ramp.tint(false, altitude_ft);
+            assert!(
+                srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2],
+                "at {altitude_ft:?} ft: srgb {srgb:?} must darken vs. plain {plain:?}"
+            );
+        }
+    }
+
+    /// Machado, Oliveira & Fernandes (2009) full-severity deuteranopia simulation matrix,
+    /// applied in linear RGB — automates docs/13's "altitude ramp distinguishable in a
+    /// deuteranopia simulation (lightness ordering survives)" line.
+    fn simulate_deuteranopia(linear_rgb: [f64; 3]) -> [f64; 3] {
+        let [r, g, b] = linear_rgb;
+        [
+            0.367_322 * r + 0.860_646 * g - 0.227_968 * b,
+            0.280_085 * r + 0.672_501 * g + 0.047_413 * b,
+            -0.011_820 * r + 0.042_940 * g + 0.968_881 * b,
+        ]
+    }
+
+    #[test]
+    fn altitude_ramp_lightness_ordering_survives_a_deuteranopia_simulation() {
+        let stops_srgb = [
+            ALT_GROUND_SRGB,
+            ALT_BELOW_2000FT_SRGB,
+            ALT_TO_10000FT_SRGB,
+            ALT_TO_28000FT_SRGB,
+            ALT_TO_40000FT_SRGB,
+            ALT_ABOVE_40000FT_SRGB,
+        ];
+        let lightness: Vec<f64> = stops_srgb
+            .iter()
+            .map(|&srgb| {
+                let simulated = simulate_deuteranopia(linear_from_srgb_u8(srgb));
+                linear_srgb_to_oklab(simulated)[0]
+            })
+            .collect();
+        for pair in lightness.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "lightness order must survive deuteranopia simulation: {lightness:?}"
             );
         }
     }
@@ -494,6 +721,7 @@ mod tests {
     #[test]
     fn airport_marker_and_runway_outline_are_dimmer_than_every_altitude_tint_and_label_text() {
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
         let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let marker_luma = luma(airport_marker_color(format));
         let runway_luma = luma(runway_outline_color(format));
@@ -507,16 +735,20 @@ mod tests {
             runway_luma < label_luma,
             "runway outline must stay dimmer than label text"
         );
-        for bucket in ALL_BUCKETS {
-            let tint_luma = luma(altitude_bucket_tint(bucket, format));
-            assert!(
-                marker_luma < tint_luma,
-                "airport marker must stay dimmer than {bucket:?}'s tint"
-            );
-            assert!(
-                runway_luma < tint_luma,
-                "runway outline must stay dimmer than {bucket:?}'s tint"
-            );
+        for on_ground in [false, true] {
+            for altitude_ft in SAMPLE_ALTITUDES_FT {
+                let tint_luma = luma(ramp.tint(on_ground, altitude_ft));
+                assert!(
+                    marker_luma < tint_luma,
+                    "airport marker must stay dimmer than the tint at {altitude_ft:?} ft \
+                     (on_ground={on_ground})"
+                );
+                assert!(
+                    runway_luma < tint_luma,
+                    "runway outline must stay dimmer than the tint at {altitude_ft:?} ft \
+                     (on_ground={on_ground})"
+                );
+            }
         }
     }
 
@@ -537,17 +769,6 @@ mod tests {
                 || runway_srgb[1] < runway_plain[1]
                 || runway_srgb[2] < runway_plain[2]
         );
-    }
-
-    #[test]
-    fn altitude_bucket_tint_darkens_on_an_srgb_surface_too() {
-        let srgb = altitude_bucket_tint(
-            AltitudeBucket::To28000Ft,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-        );
-        let plain =
-            altitude_bucket_tint(AltitudeBucket::To28000Ft, wgpu::TextureFormat::Bgra8Unorm);
-        assert!(srgb[0] < plain[0] || srgb[1] < plain[1] || srgb[2] < plain[2]);
     }
 
     // ---- Flight-category badge colors (M3 item 3.3) ------------------------------------------
@@ -618,6 +839,7 @@ mod tests {
     #[test]
     fn badge_colors_stay_dimmer_than_every_altitude_tint_and_label_text() {
         let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let ramp = AltitudeRamp::new(format);
         let luma = |c: [f32; 4]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let label_luma = luma(label_text_color(format));
 
@@ -627,12 +849,15 @@ mod tests {
                 badge_luma < label_luma,
                 "{category:?} badge must stay dimmer than label text"
             );
-            for bucket in ALL_BUCKETS {
-                let tint_luma = luma(altitude_bucket_tint(bucket, format));
-                assert!(
-                    badge_luma < tint_luma,
-                    "{category:?} badge must stay dimmer than {bucket:?}'s tint"
-                );
+            for on_ground in [false, true] {
+                for altitude_ft in SAMPLE_ALTITUDES_FT {
+                    let tint_luma = luma(ramp.tint(on_ground, altitude_ft));
+                    assert!(
+                        badge_luma < tint_luma,
+                        "{category:?} badge must stay dimmer than the tint at {altitude_ft:?} ft \
+                         (on_ground={on_ground})"
+                    );
+                }
             }
         }
     }

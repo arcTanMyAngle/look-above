@@ -34,7 +34,10 @@ var<uniform> view_proj: ViewProj;
 // .x = the glyph's on-screen size, in the same pre-normalized (Mercator-metres / extent) plane
 // the view-proj matrix operates on — see `aircraft.rs::glyph_scale_normalized`. Recomputed and
 // rewritten every frame (`Renderer::render`) so the glyph stays a constant screen-space pixel
-// size across zoom levels; `.yzw` are unused padding (uniform buffers want 16-byte members).
+// size across zoom levels. .y = this frame's glyph<->density-dot cross-fade multiplier (M4 item
+// 4.4 — see `renderer.rs::record_draw_passes`'s own comment on why it reuses the Mercator-map
+// fade rather than a second blend); `.zw` are unused padding (uniform buffers want 16-byte
+// members).
 @group(1) @binding(0)
 var<uniform> glyph_params: vec4<f32>;
 
@@ -92,5 +95,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let edge = 0.5;
     let aa = max(fwidth(distance), 0.0001);
     let alpha = smoothstep(edge - aa, edge + aa, distance);
-    return vec4<f32>(in.tint.rgb, in.tint.a * alpha);
+    return vec4<f32>(in.tint.rgb, in.tint.a * alpha * glyph_params.y);
 }
